@@ -1,9 +1,17 @@
 import pathlib
 
 ### Task parameters
-DATA_DIR = '/data/act/data'
+DATA_DIR = './data/act/data'
 # DATA_DIR = '/media/embodied_ai/SSD2TB/act/data'
 SIM_TASK_CONFIGS = {
+    'sim_transfer_cube_scripted':{
+        'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
+        'num_episodes': 5,
+        'episode_len': 400,
+        'camera_names': ['top'],
+        'model_dof': 14
+    },
+
     'sim_panda_catch_ball':{
         'dataset_dir': '/external/data/maniskill/PickBall',
         'num_episodes': 200,
@@ -122,14 +130,6 @@ SIM_TASK_CONFIGS = {
         'episode_len': 250,
         'camera_names': ['top'],
         'model_dof': 8
-    },
-
-    'sim_transfer_cube_scripted':{
-        'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
-        'num_episodes': 50,
-        'episode_len': 400,
-        'camera_names': ['top'],
-        'model_dof': 14
     },
 
     'sim_transfer_cube_human':{

@@ -95,7 +95,7 @@ def main(args):
         'camera_names': camera_names,
         'real_robot': not is_sim
     }
-
+    '''
     wandb.login(key = '7afe8f0cb860fa959ee2daf0f8ba40575f703063')
     wandb.init(
         project=task_name,
@@ -113,6 +113,7 @@ def main(args):
         },
         name=time.strftime('%Y%m%d_%H%M%S')
     )
+    '''
     
     if is_eval:
         ckpt_names = [f'policy_best.ckpt']
@@ -129,7 +130,16 @@ def main(args):
     if policy_class == 'ACTTask':
         train_dataloader, val_dataloader, stats, _ = load_pose_data(dataset_dir, num_episodes, camera_names, args['chunk_size'], batch_size_train, batch_size_val, img_aug=True)
     else:
-        train_dataloader, val_dataloader, stats, _ = load_joint_data(dataset_dir, num_episodes, camera_names, args['chunk_size'], batch_size_train, batch_size_val, img_aug=True)
+        train_dataloader, val_dataloader, stats, _ = load_joint_data(
+            dataset_dir,
+            num_episodes,
+            camera_names,
+            args['chunk_size'],
+            batch_size_train,
+            batch_size_val,
+            state_dim,
+            img_aug=True
+        )
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -438,7 +448,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             val_summary_string += f'{k}: {v.item():.3f} '
             wandb_log[f'Val {k}'] = v.item()
         
-        wandb.log(wandb_log)
+        # wandb.log(wandb_log)
 
         if epoch_train_loss < min_train_loss[0]:
             min_train_loss = [epoch_train_loss, epoch_val_loss]

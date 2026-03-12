@@ -8,31 +8,29 @@ import torchvision.transforms.v2 as transforms
 import IPython
 e = IPython.embed
 
-active_joints = [25, 26, 27, 28, 29, 30, 31, 32, 33] # hardcode, TOCABI right arm + hand
-
 color_transform = transforms.ColorJitter(brightness=0.5,
                            contrast=0.2,
                            saturation=0.2,
                            hue=0.1,
                           )
 
-def rotate_n_crop_transform(img, size, angle=None, top=None):
+def rotate_n_crop_transform(img, size=(360, 480), angle=None, top=None):
     if angle is None:
         angle = np.random.random() * 10 - 5
     if top is None:
-        h, w = img.shape
-        top_h = np.random.randint(0, 120)
-        top_w = np.random.randint(0, 160)
+        w, h = img.size
+        top_h = np.random.randint(0, max(1, h - size[0] + 1))
+        top_w = np.random.randint(0, max(1, w - size[1] + 1))
         top = [top_h, top_w]
-    
+
     img = transforms.functional.rotate(img, angle)
     img = transforms.functional.crop(img, *top, *size)
-
     return img
 
 class EpisodicJointDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, chunk_size, norm_stats, img_aug=False):
+    def __init__(self, episode_ids, dataset_dir, camera_names, chunk_size, norm_stats, active_joints, img_aug=False):
         super(EpisodicJointDataset).__init__()
+        self.active_joints = active_joints
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
@@ -47,7 +45,7 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         sample_full_episode = False # hardcode
-
+        
         episode_id = self.episode_ids[index]
         dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
         with h5py.File(dataset_path, 'r') as root:
@@ -58,7 +56,7 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
             else:
                 start_ts = np.random.choice(episode_len)
             # get observation at start_ts only
-            qpos = root['/observations/qpos'][start_ts, active_joints]
+            qpos = root['/observations/qpos'][start_ts, self.active_joints]
             image_dict = dict()
             for cam_name in self.camera_names:
                 if cam_name.endswith('stereo'):
@@ -81,12 +79,12 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                     img = root[f'/observations/images/{cam_name}'][start_ts]
                     img = transforms.functional.to_pil_image(img)
                     if self.img_aug:
-                        img = self.color_transform(img)
+                        img = color_transform(img)
                         img = rotate_n_crop_transform(img)
                     img = transforms.functional.resize(img, [480, 640])
                     image_dict[cam_name] = img
             # get all actions after and including start_ts
-            action = root['/action'][start_ts:min(start_ts+self.chunk_size, episode_len), active_joints]
+            action = root['/action'][start_ts:min(start_ts+self.chunk_size, episode_len), self.active_joints]
             action_len, action_dof = action.shape
 
         self.is_sim = is_sim
@@ -118,7 +116,7 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def get_joint_norm_stats(dataset_dir, num_episodes):
+def get_joint_norm_stats(dataset_dir, num_episodes, active_joints):
     all_qpos_data = []
     all_action_data = []
     for episode_idx in range(num_episodes):
@@ -153,7 +151,10 @@ def get_joint_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_joint_data(dataset_dir, num_episodes, camera_names, chunk_size, batch_size_train, batch_size_val, img_aug=False):
+def load_joint_data(dataset_dir, num_episodes, camera_names, chunk_size, batch_size_train, batch_size_val, model_dof, img_aug=False):
+    
+    active_joints = list(range(model_dof))
+    
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     train_ratio = 0.8
@@ -162,11 +163,11 @@ def load_joint_data(dataset_dir, num_episodes, camera_names, chunk_size, batch_s
     val_indices = shuffled_indices[int(train_ratio * num_episodes):]
 
     # obtain normalization stats for qpos and action
-    norm_stats = get_joint_norm_stats(dataset_dir, num_episodes)
+    norm_stats = get_joint_norm_stats(dataset_dir, num_episodes, active_joints)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicJointDataset(train_indices, dataset_dir, camera_names, chunk_size, norm_stats, img_aug)
-    val_dataset = EpisodicJointDataset(val_indices, dataset_dir, camera_names, chunk_size, norm_stats, img_aug)
+    train_dataset = EpisodicJointDataset(train_indices, dataset_dir, camera_names, chunk_size, norm_stats, active_joints, img_aug)
+    val_dataset = EpisodicJointDataset(val_indices, dataset_dir, camera_names, chunk_size, norm_stats, active_joints, img_aug)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 
@@ -224,7 +225,7 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                     img = root[f'/observations/images/{cam_name}'][start_ts]
                     img = transforms.functional.to_pil_image(img)
                     if self.img_aug:
-                        img = self.color_transform(img)
+                        img = color_transform(img)
                         img = rotate_n_crop_transform(img)
                     img = transforms.functional.resize(img, [480, 640])
                     image_dict[cam_name] = img
