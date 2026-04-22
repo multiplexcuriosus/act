@@ -12,7 +12,6 @@ import time
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from constants import SIM_TASK_CONFIGS
 from utils import load_joint_data, load_pose_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
@@ -25,7 +24,7 @@ import IPython
 e = IPython.embed
 
 def main(args):
-    set_seed(1)
+    set_seed(args['seed'])
     # command line parameters
     is_eval = args['eval']
     ckpt_dir = args['ckpt_dir']
@@ -39,21 +38,27 @@ def main(args):
     constant_waypoint = args['constant_waypoint']
     dataset_dir = args['dataset_dir']
     num_episodes = args['num_episodes']
+    camera_names = args['camera_names']
+    data_mode = args['data_mode']
+    img_aug = args['img_aug']
+    episode_len = args['episode_len']
     
     if use_waypoint:
         print('Using waypoint')
     if constant_waypoint is not None:
         print(f'Constant waypoint: {constant_waypoint}')
 
-    # get task parameters
+    # task name may still be used for eval env selection, but does not control dataset structure
     is_sim = task_name[:4] == 'sim_'
-    task_config = SIM_TASK_CONFIGS[task_name]
-    episode_len = task_config['episode_len']
-    camera_names = task_config['camera_names']
-    if policy_class == 'ACTTask':
-        state_dim = 10
+    if data_mode == 'joint':
+        if args['state_dim'] is None:
+            raise ValueError("--state_dim is required when --data_mode joint")
+        state_dim = args['state_dim']
+    elif data_mode == 'pose':
+        # Keep existing ACTTask pose default while allowing override.
+        state_dim = args['state_dim'] if args['state_dim'] is not None else 10
     else:
-        state_dim = task_config['model_dof']
+        raise ValueError(f"Unsupported data_mode: {data_mode}")
 
     # fixed parameters
     lr_backbone = 1e-5
@@ -128,9 +133,17 @@ def main(args):
         print()
         exit()
 
-    if policy_class == 'ACTTask':
-        train_dataloader, val_dataloader, stats, _ = load_pose_data(dataset_dir, num_episodes, camera_names, args['chunk_size'], batch_size_train, batch_size_val, img_aug=True)
-    else:
+    if args['data_mode'] == 'pose':
+        train_dataloader, val_dataloader, stats, _ = load_pose_data(
+            dataset_dir,
+            num_episodes,
+            camera_names,
+            args['chunk_size'],
+            batch_size_train,
+            batch_size_val,
+            img_aug=img_aug,
+        )
+    elif args['data_mode'] == 'joint':
         train_dataloader, val_dataloader, stats, _ = load_joint_data(
             dataset_dir,
             num_episodes,
@@ -139,8 +152,10 @@ def main(args):
             batch_size_train,
             batch_size_val,
             state_dim,
-            img_aug=True
+            img_aug=img_aug,
         )
+    else:
+        raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -198,7 +213,7 @@ def get_image(ts, camera_names):
 
 
 def eval_bc(config, ckpt_name, save_episode=True):
-    set_seed(1000)
+    set_seed(config['seed'])
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
     real_robot = config['real_robot']
@@ -378,30 +393,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    # if ckpt_dir is not empty, prompt the user to load the checkpoint
-    if os.path.isdir(ckpt_dir) and len(os.listdir(ckpt_dir)) > 1:
-        print(f"Checkpoint directory {ckpt_dir} is not empty. Load checkpoint? (y/n)")
-        load_ckpt = input()
-        if load_ckpt == "y":
-            # load the latest checkpoint
-            latest_idx = max(
-                [
-                    int(f.split("_")[2])
-                    for f in os.listdir(ckpt_dir)
-                    if f.startswith("policy_epoch_")
-                ]
-            )
-            ckpt_path = os.path.join(
-                ckpt_dir, f"policy_epoch_{latest_idx}_seed_{seed}.ckpt"
-            )
-            print(f"Loading checkpoint from {ckpt_path}")
-            loading_status = policy.load_state_dict(torch.load(ckpt_path))
-            print(loading_status)
-        else:
-            print("Not loading checkpoint")
-            latest_idx = 0
-    else:
-        latest_idx = 0
+    latest_idx = 0
 
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
@@ -541,11 +533,16 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_dir', action='store', type=str, help='dataset_dir', required=True)
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
+    parser.add_argument('--episode_len', action='store', type=int, help='episode_len for eval rollouts', required=False, default=400)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--num_episodes', action='store', type=int, help='num_episodes', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
+    parser.add_argument('--camera_names', nargs='+', required=True, help='camera names to load from dataset')
+    parser.add_argument('--data_mode', choices=['joint', 'pose'], required=True, help='dataset mode')
+    parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (required for joint mode; optional override for pose mode)')
+    parser.add_argument('--img_aug', action='store_true', help='enable image augmentation (disabled by default)')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
