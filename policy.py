@@ -16,6 +16,12 @@ class ACTPolicy(nn.Module):
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
+        # Most tasks use the last action dim as a binary gripper channel.
+        # Toy 2D control uses fully continuous actions, so disable BCE on last dim.
+        self.use_bce_last_action_dim = args_override.get(
+            'use_bce_last_action_dim',
+            args_override.get('state_dim', 0) > 2
+        )
         print(f'KL Weight {self.kl_weight}')
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
@@ -30,12 +36,18 @@ class ACTPolicy(nn.Module):
             a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad)
             # kl divergence loss
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar) # train with CVAE encoder
-            # position l1 loss
-            all_l1 = F.l1_loss(actions[:,:,:-1], a_hat[:,:,:-1], reduction='none')
-            l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
-            # gripper state binary cross entropy loss
-            all_bce = F.binary_cross_entropy_with_logits(a_hat[:,:,-1:], actions[:,:,-1:], reduction='none')
-            bce = (all_bce * ~is_pad.unsqueeze(-1)).mean()
+            if self.use_bce_last_action_dim:
+                # position l1 loss
+                all_l1 = F.l1_loss(actions[:,:,:-1], a_hat[:,:,:-1], reduction='none')
+                l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+                # gripper state binary cross entropy loss
+                all_bce = F.binary_cross_entropy_with_logits(a_hat[:,:,-1:], actions[:,:,-1:], reduction='none')
+                bce = (all_bce * ~is_pad.unsqueeze(-1)).mean()
+            else:
+                # Fully continuous action tasks (e.g. toy 2D control).
+                all_l1 = F.l1_loss(actions, a_hat, reduction='none')
+                l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+                bce = torch.zeros((), device=actions.device)
             # total loss
             loss_dict = dict()
             loss_dict['qpos'] = l1

@@ -4,6 +4,13 @@ import pathlib
 DATA_DIR = './data/act/data'
 # DATA_DIR = '/media/embodied_ai/SSD2TB/act/data'
 SIM_TASK_CONFIGS = {
+    'toy_circle_chase': {
+    'dataset_dir': '../toy_il/data/out',
+    'num_episodes': 10,
+    'episode_len': 240,
+    'camera_names': ['main'],
+    'model_dof': 2,
+    },
     'sim_transfer_cube_scripted':{
         'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
         'num_episodes': 5,

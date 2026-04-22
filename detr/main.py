@@ -70,9 +70,20 @@ def get_args_parser():
 
 
 def build_ACT_model_and_optimizer(args_override):
-    parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        'DETR training and evaluation script',
+        parents=[get_args_parser()]
+    )
 
+    # Get parser defaults without triggering required-arg checks
+    args = argparse.Namespace()
+    for action in parser._actions:
+        if action.dest == 'help':
+            continue
+        if action.default is not None and action.default is not argparse.SUPPRESS:
+            setattr(args, action.dest, action.default)
+
+    # Overwrite with provided config
     for k, v in args_override.items():
         setattr(args, k, v)
 
@@ -86,8 +97,11 @@ def build_ACT_model_and_optimizer(args_override):
             "lr": args.lr_backbone,
         },
     ]
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        param_dicts,
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
 
     return model, optimizer
 

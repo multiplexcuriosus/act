@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
-import wandb
+#import wandb
 import time
 
 from constants import DT
@@ -37,6 +37,9 @@ def main(args):
     num_epochs = args['num_epochs']
     use_waypoint = args['use_waypoint']
     constant_waypoint = args['constant_waypoint']
+    dataset_dir = args['dataset_dir']
+    num_episodes = args['num_episodes']
+    
     if use_waypoint:
         print('Using waypoint')
     if constant_waypoint is not None:
@@ -45,8 +48,6 @@ def main(args):
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
     task_config = SIM_TASK_CONFIGS[task_name]
-    dataset_dir = task_config['dataset_dir']
-    num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
     if policy_class == 'ACTTask':
@@ -116,7 +117,7 @@ def main(args):
     '''
     
     if is_eval:
-        ckpt_names = [f'policy_best.ckpt']
+        ckpt_names = [f'policy_val_best.ckpt']
         results = []
         for ckpt_name in ckpt_names:
             success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
@@ -537,11 +538,13 @@ if __name__ == '__main__':
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
     parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
+    parser.add_argument('--dataset_dir', action='store', type=str, help='dataset_dir', required=True)
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
+    parser.add_argument('--num_episodes', action='store', type=int, help='num_episodes', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
     # for ACT
