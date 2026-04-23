@@ -42,6 +42,7 @@ def main(args):
     data_mode = args['data_mode']
     img_aug = args['img_aug']
     episode_len = args['episode_len']
+    action_dim = args['action_dim']
     
     if use_waypoint:
         print('Using waypoint')
@@ -53,10 +54,14 @@ def main(args):
     if data_mode == 'joint':
         if args['state_dim'] is None:
             raise ValueError("--state_dim is required when --data_mode joint")
+        if action_dim is None:
+            raise ValueError("--action_dim is required when --data_mode joint")
         state_dim = args['state_dim']
     elif data_mode == 'pose':
         # Keep existing ACTTask pose default while allowing override.
         state_dim = args['state_dim'] if args['state_dim'] is not None else 10
+        # Keep previous behavior for pose mode unless explicitly overridden.
+        action_dim = action_dim if action_dim is not None else state_dim
     else:
         raise ValueError(f"Unsupported data_mode: {data_mode}")
 
@@ -78,11 +83,12 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
-                         'state_dim': state_dim
+                         'state_dim': state_dim,
+                         'action_dim': action_dim,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names, 'state_dim': state_dim}
+                         'camera_names': camera_names, 'state_dim': state_dim, 'action_dim': action_dim}
     else:
         raise NotImplementedError
 
@@ -91,6 +97,7 @@ def main(args):
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
+        'action_dim': action_dim,
         'lr': args['lr'],
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,
@@ -151,8 +158,11 @@ def main(args):
             args['chunk_size'],
             batch_size_train,
             batch_size_val,
-            state_dim,
+            model_dof=None,
             img_aug=img_aug,
+            qpos_dim=state_dim,
+            action_dim=action_dim,
+            action_key='/action',
         )
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
@@ -216,6 +226,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(config['seed'])
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
+    action_dim = config['action_dim']
     real_robot = config['real_robot']
     policy_class = config['policy_class']
     onscreen_render = config['onscreen_render']
@@ -280,7 +291,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, action_dim]).cuda()
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
         image_list = [] # for visualization
@@ -542,6 +553,7 @@ if __name__ == '__main__':
     parser.add_argument('--camera_names', nargs='+', required=True, help='camera names to load from dataset')
     parser.add_argument('--data_mode', choices=['joint', 'pose'], required=True, help='dataset mode')
     parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (required for joint mode; optional override for pose mode)')
+    parser.add_argument('--action_dim', action='store', type=int, required=False, default=None, help='action dimension (required for joint mode; optional override for pose mode)')
     parser.add_argument('--img_aug', action='store_true', help='enable image augmentation (disabled by default)')
 
     # for ACT
