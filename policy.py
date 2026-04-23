@@ -20,7 +20,7 @@ class ACTPolicy(nn.Module):
         # Toy 2D control uses fully continuous actions, so disable BCE on last dim.
         self.use_bce_last_action_dim = args_override.get(
             'use_bce_last_action_dim',
-            args_override.get('state_dim', 0) > 2
+            False
         )
         print(f'KL Weight {self.kl_weight}')
 
