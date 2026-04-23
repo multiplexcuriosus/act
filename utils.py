@@ -407,21 +407,29 @@ def load_joint_data(
     print(f'\nData from: {dataset_dir}\n')
 
     # obtain train/val split using balanced random search
-    train_ratio = 0.8
-    episode_stats = _compute_episode_action_stats_joint(
-        dataset_dir,
-        num_episodes,
-        action_indices=joint_data_cfg['action_indices'],
-        action_key=joint_data_cfg['action_key'],
-    )
-    train_indices, val_indices = _choose_balanced_episode_split(
-        num_episodes=num_episodes,
-        episode_stats=episode_stats,
-        train_ratio=train_ratio,
-        num_trials=split_num_trials,
-        seed=split_seed,
-        verbose=True,
-    )
+    # train_ratio = 0.8
+    # episode_stats = _compute_episode_action_stats_joint(
+    #     dataset_dir,
+    #     num_episodes,
+    #     action_indices=joint_data_cfg['action_indices'],
+    #     action_key=joint_data_cfg['action_key'],
+    # )
+    # train_indices, val_indices = _choose_balanced_episode_split(
+    #     num_episodes=num_episodes,
+    #     episode_stats=episode_stats,
+    #     train_ratio=train_ratio,
+    #     num_trials=split_num_trials,
+    #     seed=split_seed,
+    #     verbose=True,
+    # )
+    episode_indices = list(range(num_episodes))
+    rng = np.random.RandomState(split_seed)
+    rng.shuffle(episode_indices)
+
+    split_idx = int(0.8 * num_episodes)
+
+    train_indices = episode_indices[:split_idx]
+    val_indices = episode_indices[split_idx:]
 
     # obtain normalization stats for qpos and action
     norm_stats = get_joint_norm_stats(
