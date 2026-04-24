@@ -50,10 +50,10 @@ class ACTPolicy(nn.Module):
                 bce = torch.zeros((), device=actions.device)
             # total loss
             loss_dict = dict()
-            loss_dict['qpos'] = l1
+            loss_dict['action_l1'] = l1
             loss_dict['hand'] = bce
             loss_dict['kl'] = total_kld[0]  # train with CVAE encoder
-            loss_dict['loss'] = loss_dict['qpos'] + loss_dict['hand'] * 0.1 + loss_dict['kl'] * self.kl_weight  # train with CVAE encoder
+            loss_dict['loss'] = loss_dict['action_l1'] + loss_dict['hand'] * 0.1 + loss_dict['kl'] * self.kl_weight  # train with CVAE encoder
             # loss_dict['loss'] = loss_dict['l1'] # train without CVAE encoder
             return loss_dict
         else: # inference time
