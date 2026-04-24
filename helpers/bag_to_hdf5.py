@@ -6,6 +6,7 @@ import argparse
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 
+import yaml
 import cv2
 import h5py
 import numpy as np
@@ -39,6 +40,13 @@ class EpisodeWindow:
 
 def log(msg: str):
     print(msg, flush=True)
+
+
+def load_gripper_widths(config_path: str) -> Tuple[float, float]:
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    params = cfg["ps4_input_manager"]["ros__parameters"]
+    return float(params["gripper_open_width"]), float(params["gripper_close_width"])
 
 
 def bag_timestamp_to_sec(ns: int) -> float:
@@ -402,7 +410,7 @@ def collect_single_episode_data(
     return data
 
 
-def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow) -> Dict[str, np.ndarray]:
+def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow, gripper_open_width: float, gripper_close_width: float) -> Dict[str, np.ndarray]:
     log(f"[INFO] episode {ep.idx}: sampling onto {FPS:.1f} Hz grid using next-available datapoint")
 
     grid = np.arange(ep.start, ep.end + 1e-9, DT, dtype=np.float64)
@@ -451,6 +459,7 @@ def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow) -> Dict[st
     qpos_seq = []
     gripper_seq = []
     twist_seq = []
+    thresh = (gripper_open_width + gripper_close_width) / 2
 
     for i, t in enumerate(grid):
         rgb_idx = first_index_ge(rgb_t, t, rgb_idx)
@@ -476,7 +485,10 @@ def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow) -> Dict[st
             gripper_value = np.float32(gripper[gripper_idx][0])
         else:
             gripper_value = initial_gripper_width
-        gripper_seq.append(np.array([gripper_value], dtype=np.float32))
+        closed = gripper_value < thresh
+        gripper_bin = np.float32(closed)
+
+        gripper_seq.append(np.array([gripper_bin], dtype=np.float32))
         twist_seq.append(twist[twist_idx])
 
     rgb_frames = np.stack(rgb_frames, axis=0)
@@ -568,10 +580,19 @@ def main():
         default=None,
         help="Optional limit for debugging",
     )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="/home/jau/dyros/src/fr3_teleop/config/ps4_input_manager.yaml",
+        help="Path to ps4_input_manager.yaml for gripper open/close widths",
+    )
     args = parser.parse_args()
 
     bag_path = args.bag
     out_dir = os.path.join(args.out_dir, bag_top_level_name(bag_path))
+
+    gripper_open_width, gripper_close_width = load_gripper_widths(args.config)
+    log(f"[INFO] Loaded gripper widths from config: open={gripper_open_width}, close={gripper_close_width}")
     ensure_dir(out_dir)
     log(f"[INFO] Output directory: {out_dir}")
 
@@ -603,7 +624,7 @@ def main():
     for ep in windows:
         try:
             data = collect_single_episode_data(bag_path, ep)
-            arrays = sample_episode_to_arrays(data, ep)
+            arrays = sample_episode_to_arrays(data, ep, gripper_open_width, gripper_close_width)
 
             out_path = os.path.join(out_dir, f"episode_{ep.idx}.hdf5")
             write_episode_hdf5(out_path, arrays, data["joint_names"], ep)
