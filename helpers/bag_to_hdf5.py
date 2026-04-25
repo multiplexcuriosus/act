@@ -4,9 +4,7 @@ import os
 import gc
 import argparse
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
-
-import yaml
+from typing import List, Dict, Any
 import cv2
 import h5py
 import numpy as np
@@ -20,7 +18,7 @@ from rosidl_runtime_py.utilities import get_message
 TOPIC_RGB = "/camera/camera/color/image_raw"
 TOPIC_EVENT = "/openmv_cam/image"
 TOPIC_JOINT = "/joint_states"
-TOPIC_GRIPPER = "/teleop/gripper_cmd"
+TOPIC_GRIPPER_STATE = "/teleop/gripper_state_cmd"
 TOPIC_TWIST = "/cartesian_cmd/twist"
 TOPIC_EPISODE = "/episode/control"
 MIN_DURATION = 4.0  # seconds
@@ -40,13 +38,6 @@ class EpisodeWindow:
 
 def log(msg: str):
     print(msg, flush=True)
-
-
-def load_gripper_widths(config_path: str) -> Tuple[float, float]:
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
-    params = cfg["ps4_input_manager"]["ros__parameters"]
-    return float(params["gripper_open_width"]), float(params["gripper_close_width"])
 
 
 def bag_timestamp_to_sec(ns: int) -> float:
@@ -97,7 +88,7 @@ def check_required_topics(topic_type_map: Dict[str, str]):
         TOPIC_RGB,
         TOPIC_EVENT,
         TOPIC_JOINT,
-        TOPIC_GRIPPER,
+        TOPIC_GRIPPER_STATE,
         TOPIC_TWIST,
         TOPIC_EPISODE,
     }
@@ -310,8 +301,8 @@ def collect_single_episode_data(
         "event_msg": [],
         "joint_t": [],
         "joint_pos": [],
-        "gripper_t": [],
-        "gripper": [],
+        "gripper_state_t": [],
+        "gripper_state": [],
         "twist_t": [],
         "twist": [],
         "joint_names": None,
@@ -325,7 +316,7 @@ def collect_single_episode_data(
         TOPIC_RGB: False,
         TOPIC_EVENT: False,
         TOPIC_JOINT: False,
-        TOPIC_GRIPPER: False,
+        TOPIC_GRIPPER_STATE: False,
         TOPIC_TWIST: False,
     }
 
@@ -386,9 +377,9 @@ def collect_single_episode_data(
             data["joint_t"].append(t)
             data["joint_pos"].append(pos)
 
-        elif topic == TOPIC_GRIPPER:
-            data["gripper_t"].append(t)
-            data["gripper"].append(np.array([msg.data], dtype=np.float32))
+        elif topic == TOPIC_GRIPPER_STATE:
+            data["gripper_state_t"].append(t)
+            data["gripper_state"].append(np.array([1.0 if msg.data else 0.0], dtype=np.float32))
 
         elif topic == TOPIC_TWIST:
             data["twist_t"].append(t)
@@ -400,17 +391,17 @@ def collect_single_episode_data(
     log(f"       rgb frames:           {len(data['rgb_t'])}")
     log(f"       event frames:         {len(data['event_t'])}")
     log(f"       joint msgs:           {len(data['joint_t'])}")
-    log(f"       gripper msgs:         {len(data['gripper_t'])}")
+    log(f"       gripper state msgs:   {len(data['gripper_state_t'])}")
     log(f"       twist msgs:           {len(data['twist_t'])}")
 
-    for k in ["rgb_t", "event_t", "joint_t", "gripper_t", "twist_t"]:
+    for k in ["rgb_t", "event_t", "joint_t", "twist_t"]:
         if len(data[k]) == 0:
             raise RuntimeError(f"Episode {ep.idx}: no data collected for {k}")
 
     return data
 
 
-def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow, gripper_open_width: float, gripper_close_width: float) -> Dict[str, np.ndarray]:
+def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow) -> Dict[str, np.ndarray]:
     log(f"[INFO] episode {ep.idx}: sampling onto {FPS:.1f} Hz grid using next-available datapoint")
 
     grid = np.arange(ep.start, ep.end + 1e-9, DT, dtype=np.float64)
@@ -419,13 +410,13 @@ def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow, gripper_op
     rgb_t = data["rgb_t"]
     event_t = data["event_t"]
     joint_t = data["joint_t"]
-    gripper_t = data["gripper_t"]
+    gripper_state_t = data["gripper_state_t"]
     twist_t = data["twist_t"]
 
     rgb_msg = data["rgb_msg"]
     event_msg = data["event_msg"]
     joint_pos = data["joint_pos"]
-    gripper = data["gripper"]
+    gripper_state = data["gripper_state"]
     twist = data["twist"]
     joint_names = data["joint_names"]
 
@@ -435,44 +426,29 @@ def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow, gripper_op
     rgb_idx = first_index_ge(rgb_t, ep.start)
     event_idx = first_index_ge(event_t, ep.start)
     joint_idx = first_index_ge(joint_t, ep.start)
-    gripper_idx = last_index_le(gripper_t, ep.start)
+    gripper_state_idx = last_index_le(gripper_state_t, ep.start)
     twist_idx = first_index_ge(twist_t, ep.start)
 
-    try:
-        initial_gripper_width = infer_initial_gripper_width(joint_names, joint_pos[0])
-        log(
-            f"[INFO] episode {ep.idx}: inferred initial gripper width from joint_states = "
-            f"{float(initial_gripper_width):.6f}"
-        )
-    except RuntimeError as e:
-        initial_gripper_width = np.float32(gripper[0][0])
-        log(f"[WARNING] episode {ep.idx}: {e}")
-        log(
-            f"[WARNING] episode {ep.idx}: falling back to first /teleop/gripper_cmd value = "
-            f"{float(initial_gripper_width):.6f}"
-        )
-
-    log(f"[INFO] episode {ep.idx}: sparse gripper command count = {len(gripper_t)}")
+    initial_gripper_state = np.float32(0.0)  # open
+    log(f"[INFO] episode {ep.idx}: sparse gripper state event count = {len(gripper_state_t)}")
 
     rgb_frames = []
     event_frames = []
     qpos_seq = []
     gripper_seq = []
     twist_seq = []
-    thresh = (gripper_open_width + gripper_close_width) / 2
-
     for i, t in enumerate(grid):
         rgb_idx = first_index_ge(rgb_t, t, rgb_idx)
         event_idx = first_index_ge(event_t, t, event_idx)
         joint_idx = first_index_ge(joint_t, t, joint_idx)
-        gripper_idx = last_index_le(gripper_t, t, max(0, gripper_idx + 1))
+        gripper_state_idx = last_index_le(gripper_state_t, t, max(0, gripper_state_idx + 1))
         twist_idx = first_index_ge(twist_t, t, twist_idx)
 
         if i % 100 == 0:
             log(
                 f"[DEBUG] episode {ep.idx}: sample {i:04d}/{len(grid)} "
                 f"| rgb_idx={rgb_idx} event_idx={event_idx} joint_idx={joint_idx} "
-                f"gripper_idx={gripper_idx} twist_idx={twist_idx}"
+                f"gripper_state_idx={gripper_state_idx} twist_idx={twist_idx}"
             )
 
         rgb_np = image_msg_to_numpy(rgb_msg[rgb_idx])
@@ -481,14 +457,12 @@ def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow, gripper_op
         rgb_frames.append(rgb_np)
         event_frames.append(event_np)
         qpos_seq.append(build_qpos_from_joint_state(joint_names, joint_pos[joint_idx]))
-        if gripper_idx >= 0:
-            gripper_value = np.float32(gripper[gripper_idx][0])
+        if gripper_state_idx >= 0:
+            gripper_value = np.float32(gripper_state[gripper_state_idx][0])
         else:
-            gripper_value = initial_gripper_width
-        closed = gripper_value < thresh
-        gripper_bin = np.float32(closed)
+            gripper_value = initial_gripper_state
 
-        gripper_seq.append(np.array([gripper_bin], dtype=np.float32))
+        gripper_seq.append(np.array([gripper_value], dtype=np.float32))
         twist_seq.append(twist[twist_idx])
 
     rgb_frames = np.stack(rgb_frames, axis=0)
@@ -506,6 +480,9 @@ def sample_episode_to_arrays(data: Dict[str, Any], ep: EpisodeWindow, gripper_op
     log(f"       gripper shape:    {gripper_seq.shape}, dtype={gripper_seq.dtype}")
     preview_n = min(5, len(gripper_seq))
     log(f"       dense gripper first {preview_n} values: {gripper_seq[:preview_n, 0].tolist()}")
+    unique_vals, unique_counts = np.unique(gripper_seq[:, 0], return_counts=True)
+    counts_str = ", ".join([f"{float(v):.1f}:{int(c)}" for v, c in zip(unique_vals, unique_counts)])
+    log(f"       dense gripper value counts: {counts_str}")
     log(f"       combined action:  {action_combined.shape}, dtype={action_combined.dtype}")
     log(f"       expected qpos dim/action dim: 8/7")
 
@@ -580,19 +557,11 @@ def main():
         default=None,
         help="Optional limit for debugging",
     )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="/home/jau/dyros/src/fr3_teleop/config/ps4_input_manager.yaml",
-        help="Path to ps4_input_manager.yaml for gripper open/close widths",
-    )
     args = parser.parse_args()
 
     bag_path = args.bag
     out_dir = os.path.join(args.out_dir, bag_top_level_name(bag_path))
 
-    gripper_open_width, gripper_close_width = load_gripper_widths(args.config)
-    log(f"[INFO] Loaded gripper widths from config: open={gripper_open_width}, close={gripper_close_width}")
     ensure_dir(out_dir)
     log(f"[INFO] Output directory: {out_dir}")
 
@@ -624,7 +593,7 @@ def main():
     for ep in windows:
         try:
             data = collect_single_episode_data(bag_path, ep)
-            arrays = sample_episode_to_arrays(data, ep, gripper_open_width, gripper_close_width)
+            arrays = sample_episode_to_arrays(data, ep)
 
             out_path = os.path.join(out_dir, f"episode_{ep.idx}.hdf5")
             write_episode_hdf5(out_path, arrays, data["joint_names"], ep)
