@@ -85,6 +85,7 @@ def main(args):
                          'camera_names': camera_names,
                          'state_dim': state_dim,
                          'action_dim': action_dim,
+                         'use_bce_last_action_dim': True
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
