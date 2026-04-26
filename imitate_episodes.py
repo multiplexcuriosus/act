@@ -68,6 +68,12 @@ def main(args):
     # fixed parameters
     lr_backbone = 1e-5
     backbone = 'resnet18'
+    use_bce_last_action_dim = (
+        policy_class == 'ACT' and
+        data_mode == 'joint' and
+        action_dim == 7 and
+        args['use_bce_last_action_dim']
+    )
     if policy_class.startswith('ACT'):
         enc_layers = 4
         dec_layers = 7
@@ -85,7 +91,7 @@ def main(args):
                          'camera_names': camera_names,
                          'state_dim': state_dim,
                          'action_dim': action_dim,
-                         'use_bce_last_action_dim': True
+                         'use_bce_last_action_dim': use_bce_last_action_dim
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -165,6 +171,15 @@ def main(args):
             action_dim=action_dim,
             action_key='/action',
         )
+        if use_bce_last_action_dim:
+            # Keep binary gripper-state target (last action dim) in raw 0/1 space.
+            stats['action_mean'][-1] = 0.0
+            stats['action_std'][-1] = 1.0
+            train_dataloader.dataset.norm_stats['action_mean'][-1] = 0.0
+            train_dataloader.dataset.norm_stats['action_std'][-1] = 1.0
+            val_dataloader.dataset.norm_stats['action_mean'][-1] = 0.0
+            val_dataloader.dataset.norm_stats['action_std'][-1] = 1.0
+            print('[INFO] Using BCE on last action dim; forcing action_mean[-1]=0 and action_std[-1]=1')
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
 
@@ -556,6 +571,8 @@ if __name__ == '__main__':
     parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (required for joint mode; optional override for pose mode)')
     parser.add_argument('--action_dim', action='store', type=int, required=False, default=None, help='action dimension (required for joint mode; optional override for pose mode)')
     parser.add_argument('--img_aug', action='store_true', help='enable image augmentation (disabled by default)')
+    parser.add_argument('--use_bce_last_action_dim', action='store_true', help='use BCEWithLogits on final action dim')
+    parser.add_argument('--no_use_bce_last_action_dim', action='store_false', dest='use_bce_last_action_dim', help='disable BCEWithLogits on final action dim')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
@@ -567,5 +584,7 @@ if __name__ == '__main__':
     # for waypoints
     parser.add_argument('--use_waypoint', action='store_true')
     parser.add_argument('--constant_waypoint', action='store', type=int, help='constant_waypoint', required=False)
+
+    parser.set_defaults(use_bce_last_action_dim=True)
 
     main(vars(parser.parse_args()))
