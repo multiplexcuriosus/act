@@ -10,7 +10,7 @@ import torch
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, JointState
 from geometry_msgs.msg import TwistStamped
-from std_msgs.msg import Float64
+from std_msgs.msg import Bool
 
 import rclpy
 from rclpy.node import Node
@@ -72,7 +72,7 @@ class FrankaActRolloutNode(Node):
         self.image_topic = args.image_topic
         self.joint_topic = args.joint_topic
         self.twist_topic = args.twist_topic
-        self.gripper_topic = args.gripper_topic
+        self.gripper_state_topic = args.gripper_state_topic
         self.camera_name = args.camera_name
 
         self.fps = args.fps
@@ -101,6 +101,7 @@ class FrankaActRolloutNode(Node):
             "camera_names": [self.camera_name],
             "state_dim": self.state_dim,
             "action_dim": self.action_dim_cfg,
+            "use_bce_last_action_dim": args.use_bce_last_action_dim,
         }
 
         self.num_queries = policy_config["num_queries"]
@@ -147,7 +148,14 @@ class FrankaActRolloutNode(Node):
             )
 
         self.pre_process = lambda s: (s - self.qpos_mean) / np.clip(self.qpos_std, 1e-6, None)
-        self.post_process = lambda a: a * self.action_std + self.action_mean
+
+        # Binary gripper-state postprocessing from BCE logits.
+        self.close_threshold = 0.7
+        self.open_threshold = 0.3
+        self.gripper_closed_state = False
+        self.last_gripper_state_publish_time = 0.0
+        self.min_gripper_publish_interval = 0.5
+        self.sent_initial_gripper_state = False
 
         if self.temporal_agg:
             self.all_time_actions = torch.zeros(
@@ -156,7 +164,7 @@ class FrankaActRolloutNode(Node):
             )
 
         self.twist_pub = self.create_publisher(TwistStamped, self.twist_topic, 10)
-        self.gripper_pub = self.create_publisher(Float64, self.gripper_topic, 10)
+        self.gripper_state_pub = self.create_publisher(Bool, self.gripper_state_topic, 10)
 
         self.create_subscription(Image, self.image_topic, self.image_cb, 10)
         self.create_subscription(JointState, self.joint_topic, self.joint_cb, 10)
@@ -166,7 +174,7 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(f"image_topic={self.image_topic}")
         self.get_logger().info(f"joint_topic={self.joint_topic}")
         self.get_logger().info(f"twist_topic={self.twist_topic}")
-        self.get_logger().info(f"gripper_topic={self.gripper_topic}")
+        self.get_logger().info(f"gripper_state_topic={self.gripper_state_topic}")
         self.get_logger().info(
             f"state_dim={self.state_dim} action_dim={self.action_dim} temporal_agg={self.temporal_agg} fps={self.fps}"
         )
@@ -227,39 +235,77 @@ class FrankaActRolloutNode(Node):
             raw_action = self.all_actions[:, self.t % self.query_frequency]
 
         raw_action = raw_action.squeeze(0).detach().cpu().numpy()
-        return self.post_process(raw_action)
+        return raw_action
 
-    def publish_action(self, action: np.ndarray) -> None:
-        if action.shape[0] < 7:
-            raise RuntimeError(f"Predicted action has dim {action.shape[0]}, expected at least 7")
+    def publish_initial_gripper_open(self) -> None:
+        msg = Bool()
+        msg.data = False
+        self.gripper_state_pub.publish(msg)
+        self.gripper_closed_state = False
+        self.last_gripper_state_publish_time = time.time()
+        self.sent_initial_gripper_state = True
+        self.get_logger().info("Published initial gripper state OPEN")
+
+    def publish_action(self, raw_action: np.ndarray) -> Tuple[float, bool, bool]:
+        if raw_action.shape[0] < 7:
+            raise RuntimeError(f"Predicted action has dim {raw_action.shape[0]}, expected at least 7")
+
+        # Denormalize only continuous twist dimensions.
+        twist = raw_action[:6] * self.action_std[:6] + self.action_mean[:6]
+
+        twist[0] = np.clip(twist[0], -0.03, 0.03)
+        twist[1] = np.clip(twist[1], -0.03, 0.03)
+        twist[2] = np.clip(twist[2], -0.03, 0.03)
+
+        twist[3] = np.clip(twist[3], -0.10, 0.10)
+        twist[4] = np.clip(twist[4], -0.10, 0.10)
+        twist[5] = np.clip(twist[5], -0.10, 0.10)
 
         twist_msg = TwistStamped()
         twist_msg.header.stamp = self.get_clock().now().to_msg()
         twist_msg.header.frame_id = "base_link"
-        twist_msg.twist.linear.x = float(action[0])
-        twist_msg.twist.linear.y = float(action[1])
-        twist_msg.twist.linear.z = float(action[2])
-        twist_msg.twist.angular.x = float(action[3])
-        twist_msg.twist.angular.y = float(action[4])
-        twist_msg.twist.angular.z = float(action[5])
+        twist_msg.twist.linear.x = float(twist[0])
+        twist_msg.twist.linear.y = float(twist[1])
+        twist_msg.twist.linear.z = float(twist[2])
+        twist_msg.twist.angular.x = float(twist[3])
+        twist_msg.twist.angular.y = float(twist[4])
+        twist_msg.twist.angular.z = float(twist[5])
         self.twist_pub.publish(twist_msg)
 
-        gripper_msg = Float64()
-        gripper_msg.data = float(action[6])
-        #self.gripper_pub.publish(gripper_msg)
+        grip_logit = float(raw_action[-1])
+        grip_prob = 1.0 / (1.0 + np.exp(-grip_logit))
+
+        new_state = self.gripper_closed_state
+        if (not self.gripper_closed_state) and (grip_prob > self.close_threshold):
+            new_state = True
+        elif self.gripper_closed_state and (grip_prob < self.open_threshold):
+            new_state = False
+
+        did_publish = False
+        now_sec = time.time()
+        if new_state != self.gripper_closed_state:
+            if (now_sec - self.last_gripper_state_publish_time) > self.min_gripper_publish_interval:
+                gripper_msg = Bool()
+                gripper_msg.data = new_state
+                self.gripper_state_pub.publish(gripper_msg)
+                self.gripper_closed_state = new_state
+                self.last_gripper_state_publish_time = now_sec
+                did_publish = True
+
+        return grip_logit, grip_prob, did_publish
 
     def run_policy_step(self) -> None:
         with torch.inference_mode():
             t0 = time.time()
             qpos_numpy, qpos, curr_image = self.build_policy_inputs()
-            action = self.infer_action(qpos, curr_image)
-            action[2] *= 0.1
-            self.publish_action(action)
+            raw_action = self.infer_action(qpos, curr_image)
+            grip_logit, grip_prob, did_publish = self.publish_action(raw_action)
 
             dt_ms = (time.time() - t0) * 1000.0
             self.get_logger().info(
                 f"t={self.t:04d} qpos={qpos_numpy.tolist()} "
-                f"action={action.tolist()} gripper_target={float(action[6]):.6f} "
+                f"raw_action={raw_action.tolist()} grip_logit={grip_logit:.3f} grip_prob={grip_prob:.3f} "
+                f"gripper_state={'CLOSED' if self.gripper_closed_state else 'OPEN'} published={did_publish} "
                 f"inference_ms={dt_ms:.2f}"
             )
 
@@ -270,9 +316,20 @@ class FrankaActRolloutNode(Node):
                 if self.temporal_agg:
                     self.all_time_actions.zero_()
 
+            # logging
+            denorm_action = raw_action * self.action_std + self.action_mean
+
+            print(
+                f"raw={raw_action} "
+                f"denorm={denorm_action} "
+            )
+
     def timer_cb(self) -> None:
         if not self.ready():
             return
+
+        if not self.sent_initial_gripper_state:
+            self.publish_initial_gripper_open()
 
         if not self.running:
             self.running = True
@@ -294,7 +351,7 @@ def main():
     parser.add_argument("--image_topic", type=str, default="/camera/camera/color/image_raw")
     parser.add_argument("--joint_topic", type=str, default="/joint_states")
     parser.add_argument("--twist_topic", type=str, default="/cartesian_cmd/twist")
-    parser.add_argument("--gripper_topic", type=str, default="/teleop/gripper_cmd")
+    parser.add_argument("--gripper_state_topic", type=str, default="/teleop/gripper_state_cmd")
 
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--max_timesteps", type=int, default=100000)
@@ -315,6 +372,9 @@ def main():
     parser.add_argument("--nheads", type=int, default=8)
 
     parser.add_argument("--start_immediately", action="store_true")
+    parser.add_argument("--use_bce_last_action_dim", action="store_true")
+    parser.add_argument("--no_use_bce_last_action_dim", action="store_false", dest="use_bce_last_action_dim")
+    parser.set_defaults(use_bce_last_action_dim=True)
 
     args = parser.parse_args()
 
