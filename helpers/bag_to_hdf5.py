@@ -4,7 +4,7 @@ import os
 import gc
 import argparse
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import cv2
 import h5py
 import numpy as np
@@ -197,11 +197,16 @@ def extract_episode_windows(bag_path: str) -> List[EpisodeWindow]:
     topic_type_map = get_topic_type_map(reader)
     msg_types = get_type_class_map(topic_type_map)
 
-    starts = []
-    ends = []
+    current_start: Optional[float] = None
+    committed_windows: List[EpisodeWindow] = []
 
     n_total = 0
     n_episode_msgs = 0
+    n_start = 0
+    n_stop = 0
+    n_cancel_current = 0
+    n_cancel_last = 0
+    n_ignored = 0
 
     while reader.has_next():
         topic, raw, t_ns = reader.read_next()
@@ -220,42 +225,87 @@ def extract_episode_windows(bag_path: str) -> List[EpisodeWindow]:
         log(f"[DEBUG] /episode/control at {t:.6f}s -> {msg.data}")
 
         if msg.data == 1:
-            starts.append(t)
+            n_start += 1
+            if current_start is not None:
+                log(
+                    "[WARNING] start received while already recording; "
+                    "ignoring duplicate start"
+                )
+            else:
+                current_start = t
+                log(f"[INFO] start recording candidate episode at {t:.6f}")
+
         elif msg.data == 2:
-            ends.append(t)
+            n_stop += 1
+            if current_start is None:
+                log("[WARNING] stop received while not recording; ignoring")
+            else:
+                ep = EpisodeWindow(
+                    idx=len(committed_windows),
+                    start=current_start,
+                    end=t,
+                )
+                committed_windows.append(ep)
+                log(
+                    f"[INFO] committed candidate episode {ep.idx}: "
+                    f"start={ep.start:.6f}, end={ep.end:.6f}, dur={ep.end - ep.start:.3f}s"
+                )
+                current_start = None
+
+        elif msg.data == 3:
+            n_cancel_current += 1
+            if current_start is None:
+                log("[WARNING] cancel_current received while not recording; ignoring")
+            else:
+                log(
+                    f"[INFO] cancelled current candidate episode: "
+                    f"start={current_start:.6f}, cancel_time={t:.6f}"
+                )
+                current_start = None
+
+        elif msg.data == 4:
+            n_cancel_last += 1
+            if current_start is not None:
+                log(
+                    "[WARNING] cancel_last received while currently recording; "
+                    "ignoring"
+                )
+            elif committed_windows:
+                popped = committed_windows.pop()
+                log(
+                    f"[INFO] removed last committed candidate episode: "
+                    f"idx={popped.idx}, start={popped.start:.6f}, end={popped.end:.6f}"
+                )
+                for i, ep in enumerate(committed_windows):
+                    ep.idx = i
+            else:
+                log("[WARNING] cancel_last received but no committed episode exists")
+
+        else:
+            n_ignored += 1
+            log(f"[WARNING] unknown /episode/control value {msg.data}; ignoring")
 
     log(f"[INFO] pass1 done. total messages read: {n_total}")
     log(f"[INFO] episode control messages: {n_episode_msgs}")
-    log(f"[INFO] starts found: {len(starts)}")
-    log(f"[INFO] ends found:   {len(ends)}")
+    log(f"[INFO] marker counts: start={n_start}, stop={n_stop}, cancel_current={n_cancel_current}, cancel_last={n_cancel_last}, ignored={n_ignored}")
 
-    # Pair each start with the next end after it.
-    windows = []
-    end_idx = 0
-    last_end = -np.inf
+    if current_start is not None:
+        log(
+            f"[WARNING] bag ended while recording candidate episode from "
+            f"{current_start:.6f}; discarding unfinished candidate"
+        )
 
-    for i, s in enumerate(starts):
-        if s <= last_end:
-            log(f"[WARNING] skipping start {i} because it is before previous end")
-            continue
+    if not committed_windows:
+        raise RuntimeError("No valid episode windows found after cancellation handling.")
 
-        while end_idx < len(ends) and ends[end_idx] <= s:
-            end_idx += 1
+    log("[INFO] final committed candidate windows before duration filtering:")
+    for ep in committed_windows:
+        log(
+            f"       episode {ep.idx}: start={ep.start:.6f}, "
+            f"end={ep.end:.6f}, dur={ep.end - ep.start:.3f}s"
+        )
 
-        if end_idx >= len(ends):
-            log(f"[WARNING] no matching end found for start at {s:.6f}")
-            break
-
-        e = ends[end_idx]
-        windows.append(EpisodeWindow(idx=len(windows), start=s, end=e))
-        log(f"[INFO] episode {len(windows)-1}: start={s:.6f}, end={e:.6f}, dur={e-s:.3f}s")
-        last_end = e
-        end_idx += 1
-
-    if not windows:
-        raise RuntimeError("No valid episode windows found.")
-
-    return windows
+    return committed_windows
 
 
 def first_index_ge(times: List[float], t: float, start_idx: int = 0) -> int:
@@ -577,7 +627,11 @@ def main():
         if duration < MIN_DURATION:
             log(f"[INFO] dropping episode {ep.idx}: too short ({duration:.3f}s)")
         else:
-            filtered_windows.append(ep)
+            filtered_windows.append(EpisodeWindow(
+                idx=len(filtered_windows),
+                start=ep.start,
+                end=ep.end,
+            ))
 
     log(f"[INFO] kept {len(filtered_windows)} / {len(windows)} episodes after filtering")
 
