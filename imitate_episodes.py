@@ -36,8 +36,13 @@ def main(args):
     num_epochs = args['num_epochs']
     use_waypoint = args['use_waypoint']
     constant_waypoint = args['constant_waypoint']
-    dataset_dir = args['dataset_dir']
-    num_episodes = args['num_episodes']
+    dataset_dirs = args['dataset_dirs']
+    if dataset_dirs is not None:
+        dataset_source = dataset_dirs
+    else:
+        dataset_source = args['dataset_dir']
+        if dataset_source is None:
+            raise ValueError("Either --dataset_dir or --dataset_dirs must be provided.")
     camera_names = args['camera_names']
     data_mode = args['data_mode']
     img_aug = args['img_aug']
@@ -120,10 +125,9 @@ def main(args):
     wandb.init(
         project=task_name,
         config={
-            "dataset": dataset_dir,
+            "dataset": dataset_source,
             "camera names": camera_names,
             "model dof": state_dim,
-            "num episodes": num_episodes,
             "ckpt dir": ckpt_dir,
             "chunk size": args['chunk_size'],
             "batch size": batch_size_train,
@@ -149,8 +153,7 @@ def main(args):
 
     if args['data_mode'] == 'pose':
         train_dataloader, val_dataloader, stats, _ = load_pose_data(
-            dataset_dir,
-            num_episodes,
+            dataset_source,
             camera_names,
             args['chunk_size'],
             batch_size_train,
@@ -159,8 +162,7 @@ def main(args):
         )
     elif args['data_mode'] == 'joint':
         train_dataloader, val_dataloader, stats, _ = load_joint_data(
-            dataset_dir,
-            num_episodes,
+            dataset_source,
             camera_names,
             args['chunk_size'],
             batch_size_train,
@@ -557,14 +559,14 @@ if __name__ == '__main__':
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
     parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
-    parser.add_argument('--dataset_dir', action='store', type=str, help='dataset_dir', required=True)
+    parser.add_argument('--dataset_dir', action='store', type=str, help='dataset_dir', required=False)
+    parser.add_argument('--dataset_dirs', nargs='+', type=str, required=False, default=None, help='dataset directories')
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--episode_len', action='store', type=int, help='episode_len for eval rollouts', required=False, default=400)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
-    parser.add_argument('--num_episodes', action='store', type=int, help='num_episodes', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
     parser.add_argument('--camera_names', nargs='+', required=True, help='camera names to load from dataset')
     parser.add_argument('--data_mode', choices=['joint', 'pose'], required=True, help='dataset mode')
