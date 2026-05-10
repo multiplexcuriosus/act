@@ -253,9 +253,11 @@ class FrankaActRolloutNode(Node):
         # Denormalize only continuous twist dimensions.
         twist = raw_action[:6] * self.action_std[:6] + self.action_mean[:6]
 
-        twist[0] = np.clip(twist[0], -0.03, 0.03)
-        twist[1] = np.clip(twist[1], -0.03, 0.03)
-        twist[2] = np.clip(twist[2], -0.03, 0.03)
+        CLIP_MAG = 0.05
+
+        twist[0] = np.clip(twist[0], -CLIP_MAG, CLIP_MAG)
+        twist[1] = np.clip(twist[1], -CLIP_MAG, CLIP_MAG)
+        twist[2] = np.clip(twist[2], -CLIP_MAG, CLIP_MAG)
 
         twist[3] = np.clip(twist[3], -0.10, 0.10)
         twist[4] = np.clip(twist[4], -0.10, 0.10)
