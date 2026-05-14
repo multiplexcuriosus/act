@@ -16,6 +16,8 @@ color_transform = transforms.ColorJitter(brightness=0.5,
                            hue=0.1,
                           )
 
+DEFAULT_IMAGE_SIZE = (320, 320)
+
 
 DEFAULT_JOINT_DATA_CONFIG = {
     "qpos_dim": None,
@@ -63,6 +65,57 @@ def rotate_n_crop_transform(img, size=(360, 480), angle=None, top=None):
     img = transforms.functional.rotate(img, angle)
     img = transforms.functional.crop(img, *top, *size)
     return img
+
+
+def _is_grayscale_image(img):
+    if img.ndim == 2:
+        return True
+    if img.ndim == 3 and img.shape[-1] == 1:
+        return True
+    return False
+
+
+def _is_event_frame(cam_name, img):
+    return ('event' in cam_name.lower()) or _is_grayscale_image(img)
+
+
+def prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=False):
+    img = np.asarray(img)
+    if img.ndim == 2:
+        img = img[..., None]
+    if img.ndim != 3:
+        raise ValueError(f"Unsupported image shape: {img.shape}")
+    if img.shape[-1] not in (1, 3):
+        raise ValueError(f"Unsupported channel count: {img.shape[-1]} for image shape {img.shape}")
+
+    pil_input = img[..., 0] if img.shape[-1] == 1 else img
+    pil_img = transforms.functional.to_pil_image(pil_input)
+    pil_img = transforms.functional.resize(pil_img, list(target_size))
+
+    resized_img = np.asarray(pil_img)
+    if resized_img.ndim == 2:
+        resized_img = resized_img[..., None]
+
+    if force_rgb and resized_img.shape[-1] == 1:
+        resized_img = np.repeat(resized_img, 3, axis=-1)
+
+    return resized_img
+
+
+def _print_image_pipeline_info(camera_names):
+    camera_list = ', '.join(camera_names)
+    event_camera_names = [name for name in camera_names if 'event' in name.lower()]
+    target_h, target_w = DEFAULT_IMAGE_SIZE
+
+    print(f"[INFO] Camera names: {camera_list}")
+    if event_camera_names:
+        for event_camera_name in event_camera_names:
+            print(f"[INFO] Event camera detected: {event_camera_name}")
+    else:
+        print("[INFO] Event camera detected: none (grayscale auto-detect still enabled)")
+    print("[INFO] Event preprocessing enabled: True (camera-name or grayscale auto-detect)")
+    print(f"[INFO] Resizing all images to {target_h}x{target_w}")
+    print("[INFO] Event frames converted to fake RGB for ResNet compatibility")
 
 
 def _natural_episode_sort_key(dataset_path):
@@ -314,6 +367,7 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.img_aug = img_aug
         self.is_sim = None
+        _print_image_pipeline_info(self.camera_names)
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -339,27 +393,37 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                 if cam_name.endswith('stereo'):
                     left_img = root[f'/observations/images/{cam_name[:-6]}left'][start_ts]
                     right_img = root[f'/observations/images/{cam_name[:-6]}right'][start_ts]
+                    left_is_event = _is_event_frame(cam_name, left_img)
+                    right_is_event = _is_event_frame(cam_name, right_img)
                     left_img = transforms.functional.to_pil_image(left_img)
                     right_img = transforms.functional.to_pil_image(right_img)
                     if self.img_aug:
                         angle = np.random.random() * 10 - 5
                         top_h = np.random.randint(0, 120)
                         top_w = np.random.randint(0, 160)
-                        left_img = color_transform(left_img)
+                        if not left_is_event:
+                            left_img = color_transform(left_img)
                         left_img = rotate_n_crop_transform(left_img, [480, 640], angle, (top_h, top_w))
-                        right_img = color_transform(right_img)
+                        if not right_is_event:
+                            right_img = color_transform(right_img)
                         right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
-                    left_img = transforms.functional.resize(left_img, [480, 640])
-                    right_img = transforms.functional.resize(right_img, [480, 640])
-                    image_dict[cam_name] = np.concatenate([left_img, right_img], axis=1) # width dimension
+                    left_img = prepare_image(left_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=left_is_event)
+                    right_img = prepare_image(right_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=right_is_event)
+                    stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
+                    image_dict[cam_name] = prepare_image(
+                        stereo_img,
+                        target_size=DEFAULT_IMAGE_SIZE,
+                        force_rgb=(left_is_event or right_is_event),
+                    )
                 else:
                     img = root[f'/observations/images/{cam_name}'][start_ts]
+                    is_event = _is_event_frame(cam_name, img)
                     img = transforms.functional.to_pil_image(img)
                     if self.img_aug:
-                        img = color_transform(img)
+                        if not is_event:
+                            img = color_transform(img)
                         img = rotate_n_crop_transform(img)
-                    #img = transforms.functional.resize(img, [480, 640])
-                    image_dict[cam_name] = img
+                    image_dict[cam_name] = prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=is_event)
             # get all actions after and including start_ts
             action = root[self.action_key][start_ts:min(start_ts+self.chunk_size, episode_len)]
             if self.action_indices is not None:
@@ -553,6 +617,7 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.img_aug = img_aug
         self.is_sim = None
+        _print_image_pipeline_info(self.camera_names)
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -576,27 +641,37 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                 if cam_name.endswith('stereo'):
                     left_img = root[f'/observations/images/{cam_name[:-6]}left'][start_ts]
                     right_img = root[f'/observations/images/{cam_name[:-6]}right'][start_ts]
+                    left_is_event = _is_event_frame(cam_name, left_img)
+                    right_is_event = _is_event_frame(cam_name, right_img)
                     left_img = transforms.functional.to_pil_image(left_img)
                     right_img = transforms.functional.to_pil_image(right_img)
                     if self.img_aug:
                         angle = np.random.random() * 10 - 5
                         top_h = np.random.randint(0, 120)
                         top_w = np.random.randint(0, 160)
-                        left_img = color_transform(left_img)
+                        if not left_is_event:
+                            left_img = color_transform(left_img)
                         left_img = rotate_n_crop_transform(left_img, [480, 640], angle, (top_h, top_w))
-                        right_img = color_transform(right_img)
+                        if not right_is_event:
+                            right_img = color_transform(right_img)
                         right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
-                    left_img = transforms.functional.resize(left_img, [480, 640])
-                    right_img = transforms.functional.resize(right_img, [480, 640])
-                    image_dict[cam_name] = np.concatenate([left_img, right_img], axis=1) # width dimension
+                    left_img = prepare_image(left_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=left_is_event)
+                    right_img = prepare_image(right_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=right_is_event)
+                    stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
+                    image_dict[cam_name] = prepare_image(
+                        stereo_img,
+                        target_size=DEFAULT_IMAGE_SIZE,
+                        force_rgb=(left_is_event or right_is_event),
+                    )
                 else:
                     img = root[f'/observations/images/{cam_name}'][start_ts]
+                    is_event = _is_event_frame(cam_name, img)
                     img = transforms.functional.to_pil_image(img)
                     if self.img_aug:
-                        img = color_transform(img)
+                        if not is_event:
+                            img = color_transform(img)
                         img = rotate_n_crop_transform(img)
-                    #img = transforms.functional.resize(img, [480, 640])
-                    image_dict[cam_name] = img
+                    image_dict[cam_name] = prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=is_event)
             # get all actions after and including start_ts
             action = root['/ee_action_global'][start_ts:min(start_ts+self.chunk_size, episode_len)]
             action_len, action_dof = action.shape
