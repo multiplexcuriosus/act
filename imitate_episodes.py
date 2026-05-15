@@ -1,8 +1,13 @@
-import torch
-import numpy as np
+import argparse
+import datetime
+import json
 import os
 import pickle
-import argparse
+import platform
+import socket
+import subprocess
+import torch
+import numpy as np
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
@@ -70,6 +75,11 @@ def main(args):
     else:
         raise ValueError(f"Unsupported data_mode: {data_mode}")
 
+    if not os.path.isdir(ckpt_dir):
+        os.makedirs(ckpt_dir)
+
+    run_id = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
     # fixed parameters
     lr_backbone = 1e-5
     backbone = 'resnet18'
@@ -118,7 +128,20 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'run_id': run_id,
+        'dataset_source': dataset_source,
+        'batch_size_train': batch_size_train,
+        'batch_size_val': batch_size_val,
+        'img_aug': img_aug,
+        'data_mode': data_mode,
+        'use_waypoint': use_waypoint,
+        'constant_waypoint': constant_waypoint,
+        'profile_memory': args['profile_memory'],
+        'memory_profile_num_epochs': args['memory_profile_num_epochs'],
+        'json_log_interval_epochs': 10,
+        'checkpoint_interval': args['checkpoint_interval'],
+        'log_path': os.path.join(ckpt_dir, f'run_metrics_{run_id}.json')
     }
     '''
     wandb.login(key = '7afe8f0cb860fa959ee2daf0f8ba40575f703063')
@@ -228,6 +251,104 @@ def make_optimizer(policy_class, policy):
     else:
         raise NotImplementedError
     return optimizer
+
+
+def get_profile_epochs(num_epochs, num_profile_epochs):
+    if num_profile_epochs <= 0:
+        return set()
+    if num_epochs <= 0:
+        return set()
+    if num_profile_epochs == 1:
+        return {0}
+    return set(int(round(x)) for x in np.linspace(0, num_epochs - 1, num_profile_epochs))
+
+
+def make_json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(key): make_json_safe(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_safe(value) for value in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        if obj.size <= 32:
+            return obj.tolist()
+        return {'shape': list(obj.shape), 'dtype': str(obj.dtype)}
+    if torch.is_tensor(obj):
+        if obj.numel() == 1:
+            return obj.detach().cpu().item()
+        return {'shape': list(obj.shape), 'dtype': str(obj.dtype), 'device': str(obj.device)}
+    if hasattr(obj, 'as_posix'):
+        try:
+            return str(obj)
+        except Exception:
+            pass
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
+def tensor_to_float_dict(d):
+    result = {}
+    for key, value in d.items():
+        if torch.is_tensor(value) and value.numel() == 1:
+            result[key] = float(value.detach().cpu().item())
+        elif isinstance(value, np.generic):
+            result[key] = float(value.item())
+        elif isinstance(value, (int, float)):
+            result[key] = float(value)
+        else:
+            result[key] = make_json_safe(value)
+    return result
+
+
+def write_json_atomic(path, obj):
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w') as f:
+        json.dump(make_json_safe(obj), f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def get_git_commit():
+    try:
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return None
+
+
+def get_gpu_info():
+    if torch.cuda.is_available():
+        current_device = torch.cuda.current_device()
+        return {
+            'cuda_available': True,
+            'device_count': torch.cuda.device_count(),
+            'current_device': current_device,
+            'device_name': torch.cuda.get_device_name(current_device),
+            'cuda_version': torch.version.cuda,
+        }
+    return {'cuda_available': False}
+
+
+def count_parameters(model):
+    return {
+        'total': sum(p.numel() for p in model.parameters()),
+        'trainable': sum(p.numel() for p in model.parameters() if p.requires_grad),
+    }
+
+
+def summarize_memory_samples(samples, phase):
+    phase_samples = [sample for sample in samples if sample['phase'] == phase]
+    if not phase_samples:
+        return None
+    return {
+        'num_samples': len(phase_samples),
+        'peak_allocated_mb_max': max(sample['peak_allocated_mb'] for sample in phase_samples),
+        'peak_reserved_mb_max': max(sample['peak_reserved_mb'] for sample in phase_samples),
+        'current_allocated_mb_last': phase_samples[-1]['current_allocated_mb'],
+        'current_reserved_mb_last': phase_samples[-1]['current_reserved_mb'],
+        'step_time_s_mean': float(np.mean([sample['step_time_s'] for sample in phase_samples])),
+        'step_time_s_max': float(np.max([sample['step_time_s'] for sample in phase_samples])),
+    }
 
 
 def get_image(ts, camera_names):
@@ -418,6 +539,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
+    checkpoint_interval = int(config.get('checkpoint_interval', 1000))
 
     set_seed(seed)
 
@@ -427,31 +549,113 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
+    profile_epochs = get_profile_epochs(
+        num_epochs,
+        int(config.get('memory_profile_num_epochs', 3))
+    )
+
+    run_log = {
+        'run_id': config.get('run_id'),
+        'created_at': datetime.datetime.now().isoformat(),
+        'finished_at': None,
+        'status': 'running',
+        'hostname': socket.gethostname(),
+        'platform': platform.platform(),
+        'python_version': platform.python_version(),
+        'git_commit': get_git_commit(),
+        'gpu': get_gpu_info(),
+        'config': make_json_safe(config),
+        'architecture': {
+            'policy_class': policy_class,
+            'hidden_dim': policy_config.get('hidden_dim'),
+            'dim_feedforward': policy_config.get('dim_feedforward'),
+            'num_queries': policy_config.get('num_queries'),
+            'chunk_size': policy_config.get('num_queries'),
+            'enc_layers': policy_config.get('enc_layers'),
+            'dec_layers': policy_config.get('dec_layers'),
+            'nheads': policy_config.get('nheads'),
+            'backbone': policy_config.get('backbone'),
+            'camera_names': policy_config.get('camera_names'),
+            'state_dim': policy_config.get('state_dim'),
+            'action_dim': policy_config.get('action_dim'),
+            'use_bce_last_action_dim': policy_config.get('use_bce_last_action_dim'),
+            'temporal_agg': config.get('temporal_agg'),
+            'batch_size_train': config.get('batch_size_train'),
+            'batch_size_val': config.get('batch_size_val')
+        },
+        'model': count_parameters(policy),
+        'profile_memory': bool(config.get('profile_memory', False)),
+        'profile_epochs': sorted(list(profile_epochs)),
+        'epochs': [],
+        'memory_profiles': [],
+        'best': {
+            'train': None,
+            'val': None
+        }
+    }
+    write_json_atomic(config['log_path'], run_log)
+
     train_history = []
     validation_history = []
     min_train_loss = [np.inf, np.inf]
     min_val_loss = [np.inf, np.inf]
     train_best_ckpt_info = None
     best_ckpt_info = None
+    train_best_epoch = None
+    best_epoch = None
+    epoch_val_loss = None
+    epoch_train_loss = None
     for epoch in tqdm(range(latest_idx, num_epochs)):
         wandb_log = {}
+        epoch_start_time = time.perf_counter()
+        epoch_memory_profile = []
+        should_profile_epoch = (
+            bool(config.get('profile_memory', False))
+            and epoch in profile_epochs
+            and torch.cuda.is_available()
+        )
 
         # training
         policy.train()
         optimizer.zero_grad()
+        train_epoch_dicts = []
         for batch_idx, data in enumerate(train_dataloader):
+            if should_profile_epoch:
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                step_start_time = time.perf_counter()
+
             forward_dict = forward_pass(data, policy)
             # backward
             loss = forward_dict['loss']
+            detached_forward_dict = detach_dict(forward_dict)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            train_history.append(detach_dict(forward_dict))
-        e = epoch - latest_idx
-        epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*e:(batch_idx+1)*(epoch+1)])
-        epoch_train_loss = epoch_summary['loss']
+            train_epoch_dicts.append(detached_forward_dict)
+
+            if should_profile_epoch:
+                torch.cuda.synchronize()
+                step_time_s = time.perf_counter() - step_start_time
+                mem_sample = {
+                    'phase': 'train',
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'wall_time_s': time.time(),
+                    'step_time_s': step_time_s,
+                    'peak_allocated_mb': torch.cuda.max_memory_allocated() / 1024**2,
+                    'peak_reserved_mb': torch.cuda.max_memory_reserved() / 1024**2,
+                    'current_allocated_mb': torch.cuda.memory_allocated() / 1024**2,
+                    'current_reserved_mb': torch.cuda.memory_reserved() / 1024**2,
+                    'losses': tensor_to_float_dict(detached_forward_dict)
+                }
+                epoch_memory_profile.append(mem_sample)
+
+        train_epoch_summary = compute_dict_mean(train_epoch_dicts)
+        train_history.append(train_epoch_summary)
+        epoch_train_loss = train_epoch_summary['loss']
         train_summary_string = '    '
-        for k, v in epoch_summary.items():
+        for k, v in train_epoch_summary.items():
             train_summary_string += f'{k}: {v.item():.3f} '
             wandb_log[f'Train {k}'] = v.item()
 
@@ -460,29 +664,101 @@ def train_bc(train_dataloader, val_dataloader, config):
             policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
+                if should_profile_epoch:
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
+                    val_start_time = time.perf_counter()
+
                 forward_dict = forward_pass(data, policy)
-                epoch_dicts.append(forward_dict)
-            epoch_summary = compute_dict_mean(epoch_dicts)
-            validation_history.append(epoch_summary)
-            epoch_val_loss = epoch_summary['loss']
+                detached_forward_dict = detach_dict(forward_dict)
+                epoch_dicts.append(detached_forward_dict)
+
+                if should_profile_epoch:
+                    torch.cuda.synchronize()
+                    val_step_time_s = time.perf_counter() - val_start_time
+                    val_mem_sample = {
+                        'phase': 'val',
+                        'epoch': epoch,
+                        'batch_idx': batch_idx,
+                        'wall_time_s': time.time(),
+                        'step_time_s': val_step_time_s,
+                        'peak_allocated_mb': torch.cuda.max_memory_allocated() / 1024**2,
+                        'peak_reserved_mb': torch.cuda.max_memory_reserved() / 1024**2,
+                        'current_allocated_mb': torch.cuda.memory_allocated() / 1024**2,
+                        'current_reserved_mb': torch.cuda.memory_reserved() / 1024**2,
+                        'losses': tensor_to_float_dict(detached_forward_dict)
+                    }
+                    epoch_memory_profile.append(val_mem_sample)
+
+            val_epoch_summary = compute_dict_mean(epoch_dicts)
+            validation_history.append(val_epoch_summary)
+            epoch_val_loss = val_epoch_summary['loss']
         val_summary_string = '    '
-        for k, v in epoch_summary.items():
+        for k, v in val_epoch_summary.items():
             val_summary_string += f'{k}: {v.item():.3f} '
             wandb_log[f'Val {k}'] = v.item()
-        
-        # wandb.log(wandb_log)
+
+        epoch_duration_s = time.perf_counter() - epoch_start_time
+
+        train_memory_summary = summarize_memory_samples(epoch_memory_profile, 'train')
+        val_memory_summary = summarize_memory_samples(epoch_memory_profile, 'val')
 
         if epoch_train_loss < min_train_loss[0]:
             min_train_loss = [epoch_train_loss, epoch_val_loss]
+            train_best_epoch = epoch
             train_best_ckpt_info = (epoch, min_train_loss, deepcopy(policy.state_dict()))
+            run_log['best']['train'] = {
+                'epoch': int(train_best_epoch),
+                'train_loss': float(epoch_train_loss.detach().cpu().item() if torch.is_tensor(epoch_train_loss) else epoch_train_loss),
+                'val_loss': float(epoch_val_loss.detach().cpu().item() if torch.is_tensor(epoch_val_loss) else epoch_val_loss)
+            }
         if epoch_val_loss < min_val_loss[1]:
             min_val_loss = [epoch_train_loss, epoch_val_loss]
+            best_epoch = epoch
             best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+            run_log['best']['val'] = {
+                'epoch': int(best_epoch),
+                'train_loss': float(epoch_train_loss.detach().cpu().item() if torch.is_tensor(epoch_train_loss) else epoch_train_loss),
+                'val_loss': float(epoch_val_loss.detach().cpu().item() if torch.is_tensor(epoch_val_loss) else epoch_val_loss)
+            }
+
+        run_log['epochs'].append({
+            'epoch': epoch,
+            'wall_time_s': time.time(),
+            'epoch_duration_s': epoch_duration_s,
+            'profiled_memory': bool(should_profile_epoch),
+            'train': {
+                'loss': float(epoch_train_loss.detach().cpu().item() if torch.is_tensor(epoch_train_loss) else epoch_train_loss),
+                'losses': tensor_to_float_dict(train_epoch_summary),
+                'memory_summary': train_memory_summary
+            },
+            'val': {
+                'loss': float(epoch_val_loss.detach().cpu().item() if torch.is_tensor(epoch_val_loss) else epoch_val_loss),
+                'losses': tensor_to_float_dict(val_epoch_summary),
+                'memory_summary': val_memory_summary
+            }
+        })
+        if should_profile_epoch:
+            run_log['memory_profiles'].append({
+                'epoch': epoch,
+                'samples': epoch_memory_profile
+            })
+
+        should_write_log = (
+            epoch == 0 or
+            epoch == num_epochs - 1 or
+            should_profile_epoch or
+            epoch % 10 == 0
+        )
+        if should_write_log:
+            write_json_atomic(config['log_path'], run_log)
+        
+        # wandb.log(wandb_log)
         
         if epoch % 100 == 0:
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
-        if epoch % 1000 == 0:
+        if checkpoint_interval > 0 and epoch % checkpoint_interval == 0:
             if train_best_ckpt_info is not None:
                 train_best_epoch, min_train_loss, train_best_state_dict = train_best_ckpt_info
                 train_best_ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{train_best_epoch}_seed_{seed}.ckpt')
@@ -502,6 +778,13 @@ def train_bc(train_dataloader, val_dataloader, config):
             print(f'    Train loss:  {min_train_loss[0]:.6f} Val loss: {min_train_loss[1]:.6f}')
             print(f'  Best val loss at epoch {best_epoch}')
             print(f'    Train loss: {min_val_loss[0]:.6f} Val loss: {min_val_loss[1]:.6f}')
+            if should_profile_epoch:
+                print(f'  Memory profile epoch: {epoch}')
+                print(f'  Train peak allocated: {train_memory_summary["peak_allocated_mb_max"]:.1f} MB')
+                print(f'  Train peak reserved:  {train_memory_summary["peak_reserved_mb_max"]:.1f} MB')
+                print(f'  Val peak allocated:   {val_memory_summary["peak_allocated_mb_max"]:.1f} MB')
+                print(f'  Val peak reserved:    {val_memory_summary["peak_reserved_mb_max"]:.1f} MB')
+            print(f'  JSON log: {config["log_path"]}')
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
@@ -516,7 +799,11 @@ def train_bc(train_dataloader, val_dataloader, config):
         best_ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
         torch.save(best_state_dict, best_ckpt_path)
 
-    print(f'\Training finished:')
+    run_log['finished_at'] = datetime.datetime.now().isoformat()
+    run_log['status'] = 'finished'
+    write_json_atomic(config['log_path'], run_log)
+
+    print(f'\nTraining finished:')
     print(f'  Val loss:   {epoch_val_loss:.5f}')
     print(val_summary_string)
     print(f'  Train loss: {epoch_train_loss:.5f}')
@@ -525,6 +812,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     print(f'    train loss:  {min_train_loss[0]:.5f} val loss: {min_train_loss[1]:.5f}')
     print(f'  Best val loss at epoch {best_epoch}')
     print(f'    train loss: {min_val_loss[0]:.5f} val loss: {min_val_loss[1]:.5f}')
+    print(f'  JSON log: {config["log_path"]}')
     
     # save training curves
     plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
@@ -575,6 +863,9 @@ if __name__ == '__main__':
     parser.add_argument('--img_aug', action='store_true', help='enable image augmentation (disabled by default)')
     parser.add_argument('--use_bce_last_action_dim', action='store_true', help='use BCEWithLogits on final action dim')
     parser.add_argument('--no_use_bce_last_action_dim', action='store_false', dest='use_bce_last_action_dim', help='disable BCEWithLogits on final action dim')
+    parser.add_argument('--profile_memory', action='store_true', help='enable sparse CUDA memory profiling at first/mid/last epoch')
+    parser.add_argument('--memory_profile_num_epochs', type=int, default=3, help='number of epochs to profile across training; default 3 gives first/mid/last')
+    parser.add_argument('--checkpoint_interval', type=int, default=1000, help='Save intermediate best checkpoints every N epochs. Use 0 to disable intermediate checkpointing.')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
