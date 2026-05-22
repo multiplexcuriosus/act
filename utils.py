@@ -1,8 +1,10 @@
 import numpy as np
 import torch
 import os
+import glob
+import re
 import h5py
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 import torchvision.transforms.v2 as transforms
 
 import IPython
@@ -13,6 +15,8 @@ color_transform = transforms.ColorJitter(brightness=0.5,
                            saturation=0.2,
                            hue=0.1,
                           )
+
+DEFAULT_IMAGE_SIZE = (320, 320)
 
 
 DEFAULT_JOINT_DATA_CONFIG = {
@@ -63,18 +67,130 @@ def rotate_n_crop_transform(img, size=(360, 480), angle=None, top=None):
     return img
 
 
+def _is_grayscale_image(img):
+    if img.ndim == 2:
+        return True
+    if img.ndim == 3 and img.shape[-1] == 1:
+        return True
+    return False
+
+
+def _is_event_frame(cam_name, img):
+    return ('event' in cam_name.lower()) or _is_grayscale_image(img)
+
+
+def prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=False):
+    img = np.asarray(img)
+    if img.ndim == 2:
+        img = img[..., None]
+    if img.ndim != 3:
+        raise ValueError(f"Unsupported image shape: {img.shape}")
+    if img.shape[-1] not in (1, 3):
+        raise ValueError(f"Unsupported channel count: {img.shape[-1]} for image shape {img.shape}")
+
+    pil_input = img[..., 0] if img.shape[-1] == 1 else img
+    pil_img = transforms.functional.to_pil_image(pil_input)
+    pil_img = transforms.functional.resize(pil_img, list(target_size))
+
+    resized_img = np.asarray(pil_img)
+    if resized_img.ndim == 2:
+        resized_img = resized_img[..., None]
+
+    if force_rgb and resized_img.shape[-1] == 1:
+        resized_img = np.repeat(resized_img, 3, axis=-1)
+
+    return resized_img
+
+
+def _print_image_pipeline_info(camera_names):
+    camera_list = ', '.join(camera_names)
+    event_camera_names = [name for name in camera_names if 'event' in name.lower()]
+    target_h, target_w = DEFAULT_IMAGE_SIZE
+
+    print(f"[INFO] Camera names: {camera_list}")
+    if event_camera_names:
+        for event_camera_name in event_camera_names:
+            print(f"[INFO] Event camera detected: {event_camera_name}")
+    else:
+        print("[INFO] Event camera detected: none (grayscale auto-detect still enabled)")
+    print("[INFO] Event preprocessing enabled: True (camera-name or grayscale auto-detect)")
+    print(f"[INFO] Resizing all images to {target_h}x{target_w}")
+    print("[INFO] Event frames converted to fake RGB for ResNet compatibility")
+
+
+def _natural_episode_sort_key(dataset_path):
+    basename = os.path.basename(dataset_path)
+    match = re.match(r'^episode_(\d+)\.hdf5$', basename)
+    if match is not None:
+        return (0, int(match.group(1)), basename)
+    return (1, basename)
+
+
+def _extract_episode_index(dataset_path):
+    basename = os.path.basename(dataset_path)
+    match = re.match(r'^episode_(\d+)\.hdf5$', basename)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _warn_if_episode_indices_noncontiguous(episode_paths):
+    episode_indices_by_dir = {}
+    for dataset_path in episode_paths:
+        episode_index = _extract_episode_index(dataset_path)
+        if episode_index is None:
+            continue
+        dataset_dir = os.path.dirname(dataset_path)
+        episode_indices_by_dir.setdefault(dataset_dir, []).append(episode_index)
+
+    for dataset_dir, episode_indices in episode_indices_by_dir.items():
+        unique_indices = sorted(set(episode_indices))
+        if not unique_indices:
+            continue
+        expected_indices = list(range(unique_indices[0], unique_indices[-1] + 1))
+        if unique_indices != expected_indices:
+            print(f"[WARN] Non-contiguous episode indices detected in {dataset_dir}: {unique_indices}")
+
+
+def collect_episode_paths(dataset_dirs):
+    if isinstance(dataset_dirs, str):
+        normalized_dataset_dirs = [dataset_dirs]
+    else:
+        normalized_dataset_dirs = list(dataset_dirs)
+
+    if len(normalized_dataset_dirs) == 0:
+        raise ValueError("No dataset directories were provided.")
+
+    episode_paths = []
+    for dataset_dir in normalized_dataset_dirs:
+        if not os.path.exists(dataset_dir):
+            raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+        if not os.path.isdir(dataset_dir):
+            raise FileNotFoundError(f"Dataset path is not a directory: {dataset_dir}")
+        dataset_episode_paths = glob.glob(os.path.join(dataset_dir, 'episode_*.hdf5'))
+        if len(dataset_episode_paths) == 0:
+            raise FileNotFoundError(f"No episode_*.hdf5 files found in dataset directory: {dataset_dir}")
+        dataset_episode_paths.sort(key=_natural_episode_sort_key)
+        episode_paths.extend(dataset_episode_paths)
+
+    if len(episode_paths) == 0:
+        joined_dirs = ', '.join(normalized_dataset_dirs)
+        raise FileNotFoundError(f"No episode_*.hdf5 files found in dataset directories: {joined_dirs}")
+
+    return episode_paths
+
+
 # =========================
 # split-selection helpers
 # =========================
 
-def _compute_episode_action_stats_joint(dataset_dir, num_episodes, action_indices=None, action_key='/action'):
+def _compute_episode_action_stats_joint(episode_paths, action_indices=None, action_key='/action'):
     """
     Per-episode stats for joint/action datasets.
     Uses only action distribution, since this generic loader does not know dx/dy.
     """
     episode_stats = []
-    for episode_idx in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+    for episode_idx, dataset_path in enumerate(episode_paths):
         with h5py.File(dataset_path, 'r') as root:
             action = root[action_key][()]
             if action_indices is not None:
@@ -91,13 +207,12 @@ def _compute_episode_action_stats_joint(dataset_dir, num_episodes, action_indice
     return episode_stats
 
 
-def _compute_episode_action_stats_pose(dataset_dir, num_episodes):
+def _compute_episode_action_stats_pose(episode_paths):
     """
     Per-episode stats for pose/action datasets.
     """
     episode_stats = []
-    for episode_idx in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+    for episode_idx, dataset_path in enumerate(episode_paths):
         with h5py.File(dataset_path, 'r') as root:
             action = root['/ee_action_global'][()]
         action = np.asarray(action, dtype=np.float32)
@@ -128,7 +243,7 @@ def _aggregate_episode_stats(episode_stats, indices):
     return {
         "mean_action": (weights[:, None] * mean_action).sum(axis=0),
         "pos_frac_action": (weights[:, None] * pos_frac_action).sum(axis=0),
-        "num_episodes": len(indices),
+        "num_selected": len(indices),
         "num_steps": int(sum(episode_stats[i]["num_steps"] for i in indices)),
     }
 
@@ -195,7 +310,6 @@ def _print_split_summary(train_indices, val_indices, episode_stats, header="Chos
 
 
 def _choose_balanced_episode_split(
-    num_episodes,
     episode_stats,
     train_ratio=0.8,
     num_trials=100,
@@ -206,11 +320,12 @@ def _choose_balanced_episode_split(
     Option A:
     Try many random episode-level splits and keep the most balanced one.
     """
-    if num_episodes < 2:
+    episode_count = len(episode_stats)
+    if episode_count < 2:
         raise ValueError("Need at least 2 episodes to create train/val split.")
 
-    num_train = int(train_ratio * num_episodes)
-    num_train = max(1, min(num_train, num_episodes - 1))
+    num_train = int(train_ratio * episode_count)
+    num_train = max(1, min(num_train, episode_count - 1))
 
     global_stats = _compute_global_episode_stats(episode_stats)
     rng = np.random.RandomState(seed)
@@ -220,7 +335,7 @@ def _choose_balanced_episode_split(
     best_val_indices = None
 
     for _ in range(num_trials):
-        shuffled = rng.permutation(num_episodes)
+        shuffled = rng.permutation(episode_count)
         train_indices = np.sort(shuffled[:num_train])
         val_indices = np.sort(shuffled[num_train:])
 
@@ -241,28 +356,27 @@ def _choose_balanced_episode_split(
 
 
 class EpisodicJointDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', img_aug=False):
+    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', img_aug=False):
         super(EpisodicJointDataset).__init__()
         self.qpos_indices = qpos_indices
         self.action_indices = action_indices
         self.action_key = action_key
-        self.episode_ids = episode_ids
-        self.dataset_dir = dataset_dir
+        self.episode_paths = list(episode_paths)
         self.camera_names = camera_names
         self.chunk_size = chunk_size
         self.norm_stats = norm_stats
         self.img_aug = img_aug
         self.is_sim = None
+        _print_image_pipeline_info(self.camera_names)
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
-        return len(self.episode_ids)
+        return len(self.episode_paths)
 
     def __getitem__(self, index):
         sample_full_episode = False # hardcode
         
-        episode_id = self.episode_ids[index]
-        dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
+        dataset_path = self.episode_paths[index]
         with h5py.File(dataset_path, 'r') as root:
             is_sim = root.attrs['sim']
             episode_len = root[self.action_key].shape[0]
@@ -279,27 +393,37 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                 if cam_name.endswith('stereo'):
                     left_img = root[f'/observations/images/{cam_name[:-6]}left'][start_ts]
                     right_img = root[f'/observations/images/{cam_name[:-6]}right'][start_ts]
+                    left_is_event = _is_event_frame(cam_name, left_img)
+                    right_is_event = _is_event_frame(cam_name, right_img)
                     left_img = transforms.functional.to_pil_image(left_img)
                     right_img = transforms.functional.to_pil_image(right_img)
                     if self.img_aug:
                         angle = np.random.random() * 10 - 5
                         top_h = np.random.randint(0, 120)
                         top_w = np.random.randint(0, 160)
-                        left_img = color_transform(left_img)
+                        if not left_is_event:
+                            left_img = color_transform(left_img)
                         left_img = rotate_n_crop_transform(left_img, [480, 640], angle, (top_h, top_w))
-                        right_img = color_transform(right_img)
+                        if not right_is_event:
+                            right_img = color_transform(right_img)
                         right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
-                    left_img = transforms.functional.resize(left_img, [480, 640])
-                    right_img = transforms.functional.resize(right_img, [480, 640])
-                    image_dict[cam_name] = np.concatenate([left_img, right_img], axis=1) # width dimension
+                    left_img = prepare_image(left_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=left_is_event)
+                    right_img = prepare_image(right_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=right_is_event)
+                    stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
+                    image_dict[cam_name] = prepare_image(
+                        stereo_img,
+                        target_size=DEFAULT_IMAGE_SIZE,
+                        force_rgb=(left_is_event or right_is_event),
+                    )
                 else:
                     img = root[f'/observations/images/{cam_name}'][start_ts]
+                    is_event = _is_event_frame(cam_name, img)
                     img = transforms.functional.to_pil_image(img)
                     if self.img_aug:
-                        img = color_transform(img)
+                        if not is_event:
+                            img = color_transform(img)
                         img = rotate_n_crop_transform(img)
-                    #img = transforms.functional.resize(img, [480, 640])
-                    image_dict[cam_name] = img
+                    image_dict[cam_name] = prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=is_event)
             # get all actions after and including start_ts
             action = root[self.action_key][start_ts:min(start_ts+self.chunk_size, episode_len)]
             if self.action_indices is not None:
@@ -335,12 +459,11 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def get_joint_norm_stats(dataset_dir, num_episodes, qpos_indices=None, action_indices=None, action_key='/action'):
+def get_joint_norm_stats(episode_paths, qpos_indices=None, action_indices=None, action_key='/action'):
     all_qpos_data = []
     all_action_data = []
 
-    for episode_idx in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+    for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
             qpos = root['/observations/qpos'][()]
             action = root[action_key][()]
@@ -374,8 +497,7 @@ def get_joint_norm_stats(dataset_dir, num_episodes, qpos_indices=None, action_in
 
 
 def load_joint_data(
-    dataset_dir,
-    num_episodes,
+    dataset_dirs,
     camera_names,
     chunk_size,
     batch_size_train,
@@ -403,38 +525,57 @@ def load_joint_data(
         action_indices=action_indices,
         action_key=action_key,
     )
+
+    episode_paths = collect_episode_paths(dataset_dirs)
+    total_episode_count = len(episode_paths)
+    if total_episode_count < 2:
+        raise ValueError("Need at least 2 episodes for train/val split")
+
+    if isinstance(dataset_dirs, str):
+        source_dataset_dirs = [dataset_dirs]
+    else:
+        source_dataset_dirs = list(dataset_dirs)
     
-    print(f'\nData from: {dataset_dir}\n')
+    print('\nSource dataset dirs:')
+    for source_dataset_dir in source_dataset_dirs:
+        print(source_dataset_dir)
+    print(f'Total discovered episodes: {total_episode_count}')
+    print('First few episode paths:')
+    for dataset_path in episode_paths[:min(5, total_episode_count)]:
+        print(dataset_path)
+    print('')
+    _warn_if_episode_indices_noncontiguous(episode_paths)
 
     # obtain train/val split using balanced random search
     # train_ratio = 0.8
     # episode_stats = _compute_episode_action_stats_joint(
-    #     dataset_dir,
-    #     num_episodes,
+    #     episode_paths,
     #     action_indices=joint_data_cfg['action_indices'],
     #     action_key=joint_data_cfg['action_key'],
     # )
     # train_indices, val_indices = _choose_balanced_episode_split(
-    #     num_episodes=num_episodes,
     #     episode_stats=episode_stats,
     #     train_ratio=train_ratio,
     #     num_trials=split_num_trials,
     #     seed=split_seed,
     #     verbose=True,
     # )
-    episode_indices = list(range(num_episodes))
+    episode_indices = list(range(total_episode_count))
     rng = np.random.RandomState(split_seed)
     rng.shuffle(episode_indices)
 
-    split_idx = int(0.8 * num_episodes)
+    split_idx = int(0.8 * total_episode_count)
+    split_idx = max(1, min(split_idx, total_episode_count - 1))
 
     train_indices = episode_indices[:split_idx]
     val_indices = episode_indices[split_idx:]
 
+    print(f'Train episode count: {len(train_indices)}')
+    print(f'Val episode count: {len(val_indices)}')
+
     # obtain normalization stats for qpos and action
     norm_stats = get_joint_norm_stats(
-        dataset_dir,
-        num_episodes,
+        episode_paths,
         qpos_indices=joint_data_cfg['qpos_indices'],
         action_indices=joint_data_cfg['action_indices'],
         action_key=joint_data_cfg['action_key'],
@@ -442,8 +583,7 @@ def load_joint_data(
 
     # construct dataset and dataloader
     train_dataset = EpisodicJointDataset(
-        train_indices,
-        dataset_dir,
+        [episode_paths[index] for index in train_indices],
         camera_names,
         chunk_size,
         norm_stats,
@@ -453,8 +593,7 @@ def load_joint_data(
         img_aug=img_aug,
     )
     val_dataset = EpisodicJointDataset(
-        val_indices,
-        dataset_dir,
+        [episode_paths[index] for index in val_indices],
         camera_names,
         chunk_size,
         norm_stats,
@@ -470,25 +609,24 @@ def load_joint_data(
 
 
 class EpisodicPoseDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, chunk_size, norm_stats, img_aug):
+    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, img_aug):
         super(EpisodicPoseDataset).__init__()
-        self.episode_ids = episode_ids
-        self.dataset_dir = dataset_dir
+        self.episode_paths = list(episode_paths)
         self.camera_names = camera_names
         self.chunk_size = chunk_size
         self.norm_stats = norm_stats
         self.img_aug = img_aug
         self.is_sim = None
+        _print_image_pipeline_info(self.camera_names)
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
-        return len(self.episode_ids)
+        return len(self.episode_paths)
 
     def __getitem__(self, index):
         sample_full_episode = False # hardcode
 
-        episode_id = self.episode_ids[index]
-        dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
+        dataset_path = self.episode_paths[index]
         with h5py.File(dataset_path, 'r') as root:
             is_sim = root.attrs['sim']
             episode_len = root['/observations/ee_pose_global'].shape[0] - 120  # hardcode for TOCABI data, do not train moving to ready pose
@@ -503,27 +641,37 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                 if cam_name.endswith('stereo'):
                     left_img = root[f'/observations/images/{cam_name[:-6]}left'][start_ts]
                     right_img = root[f'/observations/images/{cam_name[:-6]}right'][start_ts]
+                    left_is_event = _is_event_frame(cam_name, left_img)
+                    right_is_event = _is_event_frame(cam_name, right_img)
                     left_img = transforms.functional.to_pil_image(left_img)
                     right_img = transforms.functional.to_pil_image(right_img)
                     if self.img_aug:
                         angle = np.random.random() * 10 - 5
                         top_h = np.random.randint(0, 120)
                         top_w = np.random.randint(0, 160)
-                        left_img = color_transform(left_img)
+                        if not left_is_event:
+                            left_img = color_transform(left_img)
                         left_img = rotate_n_crop_transform(left_img, [480, 640], angle, (top_h, top_w))
-                        right_img = color_transform(right_img)
+                        if not right_is_event:
+                            right_img = color_transform(right_img)
                         right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
-                    left_img = transforms.functional.resize(left_img, [480, 640])
-                    right_img = transforms.functional.resize(right_img, [480, 640])
-                    image_dict[cam_name] = np.concatenate([left_img, right_img], axis=1) # width dimension
+                    left_img = prepare_image(left_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=left_is_event)
+                    right_img = prepare_image(right_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=right_is_event)
+                    stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
+                    image_dict[cam_name] = prepare_image(
+                        stereo_img,
+                        target_size=DEFAULT_IMAGE_SIZE,
+                        force_rgb=(left_is_event or right_is_event),
+                    )
                 else:
                     img = root[f'/observations/images/{cam_name}'][start_ts]
+                    is_event = _is_event_frame(cam_name, img)
                     img = transforms.functional.to_pil_image(img)
                     if self.img_aug:
-                        img = color_transform(img)
+                        if not is_event:
+                            img = color_transform(img)
                         img = rotate_n_crop_transform(img)
-                    #img = transforms.functional.resize(img, [480, 640])
-                    image_dict[cam_name] = img
+                    image_dict[cam_name] = prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=is_event)
             # get all actions after and including start_ts
             action = root['/ee_action_global'][start_ts:min(start_ts+self.chunk_size, episode_len)]
             action_len, action_dof = action.shape
@@ -557,11 +705,10 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def get_pose_norm_stats(dataset_dir, num_episodes):
+def get_pose_norm_stats(episode_paths):
     all_qpos_data = []
     all_action_data = []
-    for episode_idx in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+    for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
             qpos = root['/observations/ee_pose_global'][()]
             action = root['/ee_action_global'][()]
@@ -593,8 +740,7 @@ def get_pose_norm_stats(dataset_dir, num_episodes):
 
 
 def load_pose_data(
-    dataset_dir,
-    num_episodes,
+    dataset_dirs,
     camera_names,
     chunk_size,
     batch_size_train,
@@ -603,13 +749,30 @@ def load_pose_data(
     split_num_trials=100,
     split_seed=0,
 ):
-    print(f'\nData from: {dataset_dir}\n')
+    episode_paths = collect_episode_paths(dataset_dirs)
+    total_episode_count = len(episode_paths)
+    if total_episode_count < 2:
+        raise ValueError("Need at least 2 episodes for train/val split")
+
+    if isinstance(dataset_dirs, str):
+        source_dataset_dirs = [dataset_dirs]
+    else:
+        source_dataset_dirs = list(dataset_dirs)
+
+    print('\nSource dataset dirs:')
+    for source_dataset_dir in source_dataset_dirs:
+        print(source_dataset_dir)
+    print(f'Total discovered episodes: {total_episode_count}')
+    print('First few episode paths:')
+    for dataset_path in episode_paths[:min(5, total_episode_count)]:
+        print(dataset_path)
+    print('')
+    _warn_if_episode_indices_noncontiguous(episode_paths)
 
     # obtain train/val split using balanced random search
     train_ratio = 0.8
-    episode_stats = _compute_episode_action_stats_pose(dataset_dir, num_episodes)
+    episode_stats = _compute_episode_action_stats_pose(episode_paths)
     train_indices, val_indices = _choose_balanced_episode_split(
-        num_episodes=num_episodes,
         episode_stats=episode_stats,
         train_ratio=train_ratio,
         num_trials=split_num_trials,
@@ -617,12 +780,15 @@ def load_pose_data(
         verbose=True,
     )
 
+    print(f'Train episode count: {len(train_indices)}')
+    print(f'Val episode count: {len(val_indices)}')
+
     # obtain normalization stats for qpos and action
-    norm_stats = get_pose_norm_stats(dataset_dir, num_episodes)
+    norm_stats = get_pose_norm_stats(episode_paths)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicPoseDataset(train_indices, dataset_dir, camera_names, chunk_size, norm_stats, img_aug)
-    val_dataset = EpisodicPoseDataset(val_indices, dataset_dir, camera_names, chunk_size, norm_stats, img_aug)
+    train_dataset = EpisodicPoseDataset([episode_paths[index] for index in train_indices], camera_names, chunk_size, norm_stats, img_aug)
+    val_dataset = EpisodicPoseDataset([episode_paths[index] for index in val_indices], camera_names, chunk_size, norm_stats, img_aug)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 
