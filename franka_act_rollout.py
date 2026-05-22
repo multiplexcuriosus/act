@@ -74,6 +74,15 @@ class FrankaActRolloutNode(Node):
         self.twist_topic = args.twist_topic
         self.gripper_state_topic = args.gripper_state_topic
         self.camera_name = args.camera_name
+        if self.image_topic == None:
+            if self.camera_name == "event":
+                self.image_topic = "/openmv_cam/event_frame_3ch"
+            elif self.camera_name == "rgb":
+                self.image_topic = "/camera/camera/color/image_raw"
+            else:
+                self.get_logger().info(f"Invalid camera type!")
+
+
 
         self.fps = args.fps
         self.max_timesteps = args.max_timesteps
@@ -350,12 +359,12 @@ def main():
     parser.add_argument("--ckpt_name", type=str, default="policy_val_best.ckpt")
     parser.add_argument("--stats_name", type=str, default="dataset_stats.pkl")
 
-    parser.add_argument("--image_topic", type=str, default="/camera/camera/color/image_raw")
+    parser.add_argument("--image_topic", type=str)
     parser.add_argument("--joint_topic", type=str, default="/joint_states")
     parser.add_argument("--twist_topic", type=str, default="/cartesian_cmd/twist")
     parser.add_argument("--gripper_state_topic", type=str, default="/teleop/gripper_state_cmd")
 
-    parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--max_timesteps", type=int, default=100000)
 
     parser.add_argument("--state_dim", type=int, default=8)
