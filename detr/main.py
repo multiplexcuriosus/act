@@ -9,6 +9,20 @@ from .models import build_ACT_model, build_CNNMLP_model
 import IPython
 e = IPython.embed
 
+
+def resolve_device(device_override=None):
+    if device_override is not None:
+        return torch.device(device_override)
+
+    try:
+        if torch.cuda.is_available():
+            torch.zeros(1, device='cuda')
+            return torch.device('cuda')
+    except Exception:
+        pass
+
+    return torch.device('cpu')
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float) # will be overridden
@@ -88,7 +102,8 @@ def build_ACT_model_and_optimizer(args_override):
         setattr(args, k, v)
 
     model = build_ACT_model(args)
-    model.cuda()
+    device = resolve_device(getattr(args, 'device', None))
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -114,7 +129,8 @@ def build_CNNMLP_model_and_optimizer(args_override):
         setattr(args, k, v)
 
     model = build_CNNMLP_model(args)
-    model.cuda()
+    device = resolve_device(getattr(args, 'device', None))
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},

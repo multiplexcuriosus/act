@@ -4,6 +4,7 @@ import os
 import glob
 import re
 import h5py
+import cv2
 from torch.utils.data import DataLoader
 import torchvision.transforms.v2 as transforms
 
@@ -100,6 +101,32 @@ def prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=False):
         resized_img = np.repeat(resized_img, 3, axis=-1)
 
     return resized_img
+
+
+def ensure_hwc3(image, cam_name):
+    image = np.asarray(image)
+    if image.ndim == 2:
+        image = image[..., None]
+    if image.ndim != 3:
+        raise ValueError(f"Unsupported image shape for camera '{cam_name}': {image.shape}")
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)
+    elif image.shape[-1] == 3:
+        pass
+    else:
+        raise ValueError(f"Unsupported image shape for camera '{cam_name}': {image.shape}")
+    return image
+
+
+def maybe_resize_for_rgb_event(image, cam_name, camera_names):
+    if camera_names == ["rgb", "event"]:
+        if image.shape[:2] != DEFAULT_IMAGE_SIZE:
+            image = cv2.resize(image, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
+        if image.shape[:2] != DEFAULT_IMAGE_SIZE:
+            raise ValueError(
+                f"RGB+event mode requires 320x320 images. camera={cam_name}, got={image.shape}"
+            )
+    return image
 
 
 def _print_image_pipeline_info(camera_names):
@@ -367,6 +394,7 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.img_aug = img_aug
         self.is_sim = None
+        self._printed_image_debug = False
         _print_image_pipeline_info(self.camera_names)
         self.__getitem__(0) # initialize self.is_sim
 
@@ -407,14 +435,20 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                         if not right_is_event:
                             right_img = color_transform(right_img)
                         right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
-                    left_img = prepare_image(left_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=left_is_event)
-                    right_img = prepare_image(right_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=right_is_event)
+                    left_img = np.asarray(left_img)
+                    right_img = np.asarray(right_img)
+                    left_img = ensure_hwc3(left_img, f'{cam_name}_left')
+                    right_img = ensure_hwc3(right_img, f'{cam_name}_right')
+                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names)
+                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names)
                     stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
-                    image_dict[cam_name] = prepare_image(
-                        stereo_img,
-                        target_size=DEFAULT_IMAGE_SIZE,
-                        force_rgb=(left_is_event or right_is_event),
-                    )
+                    if self.camera_names != ["rgb", "event"]:
+                        stereo_img = cv2.resize(
+                            stereo_img,
+                            (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    image_dict[cam_name] = ensure_hwc3(stereo_img, cam_name)
                 else:
                     img = root[f'/observations/images/{cam_name}'][start_ts]
                     is_event = _is_event_frame(cam_name, img)
@@ -423,7 +457,12 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                         if not is_event:
                             img = color_transform(img)
                         img = rotate_n_crop_transform(img)
-                    image_dict[cam_name] = prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=is_event)
+                    img = np.asarray(img)
+                    img = ensure_hwc3(img, cam_name)
+                    if self.camera_names != ["rgb", "event"]:
+                        img = cv2.resize(img, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
+                    img = maybe_resize_for_rgb_event(img, cam_name, self.camera_names)
+                    image_dict[cam_name] = img
             # get all actions after and including start_ts
             action = root[self.action_key][start_ts:min(start_ts+self.chunk_size, episode_len)]
             if self.action_indices is not None:
@@ -436,20 +475,26 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         is_pad = np.zeros(self.chunk_size)
         is_pad[action_len:] = 1
 
-        # new axis for different cameras
+        # new axis for different cameras in exact camera_names order
         all_cam_images = []
         for cam_name in self.camera_names:
-            all_cam_images.append(image_dict[cam_name])
-        all_cam_images = np.stack(all_cam_images, axis=0)
-
-        # construct observations
-        image_data = torch.from_numpy(all_cam_images)
+            cam_image = ensure_hwc3(image_dict[cam_name], cam_name)
+            cam_image = maybe_resize_for_rgb_event(cam_image, cam_name, self.camera_names)
+            cam_image = np.transpose(cam_image, (2, 0, 1))
+            all_cam_images.append(cam_image)
+        image_data = torch.from_numpy(np.stack(all_cam_images, axis=0))
         qpos_data = torch.from_numpy(qpos).float()
         action_data = torch.from_numpy(padded_action).float()
         is_pad = torch.from_numpy(is_pad).bool()
 
-        # channel last
-        image_data = torch.einsum('k h w c -> k c h w', image_data)
+        assert image_data.ndim == 4, image_data.shape
+        assert image_data.shape[0] == len(self.camera_names), image_data.shape
+        assert image_data.shape[1] == 3, image_data.shape
+        if self.camera_names == ["rgb", "event"]:
+            assert image_data.shape == (2, 3, 320, 320), image_data.shape
+            if not self._printed_image_debug:
+                print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
+                self._printed_image_debug = True
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0
@@ -617,6 +662,7 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.img_aug = img_aug
         self.is_sim = None
+        self._printed_image_debug = False
         _print_image_pipeline_info(self.camera_names)
         self.__getitem__(0) # initialize self.is_sim
 
@@ -655,14 +701,20 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                         if not right_is_event:
                             right_img = color_transform(right_img)
                         right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
-                    left_img = prepare_image(left_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=left_is_event)
-                    right_img = prepare_image(right_img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=right_is_event)
+                    left_img = np.asarray(left_img)
+                    right_img = np.asarray(right_img)
+                    left_img = ensure_hwc3(left_img, f'{cam_name}_left')
+                    right_img = ensure_hwc3(right_img, f'{cam_name}_right')
+                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names)
+                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names)
                     stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
-                    image_dict[cam_name] = prepare_image(
-                        stereo_img,
-                        target_size=DEFAULT_IMAGE_SIZE,
-                        force_rgb=(left_is_event or right_is_event),
-                    )
+                    if self.camera_names != ["rgb", "event"]:
+                        stereo_img = cv2.resize(
+                            stereo_img,
+                            (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    image_dict[cam_name] = ensure_hwc3(stereo_img, cam_name)
                 else:
                     img = root[f'/observations/images/{cam_name}'][start_ts]
                     is_event = _is_event_frame(cam_name, img)
@@ -671,7 +723,12 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                         if not is_event:
                             img = color_transform(img)
                         img = rotate_n_crop_transform(img)
-                    image_dict[cam_name] = prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=is_event)
+                    img = np.asarray(img)
+                    img = ensure_hwc3(img, cam_name)
+                    if self.camera_names != ["rgb", "event"]:
+                        img = cv2.resize(img, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
+                    img = maybe_resize_for_rgb_event(img, cam_name, self.camera_names)
+                    image_dict[cam_name] = img
             # get all actions after and including start_ts
             action = root['/ee_action_global'][start_ts:min(start_ts+self.chunk_size, episode_len)]
             action_len, action_dof = action.shape
@@ -682,20 +739,26 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
         is_pad = np.zeros(self.chunk_size)
         is_pad[action_len:] = 1
 
-        # new axis for different cameras
+        # new axis for different cameras in exact camera_names order
         all_cam_images = []
         for cam_name in self.camera_names:
-            all_cam_images.append(image_dict[cam_name])
-        all_cam_images = np.stack(all_cam_images, axis=0)
-
-        # construct observations
-        image_data = torch.from_numpy(all_cam_images)
+            cam_image = ensure_hwc3(image_dict[cam_name], cam_name)
+            cam_image = maybe_resize_for_rgb_event(cam_image, cam_name, self.camera_names)
+            cam_image = np.transpose(cam_image, (2, 0, 1))
+            all_cam_images.append(cam_image)
+        image_data = torch.from_numpy(np.stack(all_cam_images, axis=0))
         qpos_data = torch.from_numpy(qpos).float()
         action_data = torch.from_numpy(padded_action).float()
         is_pad = torch.from_numpy(is_pad).bool()
 
-        # channel last
-        image_data = torch.einsum('k h w c -> k c h w', image_data)
+        assert image_data.ndim == 4, image_data.shape
+        assert image_data.shape[0] == len(self.camera_names), image_data.shape
+        assert image_data.shape[1] == 3, image_data.shape
+        if self.camera_names == ["rgb", "event"]:
+            assert image_data.shape == (2, 3, 320, 320), image_data.shape
+            if not self._printed_image_debug:
+                print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
+                self._printed_image_debug = True
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0

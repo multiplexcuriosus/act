@@ -28,6 +28,42 @@ from sim_env import BOX_POSE
 import IPython
 e = IPython.embed
 
+
+def resolve_device(device_override=None):
+    if device_override is not None:
+        return torch.device(device_override)
+
+    try:
+        if torch.cuda.is_available():
+            torch.zeros(1, device='cuda')
+            return torch.device('cuda')
+    except Exception as exc:
+        print(f'[WARN] CUDA unavailable, falling back to CPU: {exc}')
+
+    return torch.device('cpu')
+
+
+def validate_camera_names(camera_names):
+    allowed_single = [["rgb"], ["event"]]
+    allowed_dual = ["rgb", "event"]
+
+    if camera_names in allowed_single:
+        return camera_names
+
+    if camera_names == allowed_dual:
+        return camera_names
+
+    if set(camera_names) == {"rgb", "event"}:
+        raise ValueError(
+            "RGB+event training only supports '--camera_names rgb event'. "
+            "Do not use '--camera_names event rgb' because camera order changes the model input slots."
+        )
+
+    raise ValueError(
+        f"Unsupported camera_names={camera_names}. "
+        "Allowed: ['rgb'], ['event'], or ['rgb', 'event']."
+    )
+
 def main(args):
     set_seed(args['seed'])
     # command line parameters
@@ -49,6 +85,7 @@ def main(args):
         if dataset_source is None:
             raise ValueError("Either --dataset_dir or --dataset_dirs must be provided.")
     camera_names = args['camera_names']
+    camera_names = validate_camera_names(camera_names)
     data_mode = args['data_mode']
     img_aug = args['img_aug']
     episode_len = args['episode_len']
@@ -83,6 +120,7 @@ def main(args):
     # fixed parameters
     lr_backbone = 1e-5
     backbone = 'resnet18'
+    device = resolve_device()
     use_bce_last_action_dim = (
         policy_class == 'ACT' and
         data_mode == 'joint' and
@@ -106,11 +144,13 @@ def main(args):
                          'camera_names': camera_names,
                          'state_dim': state_dim,
                          'action_dim': action_dim,
-                         'use_bce_last_action_dim': use_bce_last_action_dim
+                         'use_bce_last_action_dim': use_bce_last_action_dim,
+                         'device': device.type
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names, 'state_dim': state_dim, 'action_dim': action_dim}
+                         'camera_names': camera_names, 'state_dim': state_dim, 'action_dim': action_dim,
+                         'device': device.type}
     else:
         raise NotImplementedError
 
@@ -124,6 +164,7 @@ def main(args):
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,
         'policy_config': policy_config,
+        'device': device.type,
         'task_name': task_name,
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
@@ -139,7 +180,8 @@ def main(args):
         'constant_waypoint': constant_waypoint,
         'profile_memory': args['profile_memory'],
         'memory_profile_num_epochs': args['memory_profile_num_epochs'],
-        'json_log_interval_epochs': 10,
+        'json_log_interval_epochs': 500,
+        'save_extra_checkpoints': args['save_extra_checkpoints'],
         'checkpoint_interval': args['checkpoint_interval'],
         'log_path': os.path.join(ckpt_dir, f'run_metrics_{run_id}.json')
     }
@@ -217,16 +259,17 @@ def main(args):
 
     train_best_ckpt_info, best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
 
-    # save best checkpoint
-    if train_best_ckpt_info is not None:
-        train_best_epoch, min_train_loss, train_best_state_dict = train_best_ckpt_info
-        train_best_ckpt_path = os.path.join(ckpt_dir, f'policy_train_best.ckpt')
-        torch.save(train_best_state_dict, train_best_ckpt_path)
-
+    # save best validation checkpoint always
     if best_ckpt_info is not None:
         best_epoch, min_val_loss, best_state_dict = best_ckpt_info
         best_ckpt_path = os.path.join(ckpt_dir, f'policy_val_best.ckpt')
         torch.save(best_state_dict, best_ckpt_path)
+
+    # optionally save train-best checkpoint
+    if args['save_extra_checkpoints'] and train_best_ckpt_info is not None:
+        train_best_epoch, min_train_loss, train_best_state_dict = train_best_ckpt_info
+        train_best_ckpt_path = os.path.join(ckpt_dir, f'policy_train_best.ckpt')
+        torch.save(train_best_state_dict, train_best_ckpt_path)
 
 
 def make_policy(policy_class, policy_config):
@@ -351,13 +394,13 @@ def summarize_memory_samples(samples, phase):
     }
 
 
-def get_image(ts, camera_names):
+def get_image(ts, camera_names, device):
     curr_images = []
     for cam_name in camera_names:
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
-    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
+    curr_image = torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
     return curr_image
 
 
@@ -371,6 +414,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     onscreen_render = config['onscreen_render']
     policy_config = config['policy_config']
     camera_names = config['camera_names']
+    device = resolve_device(config.get('device'))
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
@@ -379,9 +423,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
+    loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location=device))
     print(loading_status)
-    policy.cuda()
+    policy.to(device)
     policy.eval()
     print(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -430,9 +474,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, action_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, action_dim], device=device)
 
-        qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
+        qpos_history = torch.zeros((1, max_timesteps, state_dim), device=device)
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
@@ -453,9 +497,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
                 qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
+                curr_image = get_image(ts, camera_names, device)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -469,7 +513,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         k = 0.01
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                        exp_weights = torch.from_numpy(exp_weights).to(device).unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
                         raw_action = all_actions[:, t % query_frequency]
@@ -529,7 +573,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    device = next(policy.parameters()).device
+    image_data, qpos_data, action_data, is_pad = image_data.to(device), qpos_data.to(device), action_data.to(device), is_pad.to(device)
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
@@ -540,13 +585,15 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy_class = config['policy_class']
     policy_config = config['policy_config']
     checkpoint_interval = int(config.get('checkpoint_interval', 1000))
+    save_extra_checkpoints = bool(config.get('save_extra_checkpoints', False))
+    profile_memory_enabled = bool(config.get('profile_memory', False))
 
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
     latest_idx = 0
 
-    policy.cuda()
+    policy.to(resolve_device(policy_config.get('device')))
     optimizer = make_optimizer(policy_class, policy)
 
     profile_epochs = get_profile_epochs(
@@ -584,7 +631,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             'batch_size_val': config.get('batch_size_val')
         },
         'model': count_parameters(policy),
-        'profile_memory': bool(config.get('profile_memory', False)),
+        'profile_memory': profile_memory_enabled,
         'profile_epochs': sorted(list(profile_epochs)),
         'epochs': [],
         'memory_profiles': [],
@@ -722,23 +769,23 @@ def train_bc(train_dataloader, val_dataloader, config):
                 'val_loss': float(epoch_val_loss.detach().cpu().item() if torch.is_tensor(epoch_val_loss) else epoch_val_loss)
             }
 
-        run_log['epochs'].append({
-            'epoch': epoch,
-            'wall_time_s': time.time(),
-            'epoch_duration_s': epoch_duration_s,
-            'profiled_memory': bool(should_profile_epoch),
-            'train': {
-                'loss': float(epoch_train_loss.detach().cpu().item() if torch.is_tensor(epoch_train_loss) else epoch_train_loss),
-                'losses': tensor_to_float_dict(train_epoch_summary),
-                'memory_summary': train_memory_summary
-            },
-            'val': {
-                'loss': float(epoch_val_loss.detach().cpu().item() if torch.is_tensor(epoch_val_loss) else epoch_val_loss),
-                'losses': tensor_to_float_dict(val_epoch_summary),
-                'memory_summary': val_memory_summary
-            }
-        })
         if should_profile_epoch:
+            run_log['epochs'].append({
+                'epoch': epoch,
+                'wall_time_s': time.time(),
+                'epoch_duration_s': epoch_duration_s,
+                'profiled_memory': True,
+                'train': {
+                    'loss': float(epoch_train_loss.detach().cpu().item() if torch.is_tensor(epoch_train_loss) else epoch_train_loss),
+                    'losses': tensor_to_float_dict(train_epoch_summary),
+                    'memory_summary': train_memory_summary
+                },
+                'val': {
+                    'loss': float(epoch_val_loss.detach().cpu().item() if torch.is_tensor(epoch_val_loss) else epoch_val_loss),
+                    'losses': tensor_to_float_dict(val_epoch_summary),
+                    'memory_summary': val_memory_summary
+                }
+            })
             run_log['memory_profiles'].append({
                 'epoch': epoch,
                 'samples': epoch_memory_profile
@@ -748,7 +795,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             epoch == 0 or
             epoch == num_epochs - 1 or
             should_profile_epoch or
-            epoch % 10 == 0
+            (profile_memory_enabled and epoch % 10 == 0)
         )
         if should_write_log:
             write_json_atomic(config['log_path'], run_log)
@@ -758,7 +805,7 @@ def train_bc(train_dataloader, val_dataloader, config):
         if epoch % 100 == 0:
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
-        if checkpoint_interval > 0 and epoch % checkpoint_interval == 0:
+        if save_extra_checkpoints and checkpoint_interval > 0 and epoch % checkpoint_interval == 0:
             if train_best_ckpt_info is not None:
                 train_best_epoch, min_train_loss, train_best_state_dict = train_best_ckpt_info
                 train_best_ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{train_best_epoch}_seed_{seed}.ckpt')
@@ -786,18 +833,19 @@ def train_bc(train_dataloader, val_dataloader, config):
                 print(f'  Val peak reserved:    {val_memory_summary["peak_reserved_mb_max"]:.1f} MB')
             print(f'  JSON log: {config["log_path"]}')
 
-    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    torch.save(policy.state_dict(), ckpt_path)
+    if save_extra_checkpoints:
+        ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
+        torch.save(policy.state_dict(), ckpt_path)
 
-    if train_best_ckpt_info is not None:
-        train_best_epoch, min_train_loss, train_best_state_dict = train_best_ckpt_info
-        train_best_ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{train_best_epoch}_seed_{seed}.ckpt')
-        torch.save(train_best_state_dict, train_best_ckpt_path)
+        if train_best_ckpt_info is not None:
+            train_best_epoch, min_train_loss, train_best_state_dict = train_best_ckpt_info
+            train_best_ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{train_best_epoch}_seed_{seed}.ckpt')
+            torch.save(train_best_state_dict, train_best_ckpt_path)
 
-    if best_ckpt_info is not None:
-        best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-        best_ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
-        torch.save(best_state_dict, best_ckpt_path)
+        if best_ckpt_info is not None:
+            best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+            best_ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
+            torch.save(best_state_dict, best_ckpt_path)
 
     run_log['finished_at'] = datetime.datetime.now().isoformat()
     run_log['status'] = 'finished'
@@ -865,6 +913,7 @@ if __name__ == '__main__':
     parser.add_argument('--no_use_bce_last_action_dim', action='store_false', dest='use_bce_last_action_dim', help='disable BCEWithLogits on final action dim')
     parser.add_argument('--profile_memory', action='store_true', help='enable sparse CUDA memory profiling at first/mid/last epoch')
     parser.add_argument('--memory_profile_num_epochs', type=int, default=3, help='number of epochs to profile across training; default 3 gives first/mid/last')
+    parser.add_argument('--save_extra_checkpoints', action='store_true', help='enable extra checkpoint files (policy_epoch_*, policy_last.ckpt, policy_train_best.ckpt). Disabled by default.')
     parser.add_argument('--checkpoint_interval', type=int, default=1000, help='Save intermediate best checkpoints every N epochs. Use 0 to disable intermediate checkpointing.')
 
     # for ACT

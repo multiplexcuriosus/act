@@ -1,6 +1,6 @@
 import h5py
 
-f = h5py.File("/home/jau/dyros/src/fr3_teleop/data/hdf5/mobile_base_20260421_183129_0/episode_0.hdf5", "r")
+f = h5py.File("/home/dyros/Data/jg_data/hdf5/enclosure_tennisball_red_ring_smooth/episode_0.hdf5", "r")
 print(list(f.keys()))
 print(list(f["observations"].keys()))
 print(list(f["observations"]["images"].keys()))
