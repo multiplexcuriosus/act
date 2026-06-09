@@ -4,6 +4,7 @@ DETR model and criterion classes.
 """
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.autograd import Variable
 from .backbone import build_backbone
 from .transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer
@@ -76,7 +77,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, return_features=False):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -119,18 +120,26 @@ class DETRVAE(nn.Module):
             # Image observation features and position embeddings
             all_cam_features = []
             all_cam_pos = []
+            all_cam_raw_pooled = []
+            all_cam_proj_pooled = []
             for cam_id, cam_name in enumerate(self.camera_names):
                 features, pos = self.backbones[0](image[:, cam_id]) # HARDCODED
                 features = features[0] # take the last layer feature
                 pos = pos[0]
-                all_cam_features.append(self.input_proj(features))
+                projected_features = self.input_proj(features)
+                all_cam_features.append(projected_features)
                 all_cam_pos.append(pos)
+                all_cam_raw_pooled.append(F.adaptive_avg_pool2d(features, output_size=1).flatten(1))
+                # Preferred for offline analysis: image features after projection into the ACT hidden dimension.
+                all_cam_proj_pooled.append(F.adaptive_avg_pool2d(projected_features, output_size=1).flatten(1))
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            cnn_raw_pooled = torch.cat(all_cam_raw_pooled, dim=1)
+            cnn_proj_pooled = torch.cat(all_cam_proj_pooled, dim=1)
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
@@ -138,7 +147,19 @@ class DETRVAE(nn.Module):
             hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
-        return a_hat, is_pad_hat, [mu, logvar]
+        if not return_features:
+            return a_hat, is_pad_hat, [mu, logvar]
+
+        features_dict = {
+            'decoder_hs': hs.detach(),
+        }
+        if self.backbones is not None:
+            features_dict['cnn_raw_pooled'] = cnn_raw_pooled.detach()
+            features_dict['cnn_proj_pooled'] = cnn_proj_pooled.detach()
+        if mu is not None:
+            features_dict['cvae_mu'] = mu.detach()
+            features_dict['cvae_logvar'] = logvar.detach()
+        return a_hat, is_pad_hat, [mu, logvar], features_dict
 
 
 

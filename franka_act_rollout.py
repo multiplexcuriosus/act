@@ -5,6 +5,7 @@ import argparse
 import pickle
 from typing import Optional, Tuple, List
 
+import cv2
 import numpy as np
 import torch
 from cv_bridge import CvBridge
@@ -18,10 +19,105 @@ from rclpy.node import Node
 from policy import ACTPolicy
 
 
-def ros_img_to_torch_img(msg: Image, bridge: CvBridge) -> torch.Tensor:
+def validate_camera_names(camera_names: List[str]) -> List[str]:
+    if camera_names == ["rgb"]:
+        return camera_names
+    if camera_names == ["event"]:
+        return camera_names
+    if camera_names == ["rgb", "event"]:
+        return camera_names
+    if set(camera_names) == {"rgb", "event"}:
+        raise ValueError(
+            "RGB+event rollout only supports '--camera_names rgb event'. "
+            "Do not use '--camera_names event rgb' because this changes the model input slots."
+        )
+    raise ValueError(
+        f"Unsupported camera_names={camera_names}. "
+        "Allowed: ['rgb'], ['event'], or ['rgb', 'event']."
+    )
+
+
+def default_image_topic_for_camera(cam_name: str) -> str:
+    if cam_name == "rgb":
+        return "/camera/camera/color/image_raw"
+    if cam_name == "event":
+        return "/openmv_cam/event_frame_3ch"
+    raise ValueError(f"Unsupported camera name: {cam_name}")
+
+
+def ensure_hwc3(image: np.ndarray, cam_name: str) -> np.ndarray:
+    if image.ndim == 2:
+        return np.repeat(image[:, :, None], 3, axis=2)
+    if image.ndim == 3 and image.shape[2] == 1:
+        return np.repeat(image, 3, axis=2)
+    if image.ndim == 3 and image.shape[2] == 3:
+        return image
+    raise ValueError(f"{cam_name}: expected image shape [H,W], [H,W,1], or [H,W,3], got {tuple(image.shape)}")
+
+
+def maybe_resize_for_rgb_event(image: np.ndarray, cam_name: str, camera_names: List[str]) -> np.ndarray:
+    if camera_names != ["rgb", "event"]:
+        return image
+
+    if cam_name == "rgb":
+        if image.shape[:2] != (320, 320):
+            image = cv2.resize(image, (320, 320), interpolation=cv2.INTER_AREA)
+        return image
+
+    if cam_name == "event":
+        if image.shape[:2] != (320, 320):
+            raise ValueError(
+                f"event image must be 320x320 in RGB+event rollout, got {tuple(image.shape)}"
+            )
+        return image
+
+    raise ValueError(f"Unsupported camera '{cam_name}' in camera_names={camera_names}")
+
+
+def resize_image_np(
+    img_rgb: np.ndarray,
+    target_size: Tuple[int, int] = (320, 320),
+    resize_mode: str = "warp",
+) -> np.ndarray:
+    target_h, target_w = target_size
+
+    if resize_mode == "none":
+        return img_rgb
+
+    if resize_mode == "warp":
+        return cv2.resize(img_rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    if resize_mode == "letterbox":
+        src_h, src_w = img_rgb.shape[:2]
+        scale = min(target_w / src_w, target_h / src_h)
+        resized_w = max(1, int(round(src_w * scale)))
+        resized_h = max(1, int(round(src_h * scale)))
+        resized = cv2.resize(img_rgb, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+
+        canvas = np.zeros((target_h, target_w, 3), dtype=img_rgb.dtype)
+        top = (target_h - resized_h) // 2
+        left = (target_w - resized_w) // 2
+        canvas[top:top + resized_h, left:left + resized_w] = resized
+        return canvas
+
+    raise ValueError(f"Unsupported resize_mode: {resize_mode}")
+
+
+def ros_img_to_torch_img(
+    msg: Image,
+    bridge: CvBridge,
+    target_size: Tuple[int, int] = (320, 320),
+    resize_mode: str = "warp",
+) -> Tuple[torch.Tensor, Tuple[int, ...], Tuple[int, ...]]:
     img_rgb = bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-    img_float = torch.from_numpy(img_rgb / 255.0).float()
-    return img_float
+    original_shape = tuple(img_rgb.shape)
+
+    if resize_mode != "none":
+        img_rgb = resize_image_np(img_rgb, target_size=target_size, resize_mode=resize_mode)
+
+    processed_shape = tuple(img_rgb.shape)
+    img_float = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).to(torch.float32)
+    return img_float, original_shape, processed_shape
 
 
 def build_qpos_from_joint_state(
@@ -69,18 +165,34 @@ class FrankaActRolloutNode(Node):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.get_logger().info(f"Using device: {self.device}")
 
+        if args.camera_names is not None and args.camera_name is not None:
+            raise ValueError("Use either --camera_names or --camera_name, not both.")
+
+        raw_camera_names = args.camera_names if args.camera_names is not None else [args.camera_name or "rgb"]
+        self.camera_names = validate_camera_names(list(raw_camera_names))
+
         self.image_topic = args.image_topic
         self.joint_topic = args.joint_topic
         self.twist_topic = args.twist_topic
         self.gripper_state_topic = args.gripper_state_topic
-        self.camera_name = args.camera_name
-        if self.image_topic == None:
-            if self.camera_name == "event":
-                self.image_topic = "/openmv_cam/event_frame_3ch"
-            elif self.camera_name == "rgb":
-                self.image_topic = "/camera/camera/color/image_raw"
-            else:
-                self.get_logger().info(f"Invalid camera type!")
+        self.camera_name = self.camera_names[0]
+        self.image_size = tuple(args.image_size)
+        self.resize_mode = args.resize_mode
+        self.freeze_startup_image = args.freeze_startup_image
+        self.dryrun = args.dryrun
+        self.logged_first_image_stats = False
+
+        if len(self.camera_names) > 1 and self.image_topic is not None:
+            raise ValueError(
+                "--image_topic is only supported for single-camera rollout. "
+                "For multi-camera rollout, use default topics based on --camera_names order."
+            )
+
+        self.image_topics = {
+            cam: (self.image_topic if len(self.camera_names) == 1 and self.image_topic is not None
+                  else default_image_topic_for_camera(cam))
+            for cam in self.camera_names
+        }
 
 
 
@@ -91,6 +203,9 @@ class FrankaActRolloutNode(Node):
         self.action_dim_cfg = args.action_dim
 
         self.latest_image_msg: Optional[Image] = None
+        self.frozen_image_msg: Optional[Image] = None
+        self.latest_image_msgs = {cam: None for cam in self.camera_names}
+        self.frozen_image_msgs = {cam: None for cam in self.camera_names}
         self.latest_joint_msg: Optional[JointState] = None
 
         self.t = 0
@@ -107,7 +222,7 @@ class FrankaActRolloutNode(Node):
             "enc_layers": args.enc_layers,
             "dec_layers": args.dec_layers,
             "nheads": args.nheads,
-            "camera_names": [self.camera_name],
+            "camera_names": self.camera_names,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim_cfg,
             "use_bce_last_action_dim": args.use_bce_last_action_dim,
@@ -120,8 +235,19 @@ class FrankaActRolloutNode(Node):
         ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
         stats_path = os.path.join(args.ckpt_dir, args.stats_name)
 
+        ckpt_obj = torch.load(ckpt_path, map_location=self.device)
+        state_dict = ckpt_obj["state_dict"] if isinstance(ckpt_obj, dict) and "state_dict" in ckpt_obj else ckpt_obj
+
+        trained_camera_names = None
+        if isinstance(ckpt_obj, dict):
+            for cfg_key in ["policy_config", "config"]:
+                cfg = ckpt_obj.get(cfg_key)
+                if isinstance(cfg, dict) and "camera_names" in cfg:
+                    trained_camera_names = cfg["camera_names"]
+                    break
+
         self.policy = ACTPolicy(policy_config)
-        loading_status = self.policy.load_state_dict(torch.load(ckpt_path, map_location=self.device))
+        loading_status = self.policy.load_state_dict(state_dict)
         self.get_logger().info(f"Checkpoint load status: {loading_status}")
         self.policy.to(self.device)
         self.policy.eval()
@@ -133,6 +259,21 @@ class FrankaActRolloutNode(Node):
         for k in ["qpos_mean", "qpos_std", "action_mean", "action_std"]:
             if k not in stats:
                 raise KeyError(f"Missing key '{k}' in dataset stats: {stats_path}")
+
+        if trained_camera_names is None and "camera_names" in stats:
+            trained_camera_names = stats["camera_names"]
+
+        if trained_camera_names is None:
+            self.get_logger().warn(
+                "Checkpoint/stats do not include camera_names. Cannot verify rollout camera order against training config."
+            )
+        else:
+            trained_camera_names = list(trained_camera_names)
+            if trained_camera_names != self.camera_names:
+                raise ValueError(
+                    f"Checkpoint camera_names={trained_camera_names} but rollout camera_names={self.camera_names}. "
+                    "Camera order must match training exactly."
+                )
 
         self.qpos_mean = np.asarray(stats["qpos_mean"], dtype=np.float32)
         self.qpos_std = np.asarray(stats["qpos_std"], dtype=np.float32)
@@ -175,37 +316,93 @@ class FrankaActRolloutNode(Node):
         self.twist_pub = self.create_publisher(TwistStamped, self.twist_topic, 10)
         self.gripper_state_pub = self.create_publisher(Bool, self.gripper_state_topic, 10)
 
-        self.create_subscription(Image, self.image_topic, self.image_cb, 10)
+        for cam_name in self.camera_names:
+            topic = self.image_topics[cam_name]
+            self.create_subscription(
+                Image,
+                topic,
+                lambda msg, cam=cam_name: self.image_cb(msg, cam),
+                10,
+            )
         self.create_subscription(JointState, self.joint_topic, self.joint_cb, 10)
 
         self.timer = self.create_timer(1.0 / self.fps, self.timer_cb)
 
-        self.get_logger().info(f"image_topic={self.image_topic}")
+        self.get_logger().info(f"camera_names={self.camera_names}")
+        self.get_logger().info(f"image_topics={self.image_topics}")
         self.get_logger().info(f"joint_topic={self.joint_topic}")
         self.get_logger().info(f"twist_topic={self.twist_topic}")
         self.get_logger().info(f"gripper_state_topic={self.gripper_state_topic}")
+        self.get_logger().info(f"dryrun={self.dryrun} (twist publish disabled when true)")
         self.get_logger().info(
             f"state_dim={self.state_dim} action_dim={self.action_dim} temporal_agg={self.temporal_agg} fps={self.fps}"
         )
+        self.get_logger().info(
+            f"image_preprocess resize_mode={self.resize_mode} target_size={self.image_size} freeze_startup_image={self.freeze_startup_image}"
+        )
+        if self.resize_mode != "warp":
+            self.get_logger().warn(
+                "Current checkpoints were trained with warp resize to 320x320. Use other resize modes only with matching retrained checkpoints."
+            )
+        if self.resize_mode == "letterbox":
+            self.get_logger().warn(
+                "Letterbox resize selected. Use this only with policies trained using letterbox preprocessing."
+            )
+        if self.freeze_startup_image:
+            self.get_logger().warn(
+                "freeze_startup_image is enabled. This is an ablation/debug mode and does not use normal live visual feedback."
+            )
         if self.running:
             self.get_logger().info("Rollout starts immediately.")
         else:
             self.get_logger().info("Waiting for first valid observation, then rollout will start.")
 
-    def image_cb(self, msg: Image) -> None:
-        self.latest_image_msg = msg
+        self.logged_camera_stack_debug = False
+
+    def image_cb(self, msg: Image, cam_name: str) -> None:
+        self.latest_image_msgs[cam_name] = msg
+        if cam_name == self.camera_names[0]:
+            self.latest_image_msg = msg
+
+        if self.freeze_startup_image and self.frozen_image_msgs[cam_name] is None:
+            self.frozen_image_msgs[cam_name] = msg
+            if cam_name == self.camera_names[0]:
+                self.frozen_image_msg = msg
+            self.get_logger().info(f"Captured startup image for frozen-image rollout. camera={cam_name}")
 
     def joint_cb(self, msg: JointState) -> None:
         self.latest_joint_msg = msg
 
     def ready(self) -> bool:
-        return self.latest_image_msg is not None and self.latest_joint_msg is not None
+        if self.freeze_startup_image:
+            return all(self.frozen_image_msgs[cam] is not None for cam in self.camera_names) and self.latest_joint_msg is not None
+        return all(self.latest_image_msgs[cam] is not None for cam in self.camera_names) and self.latest_joint_msg is not None
+
+    def log_image_preprocess_once(
+        self,
+        original_shape: Tuple[int, ...],
+        processed_shape: Tuple[int, ...],
+        curr_image: torch.Tensor,
+    ) -> None:
+        if self.logged_first_image_stats:
+            return
+
+        image_cpu = curr_image.detach().cpu()
+        self.get_logger().info(
+            "First image preprocess: "
+            f"original_shape={original_shape} processed_shape={processed_shape} "
+            f"policy_tensor_shape={tuple(curr_image.shape)} resize_mode={self.resize_mode} target_size={self.image_size}"
+        )
+        self.get_logger().info(
+            "First image stats after normalization: "
+            f"min={float(image_cpu.min()):.6f} max={float(image_cpu.max()):.6f} "
+            f"mean={float(image_cpu.mean()):.6f} std={float(image_cpu.std()):.6f}"
+        )
+        self.logged_first_image_stats = True
 
     def build_policy_inputs(self) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
         if self.latest_joint_msg is None:
             raise RuntimeError("JointState not received")
-        if self.latest_image_msg is None:
-            raise RuntimeError("Image not received")
 
         joint_msg = self.latest_joint_msg
         qpos_numpy = build_qpos_from_joint_state(
@@ -217,8 +414,50 @@ class FrankaActRolloutNode(Node):
         qpos_norm = self.pre_process(qpos_numpy)
         qpos = torch.from_numpy(qpos_norm).float().to(self.device).unsqueeze(0)
 
-        image = ros_img_to_torch_img(self.latest_image_msg, self.bridge)
-        curr_image = image.permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(self.device)
+        image_chw_list = []
+        original_shapes = []
+        processed_shapes = []
+        for cam_name in self.camera_names:
+            image_msg_for_policy = self.frozen_image_msgs[cam_name] if self.freeze_startup_image else self.latest_image_msgs[cam_name]
+            if image_msg_for_policy is None:
+                raise RuntimeError(f"Image not received for camera '{cam_name}'")
+
+            image_np = self.bridge.imgmsg_to_cv2(image_msg_for_policy, desired_encoding='rgb8')
+            original_shapes.append(tuple(image_np.shape))
+
+            image_np = ensure_hwc3(np.asarray(image_np), cam_name)
+
+            if self.camera_names == ["rgb", "event"]:
+                image_np = maybe_resize_for_rgb_event(image_np, cam_name, self.camera_names)
+            elif self.resize_mode != "none":
+                image_np = resize_image_np(image_np, target_size=self.image_size, resize_mode=self.resize_mode)
+
+            processed_shapes.append(tuple(image_np.shape))
+            image_chw_list.append(np.transpose(image_np, (2, 0, 1)))
+
+        image_stack = np.stack(image_chw_list, axis=0)
+        curr_image = torch.from_numpy(image_stack).to(torch.float32).div(255.0).unsqueeze(0).to(self.device)
+
+        if self.camera_names == ["rgb", "event"]:
+            expected_shape = (1, 2, 3, 320, 320)
+            if tuple(curr_image.shape) != expected_shape:
+                raise RuntimeError(
+                    f"Unexpected policy image shape for rgb+event rollout: got {tuple(curr_image.shape)}, expected {expected_shape}"
+                )
+        elif self.resize_mode == "warp" and self.image_size == (320, 320) and len(self.camera_names) == 1:
+            expected_shape = (1, 1, 3, 320, 320)
+            if tuple(curr_image.shape) != expected_shape:
+                raise RuntimeError(
+                    f"Unexpected policy image shape for default rollout: got {tuple(curr_image.shape)}, expected {expected_shape}"
+                )
+
+        if not self.logged_camera_stack_debug:
+            self.get_logger().info(
+                f"[DEBUG] rollout camera_names={self.camera_names}, curr_image.shape={curr_image.shape}"
+            )
+            self.logged_camera_stack_debug = True
+
+        self.log_image_preprocess_once(tuple(original_shapes), tuple(processed_shapes), curr_image)
 
         return qpos_numpy, qpos, curr_image
 
@@ -281,7 +520,8 @@ class FrankaActRolloutNode(Node):
         twist_msg.twist.angular.x = float(twist[3])
         twist_msg.twist.angular.y = float(twist[4])
         twist_msg.twist.angular.z = float(twist[5])
-        self.twist_pub.publish(twist_msg)
+        if not self.dryrun:
+            self.twist_pub.publish(twist_msg)
 
         grip_logit = float(raw_action[-1])
         grip_prob = 1.0 / (1.0 + np.exp(-grip_logit))
@@ -363,13 +603,18 @@ def main():
     parser.add_argument("--joint_topic", type=str, default="/joint_states")
     parser.add_argument("--twist_topic", type=str, default="/cartesian_cmd/twist")
     parser.add_argument("--gripper_state_topic", type=str, default="/teleop/gripper_state_cmd")
+    parser.add_argument("--image_size", type=int, nargs=2, default=[320, 320], metavar=("H", "W"))
+    parser.add_argument("--resize_mode", type=str, choices=["warp", "letterbox", "none"], default="warp")
+    parser.add_argument("--freeze_startup_image", action="store_true", default=False)
+    parser.add_argument("--dryrun", action="store_true", default=False)
 
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--max_timesteps", type=int, default=100000)
 
     parser.add_argument("--state_dim", type=int, default=8)
     parser.add_argument("--action_dim", type=int, default=7)
-    parser.add_argument("--camera_name", type=str, default="rgb")
+    parser.add_argument("--camera_names", type=str, nargs='+')
+    parser.add_argument("--camera_name", type=str, choices=["rgb", "event"], default=None)
 
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--kl_weight", type=int, required=True)

@@ -60,6 +60,40 @@ class ACTPolicy(nn.Module):
             a_hat, _, (_, _) = self.model(qpos, image, env_state) # no action, sample from prior
             return a_hat
 
+    def extract_features(self, qpos, image, actions=None, is_pad=None):
+        """
+        Return ACT predictions and intermediate features.
+
+        qpos:  [B, state_dim]
+        image: [B, num_cam, 3, H, W], values in [0, 1]
+        actions/is_pad:
+            - None for inference-style feature extraction
+            - provided for CVAE mu/logvar extraction
+        """
+        env_state = None
+
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+        image = normalize(image)
+
+        if actions is not None:
+            actions = actions[:, :self.model.num_queries]
+            is_pad = is_pad[:, :self.model.num_queries]
+
+        a_hat, is_pad_hat, (mu, logvar), features = self.model(
+            qpos,
+            image,
+            env_state,
+            actions=actions,
+            is_pad=is_pad,
+            return_features=True,
+        )
+
+        return a_hat, is_pad_hat, (mu, logvar), features
+
+
     def configure_optimizers(self):
         return self.optimizer
 
