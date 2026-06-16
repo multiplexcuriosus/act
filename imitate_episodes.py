@@ -9,6 +9,7 @@ import subprocess
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import cv2
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
@@ -90,6 +91,24 @@ def main(args):
     img_aug = args['img_aug']
     episode_len = args['episode_len']
     action_dim = args['action_dim']
+    image_size = int(args['image_size'])
+    event_input_channels = int(args['event_input_channels'])
+    event_channel_index = int(args['event_channel_index'])
+
+    if image_size <= 0:
+        raise ValueError(f"--image_size must be positive, got {image_size}")
+    if event_input_channels not in (1, 3):
+        raise ValueError(f"--event_input_channels must be 1 or 3, got {event_input_channels}")
+    if event_input_channels == 1 and camera_names != ["event"]:
+        raise ValueError(
+            "--event_input_channels 1 is currently supported only for --camera_names event. "
+            "Use --event_input_channels 3 for RGB or RGB+event training."
+        )
+    if image_size % 32 != 0:
+        print(
+            f"[WARN] --image_size={image_size} is not divisible by 32. "
+            "ResNet feature-map sizes are typically cleaner with multiples of 32."
+        )
     
     if use_waypoint:
         print('Using waypoint')
@@ -142,6 +161,8 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
+                         'event_input_channels': event_input_channels,
+                         'image_size': image_size,
                          'state_dim': state_dim,
                          'action_dim': action_dim,
                          'use_bce_last_action_dim': use_bce_last_action_dim,
@@ -149,7 +170,7 @@ def main(args):
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names, 'state_dim': state_dim, 'action_dim': action_dim,
+                         'camera_names': camera_names, 'image_size': image_size, 'state_dim': state_dim, 'action_dim': action_dim,
                          'device': device.type}
     else:
         raise NotImplementedError
@@ -169,6 +190,9 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
+        'event_input_channels': event_input_channels,
+        'event_channel_index': event_channel_index,
+        'image_size': image_size,
         'real_robot': not is_sim,
         'run_id': run_id,
         'dataset_source': dataset_source,
@@ -224,6 +248,9 @@ def main(args):
             batch_size_train,
             batch_size_val,
             img_aug=img_aug,
+            image_size=image_size,
+            event_input_channels=event_input_channels,
+            event_channel_index=event_channel_index,
         )
     elif args['data_mode'] == 'joint':
         train_dataloader, val_dataloader, stats, _ = load_joint_data(
@@ -237,6 +264,9 @@ def main(args):
             qpos_dim=state_dim,
             action_dim=action_dim,
             action_key='/action',
+            image_size=image_size,
+            event_input_channels=event_input_channels,
+            event_channel_index=event_channel_index,
         )
         if use_bce_last_action_dim:
             # Keep binary gripper-state target (last action dim) in raw 0/1 space.
@@ -249,6 +279,11 @@ def main(args):
             print('[INFO] Using BCE on last action dim; forcing action_mean[-1]=0 and action_std[-1]=1')
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
+
+    stats['camera_names'] = list(camera_names)
+    stats['image_size'] = int(image_size)
+    stats['event_input_channels'] = int(event_input_channels)
+    stats['event_channel_index'] = int(event_channel_index)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -394,10 +429,22 @@ def summarize_memory_samples(samples, phase):
     }
 
 
-def get_image(ts, camera_names, device):
+def get_image(ts, camera_names, device, image_size=None):
+    target_size = int(image_size) if image_size is not None else 320
     curr_images = []
     for cam_name in camera_names:
-        curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
+        curr_image = np.asarray(ts.observation['images'][cam_name])
+        if curr_image.ndim == 2:
+            curr_image = curr_image[..., None]
+        if curr_image.ndim != 3:
+            raise ValueError(f"Unsupported eval image shape for camera '{cam_name}': {curr_image.shape}")
+        if curr_image.shape[-1] == 1:
+            curr_image = np.repeat(curr_image, 3, axis=-1)
+        elif curr_image.shape[-1] != 3:
+            raise ValueError(f"Unsupported eval image channels for camera '{cam_name}': {curr_image.shape}")
+
+        curr_image = cv2.resize(curr_image, (target_size, target_size), interpolation=cv2.INTER_AREA)
+        curr_image = rearrange(curr_image, 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
     curr_image = torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
@@ -456,6 +503,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     num_rollouts = 50
     episode_returns = []
     highest_rewards = []
+    printed_eval_image_shape = False
     for rollout_id in range(num_rollouts):
         rollout_id += 0
         ### set task
@@ -499,7 +547,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 qpos = pre_process(qpos_numpy)
                 qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names, device)
+                curr_image = get_image(ts, camera_names, device, image_size=config.get('image_size', 320))
+                if not printed_eval_image_shape:
+                    print(f"[DEBUG] eval curr_image.shape={tuple(curr_image.shape)}")
+                    printed_eval_image_shape = True
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -915,6 +966,9 @@ if __name__ == '__main__':
     parser.add_argument('--memory_profile_num_epochs', type=int, default=3, help='number of epochs to profile across training; default 3 gives first/mid/last')
     parser.add_argument('--save_extra_checkpoints', action='store_true', help='enable extra checkpoint files (policy_epoch_*, policy_last.ckpt, policy_train_best.ckpt). Disabled by default.')
     parser.add_argument('--checkpoint_interval', type=int, default=1000, help='Save intermediate best checkpoints every N epochs. Use 0 to disable intermediate checkpointing.')
+    parser.add_argument('--image_size', type=int, default=320, help='Canonical square image size, e.g. 320 or 160')
+    parser.add_argument('--event_input_channels', type=int, choices=[1, 3], default=3, help='Event image channels: 3 for fake-RGB (default), 1 for true single-channel event-only training')
+    parser.add_argument('--event_channel_index', type=int, default=2, help='When loading 3-channel event frames as 1-channel, select this channel index')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)

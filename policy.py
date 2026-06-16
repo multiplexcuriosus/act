@@ -16,6 +16,9 @@ class ACTPolicy(nn.Module):
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
+        self.event_input_channels = int(args_override.get('event_input_channels', 3))
+        if self.event_input_channels not in (1, 3):
+            raise ValueError(f"event_input_channels must be 1 or 3, got {self.event_input_channels}")
         # Most tasks use the last action dim as a binary gripper channel.
         # Toy 2D control uses fully continuous actions, so disable BCE on last dim.
         self.use_bce_last_action_dim = args_override.get(
@@ -24,11 +27,20 @@ class ACTPolicy(nn.Module):
         )
         print(f'KL Weight {self.kl_weight}')
 
+    def _normalize_image(self, image):
+        channels = image.shape[2]
+        if channels == 1:
+            normalize = transforms.Normalize(mean=[0.5], std=[0.5])
+        elif channels == 3:
+            normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225])
+        else:
+            raise ValueError(f"Unsupported image channel count: {channels}")
+        return normalize(image)
+
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        image = self._normalize_image(image)
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
@@ -72,11 +84,7 @@ class ACTPolicy(nn.Module):
         """
         env_state = None
 
-        normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        )
-        image = normalize(image)
+        image = self._normalize_image(image)
 
         if actions is not None:
             actions = actions[:, :self.model.num_queries]
@@ -104,13 +112,25 @@ class ACTTaskPolicy(nn.Module):
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
+        self.event_input_channels = int(args_override.get('event_input_channels', 3))
+        if self.event_input_channels not in (1, 3):
+            raise ValueError(f"event_input_channels must be 1 or 3, got {self.event_input_channels}")
         print(f'KL Weight {self.kl_weight}')
+
+    def _normalize_image(self, image):
+        channels = image.shape[2]
+        if channels == 1:
+            normalize = transforms.Normalize(mean=[0.5], std=[0.5])
+        elif channels == 3:
+            normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225])
+        else:
+            raise ValueError(f"Unsupported image channel count: {channels}")
+        return normalize(image)
 
     def __call__(self, pose, image, actions=None, is_pad=None):
         env_state = None
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        image = self._normalize_image(image)
         if actions is not None: # training time
             # change 9D rotation to 6D GSO representation
             pose_6D_rot = torch.cat([pose[:,:6], pose[:,9:]], dim=-1)
@@ -163,12 +183,24 @@ class CNNMLPPolicy(nn.Module):
         model, optimizer = build_CNNMLP_model_and_optimizer(args_override)
         self.model = model # decoder
         self.optimizer = optimizer
+        self.event_input_channels = int(args_override.get('event_input_channels', 3))
+        if self.event_input_channels not in (1, 3):
+            raise ValueError(f"event_input_channels must be 1 or 3, got {self.event_input_channels}")
+
+    def _normalize_image(self, image):
+        channels = image.shape[2]
+        if channels == 1:
+            normalize = transforms.Normalize(mean=[0.5], std=[0.5])
+        elif channels == 3:
+            normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225])
+        else:
+            raise ValueError(f"Unsupported image channel count: {channels}")
+        return normalize(image)
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None # TODO
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        image = self._normalize_image(image)
         if actions is not None: # training time
             actions = actions[:, 0]
             a_hat = self.model(qpos, image, env_state, actions)

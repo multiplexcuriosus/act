@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
 import argparse
 import pickle
@@ -55,6 +56,38 @@ def ensure_hwc3(image: np.ndarray, cam_name: str) -> np.ndarray:
     raise ValueError(f"{cam_name}: expected image shape [H,W], [H,W,1], or [H,W,3], got {tuple(image.shape)}")
 
 
+def extract_event_single_channel(
+    image: np.ndarray,
+    event_channel_index: int,
+    cam_name: str,
+) -> np.ndarray:
+    image = np.asarray(image)
+
+    if image.ndim == 2:
+        return image
+    if image.ndim == 3 and image.shape[2] == 1:
+        return image[:, :, 0]
+    if image.ndim == 3 and image.shape[2] >= 3:
+        if not (0 <= event_channel_index < image.shape[2]):
+            raise ValueError(
+                f"Invalid --event_channel_index={event_channel_index} for {cam_name} image shape {tuple(image.shape)}"
+            )
+        return image[:, :, event_channel_index]
+
+    raise ValueError(
+        f"{cam_name}: expected event image shape [H,W], [H,W,1], or [H,W,>=3], got {tuple(image.shape)}"
+    )
+
+
+def ensure_hw_or_hwc1(image: np.ndarray, cam_name: str) -> np.ndarray:
+    image = np.asarray(image)
+    if image.ndim == 2:
+        return image
+    if image.ndim == 3 and image.shape[2] == 1:
+        return image
+    raise ValueError(f"{cam_name}: expected image shape [H,W] or [H,W,1], got {tuple(image.shape)}")
+
+
 def maybe_resize_for_rgb_event(image: np.ndarray, cam_name: str, camera_names: List[str]) -> np.ndarray:
     if camera_names != ["rgb", "event"]:
         return image
@@ -101,6 +134,58 @@ def resize_image_np(
         return canvas
 
     raise ValueError(f"Unsupported resize_mode: {resize_mode}")
+
+
+def resize_single_channel_image_np(
+    img: np.ndarray,
+    target_size: Tuple[int, int] = (320, 320),
+    resize_mode: str = "warp",
+) -> np.ndarray:
+    target_h, target_w = target_size
+
+    img = ensure_hw_or_hwc1(img, "event")
+    if img.ndim == 3:
+        img = img[:, :, 0]
+
+    if resize_mode == "none":
+        return img
+
+    if resize_mode == "warp":
+        return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    if resize_mode == "letterbox":
+        src_h, src_w = img.shape[:2]
+        scale = min(target_w / src_w, target_h / src_h)
+        resized_w = max(1, int(round(src_w * scale)))
+        resized_h = max(1, int(round(src_h * scale)))
+        resized = cv2.resize(img, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+
+        canvas = np.zeros((target_h, target_w), dtype=img.dtype)
+        top = (target_h - resized_h) // 2
+        left = (target_w - resized_w) // 2
+        canvas[top:top + resized_h, left:left + resized_w] = resized
+        return canvas
+
+    raise ValueError(f"Unsupported resize_mode: {resize_mode}")
+
+
+def infer_event_input_channels_from_state_dict(state_dict: dict) -> Optional[int]:
+    conv1_keys = [
+        "model.backbones.0.0.body.conv1.weight",
+        "backbones.0.0.body.conv1.weight",
+    ]
+    for key in conv1_keys:
+        weight = state_dict.get(key)
+        if weight is not None:
+            if weight.ndim != 4:
+                raise ValueError(f"Unexpected conv1 weight shape at '{key}': {tuple(weight.shape)}")
+            in_channels = int(weight.shape[1])
+            if in_channels not in (1, 3):
+                raise ValueError(
+                    f"Unsupported conv1 input channels inferred from checkpoint key '{key}': {in_channels}"
+                )
+            return in_channels
+    return None
 
 
 def ros_img_to_torch_img(
@@ -178,9 +263,21 @@ class FrankaActRolloutNode(Node):
         self.camera_name = self.camera_names[0]
         self.image_size = tuple(args.image_size)
         self.resize_mode = args.resize_mode
+        self.event_channel_index = int(args.event_channel_index)
         self.freeze_startup_image = args.freeze_startup_image
         self.dryrun = args.dryrun
         self.logged_first_image_stats = False
+
+        if args.event_input_channels not in (1, 3):
+            raise ValueError(f"--event_input_channels must be 1 or 3, got {args.event_input_channels}")
+        self.event_input_channels = int(args.event_input_channels)
+        self.event_input_channels_explicit = bool(getattr(args, "event_input_channels_explicit", False))
+
+        if self.event_input_channels == 1 and self.camera_names != ["event"]:
+            raise ValueError(
+                "--event_input_channels 1 is currently supported only for --camera_names event. "
+                "Use --event_input_channels 3 for RGB or RGB+event rollout."
+            )
 
         if len(self.camera_names) > 1 and self.image_topic is not None:
             raise ValueError(
@@ -223,6 +320,7 @@ class FrankaActRolloutNode(Node):
             "dec_layers": args.dec_layers,
             "nheads": args.nheads,
             "camera_names": self.camera_names,
+            "event_input_channels": self.event_input_channels,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim_cfg,
             "use_bce_last_action_dim": args.use_bce_last_action_dim,
@@ -237,6 +335,21 @@ class FrankaActRolloutNode(Node):
 
         ckpt_obj = torch.load(ckpt_path, map_location=self.device)
         state_dict = ckpt_obj["state_dict"] if isinstance(ckpt_obj, dict) and "state_dict" in ckpt_obj else ckpt_obj
+
+        if self.camera_names == ["event"]:
+            inferred_event_input_channels = infer_event_input_channels_from_state_dict(state_dict)
+            if inferred_event_input_channels is not None:
+                if self.event_input_channels_explicit and self.event_input_channels != inferred_event_input_channels:
+                    raise ValueError(
+                        f"Checkpoint expects event_input_channels={inferred_event_input_channels} from conv1, "
+                        f"but CLI requested --event_input_channels {self.event_input_channels}."
+                    )
+                if not self.event_input_channels_explicit:
+                    self.event_input_channels = inferred_event_input_channels
+                    self.get_logger().info(
+                        f"Using event_input_channels={self.event_input_channels} inferred from checkpoint conv1."
+                    )
+                policy_config["event_input_channels"] = self.event_input_channels
 
         trained_camera_names = None
         if isinstance(ckpt_obj, dict):
@@ -253,8 +366,26 @@ class FrankaActRolloutNode(Node):
         self.policy.eval()
         self.get_logger().info(f"Loaded checkpoint: {ckpt_path}")
 
+        if self.camera_names == ["event"]:
+            conv1_in_channels = int(self.policy.model.backbones[0][0].body.conv1.in_channels)
+            if conv1_in_channels != self.event_input_channels:
+                raise RuntimeError(
+                    "Sanity check failed: model conv1.in_channels does not match event_input_channels "
+                    f"({conv1_in_channels} vs {self.event_input_channels})."
+                )
+            self.get_logger().info(
+                f"Sanity check: event mode conv1.in_channels={conv1_in_channels}"
+            )
+
         with open(stats_path, "rb") as f:
             stats = pickle.load(f)
+
+        if self.camera_names == ["event"] and "event_input_channels" in stats:
+            stats_event_channels = int(stats["event_input_channels"])
+            if stats_event_channels != self.event_input_channels:
+                raise ValueError(
+                    f"dataset_stats event_input_channels={stats_event_channels} but rollout uses event_input_channels={self.event_input_channels}."
+                )
 
         for k in ["qpos_mean", "qpos_std", "action_mean", "action_std"]:
             if k not in stats:
@@ -340,6 +471,9 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(
             f"image_preprocess resize_mode={self.resize_mode} target_size={self.image_size} freeze_startup_image={self.freeze_startup_image}"
         )
+        self.get_logger().info(
+            f"event_input_channels={self.event_input_channels} event_channel_index={self.event_channel_index}"
+        )
         if self.resize_mode != "warp":
             self.get_logger().warn(
                 "Current checkpoints were trained with warp resize to 320x320. Use other resize modes only with matching retrained checkpoints."
@@ -422,15 +556,34 @@ class FrankaActRolloutNode(Node):
             if image_msg_for_policy is None:
                 raise RuntimeError(f"Image not received for camera '{cam_name}'")
 
-            image_np = self.bridge.imgmsg_to_cv2(image_msg_for_policy, desired_encoding='rgb8')
-            original_shapes.append(tuple(image_np.shape))
+            if self.camera_names == ["event"] and self.event_input_channels == 1:
+                image_np = self.bridge.imgmsg_to_cv2(image_msg_for_policy, desired_encoding='passthrough')
+                image_np = extract_event_single_channel(
+                    np.asarray(image_np),
+                    event_channel_index=self.event_channel_index,
+                    cam_name=cam_name,
+                )
+                original_shapes.append(tuple(image_np.shape))
 
-            image_np = ensure_hwc3(np.asarray(image_np), cam_name)
+                if self.resize_mode != "none":
+                    image_np = resize_single_channel_image_np(
+                        image_np,
+                        target_size=self.image_size,
+                        resize_mode=self.resize_mode,
+                    )
+                image_np = ensure_hw_or_hwc1(image_np, cam_name)
+                if image_np.ndim == 2:
+                    image_np = image_np[:, :, None]
+            else:
+                image_np = self.bridge.imgmsg_to_cv2(image_msg_for_policy, desired_encoding='rgb8')
+                original_shapes.append(tuple(image_np.shape))
 
-            if self.camera_names == ["rgb", "event"]:
-                image_np = maybe_resize_for_rgb_event(image_np, cam_name, self.camera_names)
-            elif self.resize_mode != "none":
-                image_np = resize_image_np(image_np, target_size=self.image_size, resize_mode=self.resize_mode)
+                image_np = ensure_hwc3(np.asarray(image_np), cam_name)
+
+                if self.camera_names == ["rgb", "event"]:
+                    image_np = maybe_resize_for_rgb_event(image_np, cam_name, self.camera_names)
+                elif self.resize_mode != "none":
+                    image_np = resize_image_np(image_np, target_size=self.image_size, resize_mode=self.resize_mode)
 
             processed_shapes.append(tuple(image_np.shape))
             image_chw_list.append(np.transpose(image_np, (2, 0, 1)))
@@ -444,11 +597,26 @@ class FrankaActRolloutNode(Node):
                 raise RuntimeError(
                     f"Unexpected policy image shape for rgb+event rollout: got {tuple(curr_image.shape)}, expected {expected_shape}"
                 )
+        elif self.camera_names == ["event"] and self.resize_mode == "warp" and self.image_size == (320, 320):
+            expected_channels = self.event_input_channels
+            expected_shape = (1, 1, expected_channels, 320, 320)
+            if tuple(curr_image.shape) != expected_shape:
+                raise RuntimeError(
+                    "Unexpected policy image shape for event rollout: "
+                    f"got {tuple(curr_image.shape)}, expected {expected_shape}"
+                )
         elif self.resize_mode == "warp" and self.image_size == (320, 320) and len(self.camera_names) == 1:
             expected_shape = (1, 1, 3, 320, 320)
             if tuple(curr_image.shape) != expected_shape:
                 raise RuntimeError(
                     f"Unexpected policy image shape for default rollout: got {tuple(curr_image.shape)}, expected {expected_shape}"
+                )
+
+        if self.camera_names == ["event"]:
+            if int(curr_image.shape[2]) != self.event_input_channels:
+                raise RuntimeError(
+                    "Sanity check failed: curr_image channels do not match event_input_channels "
+                    f"({int(curr_image.shape[2])} vs {self.event_input_channels})."
                 )
 
         if not self.logged_camera_stack_debug:
@@ -605,6 +773,8 @@ def main():
     parser.add_argument("--gripper_state_topic", type=str, default="/teleop/gripper_state_cmd")
     parser.add_argument("--image_size", type=int, nargs=2, default=[320, 320], metavar=("H", "W"))
     parser.add_argument("--resize_mode", type=str, choices=["warp", "letterbox", "none"], default="warp")
+    parser.add_argument("--event_input_channels", type=int, choices=[1, 3], default=3)
+    parser.add_argument("--event_channel_index", type=int, default=2)
     parser.add_argument("--freeze_startup_image", action="store_true", default=False)
     parser.add_argument("--dryrun", action="store_true", default=False)
 
@@ -633,6 +803,7 @@ def main():
     parser.set_defaults(use_bce_last_action_dim=True)
 
     args = parser.parse_args()
+    args.event_input_channels_explicit = "--event_input_channels" in sys.argv
 
     rclpy.init()
     node = FrankaActRolloutNode(args)

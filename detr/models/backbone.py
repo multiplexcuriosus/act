@@ -88,12 +88,46 @@ class Backbone(BackboneBase):
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
-                 dilation: bool):
+                 dilation: bool,
+                 input_channels: int = 3):
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
             pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
+        adapt_resnet_input_channels(backbone, input_channels)
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
+
+
+def adapt_resnet_input_channels(resnet: nn.Module, in_channels: int) -> None:
+    if in_channels == 3:
+        return
+    if in_channels <= 0:
+        raise ValueError(f"in_channels must be positive, got {in_channels}")
+
+    old_conv1 = resnet.conv1
+    new_conv1 = nn.Conv2d(
+        in_channels=in_channels,
+        out_channels=old_conv1.out_channels,
+        kernel_size=old_conv1.kernel_size,
+        stride=old_conv1.stride,
+        padding=old_conv1.padding,
+        bias=(old_conv1.bias is not None),
+    )
+
+    with torch.no_grad():
+        if in_channels == 1:
+            new_conv1.weight.copy_(old_conv1.weight.mean(dim=1, keepdim=True))
+        else:
+            new_conv1.weight.zero_()
+            channels_to_copy = min(3, in_channels)
+            new_conv1.weight[:, :channels_to_copy] = old_conv1.weight[:, :channels_to_copy]
+            if in_channels > 3:
+                mean_weight = old_conv1.weight.mean(dim=1, keepdim=True)
+                new_conv1.weight[:, 3:in_channels] = mean_weight.repeat(1, in_channels - 3, 1, 1)
+        if old_conv1.bias is not None:
+            new_conv1.bias.copy_(old_conv1.bias)
+
+    resnet.conv1 = new_conv1
 
 
 class Joiner(nn.Sequential):
@@ -112,11 +146,17 @@ class Joiner(nn.Sequential):
         return out, pos
 
 
-def build_backbone(args):
+def build_backbone(args, input_channels: int = 3):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
     return_interm_layers = args.masks
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+    backbone = Backbone(
+        args.backbone,
+        train_backbone,
+        return_interm_layers,
+        args.dilation,
+        input_channels=input_channels,
+    )
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

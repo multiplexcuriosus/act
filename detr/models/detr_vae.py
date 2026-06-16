@@ -253,12 +253,28 @@ def build_encoder(args):
 def build(args):
     state_dim = args.state_dim
     action_dim = getattr(args, 'action_dim', state_dim)
+    event_input_channels = int(getattr(args, 'event_input_channels', 3))
+
+    if event_input_channels not in (1, 3):
+        raise ValueError(f"event_input_channels must be 1 or 3, got {event_input_channels}")
+
+    camera_names = list(args.camera_names)
+    if camera_names == ["event"]:
+        image_input_channels = event_input_channels
+    else:
+        if event_input_channels == 1 and "event" in camera_names:
+            raise ValueError(
+                "Mixed camera_names with event_input_channels=1 is not supported. "
+                "Use camera_names=['event'] for true 1-channel event mode, "
+                "or event_input_channels=3 for RGB/mixed mode."
+            )
+        image_input_channels = 3
 
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
     backbones = []
-    backbone = build_backbone(args)
+    backbone = build_backbone(args, input_channels=image_input_channels)
     backbones.append(backbone)
 
     transformer = build_transformer(args)
@@ -283,13 +299,29 @@ def build(args):
 def build_cnnmlp(args):
     state_dim = args.state_dim
     action_dim = getattr(args, 'action_dim', state_dim)
+    event_input_channels = int(getattr(args, 'event_input_channels', 3))
+
+    if event_input_channels not in (1, 3):
+        raise ValueError(f"event_input_channels must be 1 or 3, got {event_input_channels}")
+
+    camera_names = list(args.camera_names)
+    if camera_names == ["event"]:
+        image_input_channels = event_input_channels
+    else:
+        if event_input_channels == 1 and "event" in camera_names:
+            raise ValueError(
+                "Mixed camera_names with event_input_channels=1 is not supported. "
+                "Use camera_names=['event'] for true 1-channel event mode, "
+                "or event_input_channels=3 for RGB/mixed mode."
+            )
+        image_input_channels = 3
 
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
     backbones = []
     for _ in args.camera_names:
-        backbone = build_backbone(args)
+        backbone = build_backbone(args, input_channels=image_input_channels)
         backbones.append(backbone)
 
     model = CNNMLP(

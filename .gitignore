@@ -139,3 +139,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+checkpoints/010426_circle_chase_clean/dataset_stats.pkl
+bag_to_hdf5_tools_yonghee/*
+bias_reduction/*

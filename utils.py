@@ -20,6 +20,25 @@ color_transform = transforms.ColorJitter(brightness=0.5,
 DEFAULT_IMAGE_SIZE = (320, 320)
 
 
+def canonical_image_size(image_size=None):
+    if image_size is None:
+        return DEFAULT_IMAGE_SIZE
+
+    if isinstance(image_size, int):
+        if image_size <= 0:
+            raise ValueError(f"image_size must be positive, got {image_size}")
+        return (image_size, image_size)
+
+    if isinstance(image_size, (tuple, list)) and len(image_size) == 2:
+        h = int(image_size[0])
+        w = int(image_size[1])
+        if h <= 0 or w <= 0:
+            raise ValueError(f"image_size must contain positive values, got {image_size}")
+        return (h, w)
+
+    raise ValueError(f"Unsupported image_size={image_size}. Expected None, int, or (h, w)")
+
+
 DEFAULT_JOINT_DATA_CONFIG = {
     "qpos_dim": None,
     "action_dim": None,
@@ -79,30 +98,6 @@ def _is_grayscale_image(img):
 def _is_event_frame(cam_name, img):
     return ('event' in cam_name.lower()) or _is_grayscale_image(img)
 
-
-def prepare_image(img, target_size=DEFAULT_IMAGE_SIZE, force_rgb=False):
-    img = np.asarray(img)
-    if img.ndim == 2:
-        img = img[..., None]
-    if img.ndim != 3:
-        raise ValueError(f"Unsupported image shape: {img.shape}")
-    if img.shape[-1] not in (1, 3):
-        raise ValueError(f"Unsupported channel count: {img.shape[-1]} for image shape {img.shape}")
-
-    pil_input = img[..., 0] if img.shape[-1] == 1 else img
-    pil_img = transforms.functional.to_pil_image(pil_input)
-    pil_img = transforms.functional.resize(pil_img, list(target_size))
-
-    resized_img = np.asarray(pil_img)
-    if resized_img.ndim == 2:
-        resized_img = resized_img[..., None]
-
-    if force_rgb and resized_img.shape[-1] == 1:
-        resized_img = np.repeat(resized_img, 3, axis=-1)
-
-    return resized_img
-
-
 def ensure_hwc3(image, cam_name):
     image = np.asarray(image)
     if image.ndim == 2:
@@ -118,21 +113,22 @@ def ensure_hwc3(image, cam_name):
     return image
 
 
-def maybe_resize_for_rgb_event(image, cam_name, camera_names):
+def maybe_resize_for_rgb_event(image, cam_name, camera_names, target_size):
+    target_h, target_w = target_size
     if camera_names == ["rgb", "event"]:
-        if image.shape[:2] != DEFAULT_IMAGE_SIZE:
-            image = cv2.resize(image, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
-        if image.shape[:2] != DEFAULT_IMAGE_SIZE:
+        if image.shape[:2] != target_size:
+            image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        if image.shape[:2] != target_size:
             raise ValueError(
-                f"RGB+event mode requires 320x320 images. camera={cam_name}, got={image.shape}"
+                f"RGB+event mode requires {target_h}x{target_w} images. camera={cam_name}, got={image.shape}"
             )
     return image
 
 
-def _print_image_pipeline_info(camera_names):
+def _print_image_pipeline_info(camera_names, target_size, event_input_channels=3, event_channel_index=2):
     camera_list = ', '.join(camera_names)
     event_camera_names = [name for name in camera_names if 'event' in name.lower()]
-    target_h, target_w = DEFAULT_IMAGE_SIZE
+    target_h, target_w = target_size
 
     print(f"[INFO] Camera names: {camera_list}")
     if event_camera_names:
@@ -142,7 +138,37 @@ def _print_image_pipeline_info(camera_names):
         print("[INFO] Event camera detected: none (grayscale auto-detect still enabled)")
     print("[INFO] Event preprocessing enabled: True (camera-name or grayscale auto-detect)")
     print(f"[INFO] Resizing all images to {target_h}x{target_w}")
-    print("[INFO] Event frames converted to fake RGB for ResNet compatibility")
+    if camera_names == ["event"] and event_input_channels == 1:
+        print("[INFO] Event frames kept as single-channel input")
+        print(f"[INFO] event_channel_index={event_channel_index} (used when raw event image has 3 channels)")
+    else:
+        print("[INFO] Event frames converted to fake RGB for ResNet compatibility")
+
+
+def _extract_single_event_channel(image, event_channel_index, cam_name):
+    image = np.asarray(image)
+
+    if image.ndim == 2:
+        return image
+
+    if image.ndim == 3:
+        if image.shape[-1] == 1:
+            return image[..., 0]
+        if image.shape[-1] >= 3:
+            if not (0 <= event_channel_index < image.shape[-1]):
+                raise ValueError(
+                    f"Invalid event_channel_index={event_channel_index} for camera '{cam_name}' with image shape {image.shape}"
+                )
+            return image[..., event_channel_index]
+
+    raise ValueError(f"Unsupported event image shape for camera '{cam_name}': {image.shape}")
+
+
+def _resize_single_channel_image(image_hw, target_size):
+    target_h, target_w = target_size
+    if image_hw.shape[:2] == target_size:
+        return image_hw
+    return cv2.resize(image_hw, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
 
 def _natural_episode_sort_key(dataset_path):
@@ -383,7 +409,7 @@ def _choose_balanced_episode_split(
 
 
 class EpisodicJointDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', img_aug=False):
+    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', img_aug=False, image_size=None, event_input_channels=3, event_channel_index=2):
         super(EpisodicJointDataset).__init__()
         self.qpos_indices = qpos_indices
         self.action_indices = action_indices
@@ -393,9 +419,24 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         self.chunk_size = chunk_size
         self.norm_stats = norm_stats
         self.img_aug = img_aug
+        self.image_size = canonical_image_size(image_size)
+        self.event_input_channels = int(event_input_channels)
+        self.event_channel_index = int(event_channel_index)
         self.is_sim = None
         self._printed_image_debug = False
-        _print_image_pipeline_info(self.camera_names)
+        if self.event_input_channels not in (1, 3):
+            raise ValueError(f"event_input_channels must be 1 or 3, got {self.event_input_channels}")
+        if self.event_input_channels == 1 and self.camera_names != ["event"]:
+            raise ValueError(
+                "event_input_channels=1 is only supported for camera_names=['event'] in current training pipeline."
+            )
+        _print_image_pipeline_info(
+            self.camera_names,
+            self.image_size,
+            event_input_channels=self.event_input_channels,
+            event_channel_index=self.event_channel_index,
+        )
+        print(f"[INFO] Selected canonical image size: {self.image_size}")
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -439,13 +480,13 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                     right_img = np.asarray(right_img)
                     left_img = ensure_hwc3(left_img, f'{cam_name}_left')
                     right_img = ensure_hwc3(right_img, f'{cam_name}_right')
-                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names)
-                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names)
+                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names, self.image_size)
+                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names, self.image_size)
                     stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
                     if self.camera_names != ["rgb", "event"]:
                         stereo_img = cv2.resize(
                             stereo_img,
-                            (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]),
+                            (self.image_size[1], self.image_size[0]),
                             interpolation=cv2.INTER_AREA,
                         )
                     image_dict[cam_name] = ensure_hwc3(stereo_img, cam_name)
@@ -458,10 +499,15 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                             img = color_transform(img)
                         img = rotate_n_crop_transform(img)
                     img = np.asarray(img)
-                    img = ensure_hwc3(img, cam_name)
-                    if self.camera_names != ["rgb", "event"]:
-                        img = cv2.resize(img, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
-                    img = maybe_resize_for_rgb_event(img, cam_name, self.camera_names)
+                    if self.camera_names == ["event"] and self.event_input_channels == 1:
+                        img = _extract_single_event_channel(img, self.event_channel_index, cam_name)
+                        img = _resize_single_channel_image(img, self.image_size)
+                        img = img[..., None]
+                    else:
+                        img = ensure_hwc3(img, cam_name)
+                        if self.camera_names != ["rgb", "event"]:
+                            img = cv2.resize(img, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_AREA)
+                        img = maybe_resize_for_rgb_event(img, cam_name, self.camera_names, self.image_size)
                     image_dict[cam_name] = img
             # get all actions after and including start_ts
             action = root[self.action_key][start_ts:min(start_ts+self.chunk_size, episode_len)]
@@ -478,8 +524,14 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         # new axis for different cameras in exact camera_names order
         all_cam_images = []
         for cam_name in self.camera_names:
-            cam_image = ensure_hwc3(image_dict[cam_name], cam_name)
-            cam_image = maybe_resize_for_rgb_event(cam_image, cam_name, self.camera_names)
+            cam_image = image_dict[cam_name]
+            if self.camera_names == ["event"] and self.event_input_channels == 1:
+                cam_image = _extract_single_event_channel(cam_image, self.event_channel_index, cam_name)
+                cam_image = _resize_single_channel_image(cam_image, self.image_size)
+                cam_image = cam_image[..., None]
+            else:
+                cam_image = ensure_hwc3(cam_image, cam_name)
+                cam_image = maybe_resize_for_rgb_event(cam_image, cam_name, self.camera_names, self.image_size)
             cam_image = np.transpose(cam_image, (2, 0, 1))
             all_cam_images.append(cam_image)
         image_data = torch.from_numpy(np.stack(all_cam_images, axis=0))
@@ -489,12 +541,15 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
 
         assert image_data.ndim == 4, image_data.shape
         assert image_data.shape[0] == len(self.camera_names), image_data.shape
-        assert image_data.shape[1] == 3, image_data.shape
+        expected_channels = 1 if (self.camera_names == ["event"] and self.event_input_channels == 1) else 3
+        assert image_data.shape[1] == expected_channels, image_data.shape
+        if self.camera_names == ["event"]:
+            assert image_data.shape == (1, expected_channels, self.image_size[0], self.image_size[1]), image_data.shape
         if self.camera_names == ["rgb", "event"]:
-            assert image_data.shape == (2, 3, 320, 320), image_data.shape
-            if not self._printed_image_debug:
-                print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
-                self._printed_image_debug = True
+            assert image_data.shape == (2, 3, self.image_size[0], self.image_size[1]), image_data.shape
+        if not self._printed_image_debug:
+            print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
+            self._printed_image_debug = True
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0
@@ -556,6 +611,9 @@ def load_joint_data(
     qpos_indices=None,
     action_indices=None,
     action_key='/action',
+    image_size=None,
+    event_input_channels=3,
+    event_channel_index=2,
 ):
     # Backward-compatible default: model_dof applies to both if explicit dims are not provided.
     if qpos_dim is None and model_dof is not None:
@@ -636,6 +694,9 @@ def load_joint_data(
         action_indices=joint_data_cfg['action_indices'],
         action_key=joint_data_cfg['action_key'],
         img_aug=img_aug,
+        image_size=image_size,
+        event_input_channels=event_input_channels,
+        event_channel_index=event_channel_index,
     )
     val_dataset = EpisodicJointDataset(
         [episode_paths[index] for index in val_indices],
@@ -646,6 +707,9 @@ def load_joint_data(
         action_indices=joint_data_cfg['action_indices'],
         action_key=joint_data_cfg['action_key'],
         img_aug=img_aug,
+        image_size=image_size,
+        event_input_channels=event_input_channels,
+        event_channel_index=event_channel_index,
     )
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
@@ -654,16 +718,31 @@ def load_joint_data(
 
 
 class EpisodicPoseDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, img_aug):
+    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, img_aug, image_size=None, event_input_channels=3, event_channel_index=2):
         super(EpisodicPoseDataset).__init__()
         self.episode_paths = list(episode_paths)
         self.camera_names = camera_names
         self.chunk_size = chunk_size
         self.norm_stats = norm_stats
         self.img_aug = img_aug
+        self.image_size = canonical_image_size(image_size)
+        self.event_input_channels = int(event_input_channels)
+        self.event_channel_index = int(event_channel_index)
         self.is_sim = None
         self._printed_image_debug = False
-        _print_image_pipeline_info(self.camera_names)
+        if self.event_input_channels not in (1, 3):
+            raise ValueError(f"event_input_channels must be 1 or 3, got {self.event_input_channels}")
+        if self.event_input_channels == 1 and self.camera_names != ["event"]:
+            raise ValueError(
+                "event_input_channels=1 is only supported for camera_names=['event'] in current training pipeline."
+            )
+        _print_image_pipeline_info(
+            self.camera_names,
+            self.image_size,
+            event_input_channels=self.event_input_channels,
+            event_channel_index=self.event_channel_index,
+        )
+        print(f"[INFO] Selected canonical image size: {self.image_size}")
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -705,13 +784,13 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                     right_img = np.asarray(right_img)
                     left_img = ensure_hwc3(left_img, f'{cam_name}_left')
                     right_img = ensure_hwc3(right_img, f'{cam_name}_right')
-                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names)
-                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names)
+                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names, self.image_size)
+                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names, self.image_size)
                     stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
                     if self.camera_names != ["rgb", "event"]:
                         stereo_img = cv2.resize(
                             stereo_img,
-                            (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]),
+                            (self.image_size[1], self.image_size[0]),
                             interpolation=cv2.INTER_AREA,
                         )
                     image_dict[cam_name] = ensure_hwc3(stereo_img, cam_name)
@@ -724,10 +803,15 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                             img = color_transform(img)
                         img = rotate_n_crop_transform(img)
                     img = np.asarray(img)
-                    img = ensure_hwc3(img, cam_name)
-                    if self.camera_names != ["rgb", "event"]:
-                        img = cv2.resize(img, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
-                    img = maybe_resize_for_rgb_event(img, cam_name, self.camera_names)
+                    if self.camera_names == ["event"] and self.event_input_channels == 1:
+                        img = _extract_single_event_channel(img, self.event_channel_index, cam_name)
+                        img = _resize_single_channel_image(img, self.image_size)
+                        img = img[..., None]
+                    else:
+                        img = ensure_hwc3(img, cam_name)
+                        if self.camera_names != ["rgb", "event"]:
+                            img = cv2.resize(img, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_AREA)
+                        img = maybe_resize_for_rgb_event(img, cam_name, self.camera_names, self.image_size)
                     image_dict[cam_name] = img
             # get all actions after and including start_ts
             action = root['/ee_action_global'][start_ts:min(start_ts+self.chunk_size, episode_len)]
@@ -742,8 +826,14 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
         # new axis for different cameras in exact camera_names order
         all_cam_images = []
         for cam_name in self.camera_names:
-            cam_image = ensure_hwc3(image_dict[cam_name], cam_name)
-            cam_image = maybe_resize_for_rgb_event(cam_image, cam_name, self.camera_names)
+            cam_image = image_dict[cam_name]
+            if self.camera_names == ["event"] and self.event_input_channels == 1:
+                cam_image = _extract_single_event_channel(cam_image, self.event_channel_index, cam_name)
+                cam_image = _resize_single_channel_image(cam_image, self.image_size)
+                cam_image = cam_image[..., None]
+            else:
+                cam_image = ensure_hwc3(cam_image, cam_name)
+                cam_image = maybe_resize_for_rgb_event(cam_image, cam_name, self.camera_names, self.image_size)
             cam_image = np.transpose(cam_image, (2, 0, 1))
             all_cam_images.append(cam_image)
         image_data = torch.from_numpy(np.stack(all_cam_images, axis=0))
@@ -753,12 +843,15 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
 
         assert image_data.ndim == 4, image_data.shape
         assert image_data.shape[0] == len(self.camera_names), image_data.shape
-        assert image_data.shape[1] == 3, image_data.shape
+        expected_channels = 1 if (self.camera_names == ["event"] and self.event_input_channels == 1) else 3
+        assert image_data.shape[1] == expected_channels, image_data.shape
+        if self.camera_names == ["event"]:
+            assert image_data.shape == (1, expected_channels, self.image_size[0], self.image_size[1]), image_data.shape
         if self.camera_names == ["rgb", "event"]:
-            assert image_data.shape == (2, 3, 320, 320), image_data.shape
-            if not self._printed_image_debug:
-                print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
-                self._printed_image_debug = True
+            assert image_data.shape == (2, 3, self.image_size[0], self.image_size[1]), image_data.shape
+        if not self._printed_image_debug:
+            print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
+            self._printed_image_debug = True
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0
@@ -811,6 +904,9 @@ def load_pose_data(
     img_aug=False,
     split_num_trials=100,
     split_seed=0,
+    image_size=None,
+    event_input_channels=3,
+    event_channel_index=2,
 ):
     episode_paths = collect_episode_paths(dataset_dirs)
     total_episode_count = len(episode_paths)
@@ -850,8 +946,26 @@ def load_pose_data(
     norm_stats = get_pose_norm_stats(episode_paths)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicPoseDataset([episode_paths[index] for index in train_indices], camera_names, chunk_size, norm_stats, img_aug)
-    val_dataset = EpisodicPoseDataset([episode_paths[index] for index in val_indices], camera_names, chunk_size, norm_stats, img_aug)
+    train_dataset = EpisodicPoseDataset(
+        [episode_paths[index] for index in train_indices],
+        camera_names,
+        chunk_size,
+        norm_stats,
+        img_aug,
+        image_size=image_size,
+        event_input_channels=event_input_channels,
+        event_channel_index=event_channel_index,
+    )
+    val_dataset = EpisodicPoseDataset(
+        [episode_paths[index] for index in val_indices],
+        camera_names,
+        chunk_size,
+        norm_stats,
+        img_aug,
+        image_size=image_size,
+        event_input_channels=event_input_channels,
+        event_channel_index=event_channel_index,
+    )
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 
