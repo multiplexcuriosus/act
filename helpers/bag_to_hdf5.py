@@ -4,7 +4,7 @@ import os
 import gc
 import argparse
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 import cv2
 import h5py
 import numpy as np
@@ -19,6 +19,7 @@ TOPIC_EVENT = "/openmv_cam/image"
 TOPIC_JOINT = "/joint_states"
 TOPIC_GRIPPER_STATE = "/teleop/gripper_state_cmd"
 TOPIC_TWIST = "/cartesian_cmd/twist"
+TOPIC_WRENCH = "/right_franka/external_wrenches"
 TOPIC_EPISODE = "/episode/control"
 MIN_DURATION = 4.0  # seconds
 
@@ -142,8 +143,15 @@ def get_topic_type_map(reader) -> Dict[str, str]:
     return {x.name: x.type for x in topic_types}
 
 
-def get_type_class_map(topic_type_map: Dict[str, str]) -> Dict[str, Any]:
-    return {topic: get_message(msg_type) for topic, msg_type in topic_type_map.items()}
+def get_type_class_map(
+    topic_type_map: Dict[str, str],
+    only_topics: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    if only_topics is None:
+        items = topic_type_map.items()
+    else:
+        items = [(t, topic_type_map[t]) for t in only_topics if t in topic_type_map]
+    return {topic: get_message(msg_type) for topic, msg_type in items}
 
 
 def check_required_topics(
@@ -155,6 +163,7 @@ def check_required_topics(
         TOPIC_JOINT,
         TOPIC_GRIPPER_STATE,
         TOPIC_TWIST,
+        TOPIC_WRENCH,
         TOPIC_EPISODE,
     }
     if require_event_topic:
@@ -403,6 +412,15 @@ def twist_msg_to_vec(msg) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def wrench_msg_to_vec(msg) -> np.ndarray:
+    arr = np.asarray(msg.data, dtype=np.float32)
+    if arr.shape[0] != 12:
+        raise RuntimeError(
+            f"Expected /right_franka/external_wrenches to have 12 floats, got shape {arr.shape}"
+        )
+    return arr
+
+
 def build_qpos_from_joint_state(joint_names: List[str], joint_pos: np.ndarray) -> np.ndarray:
     arm_joint_names = [
         "right_fr3_joint1",
@@ -452,7 +470,7 @@ def extract_episode_windows(bag_path: str) -> List[EpisodeWindow]:
     log("[INFO] Pass 1/2: scanning /episode/control for episode boundaries...")
     reader = open_reader(bag_path)
     topic_type_map = get_topic_type_map(reader)
-    msg_types = get_type_class_map(topic_type_map)
+    msg_types = get_type_class_map(topic_type_map, only_topics={TOPIC_EPISODE})
 
     current_start: Optional[float] = None
     committed_windows: List[EpisodeWindow] = []
@@ -599,7 +617,6 @@ def collect_single_episode_data(
 
     reader = open_reader(bag_path)
     topic_type_map = get_topic_type_map(reader)
-    msg_types = get_type_class_map(topic_type_map)
 
     # We include only messages within this episode window.
     data = {
@@ -613,6 +630,8 @@ def collect_single_episode_data(
         "gripper_state": [],
         "twist_t": [],
         "twist": [],
+        "wrench_t": [],
+        "wrench": [],
         "joint_names": None,
     }
 
@@ -625,11 +644,13 @@ def collect_single_episode_data(
         TOPIC_JOINT: False,
         TOPIC_GRIPPER_STATE: False,
         TOPIC_TWIST: False,
+        TOPIC_WRENCH: False,
     }
     if require_event_topic:
         seen_after_end[TOPIC_EVENT] = False
 
     tracked_topics = set(seen_after_end.keys())
+    msg_types = get_type_class_map(topic_type_map, only_topics=tracked_topics)
 
     while reader.has_next():
         topic, raw, t_ns = reader.read_next()
@@ -694,6 +715,10 @@ def collect_single_episode_data(
             data["twist_t"].append(t)
             data["twist"].append(twist_msg_to_vec(msg))
 
+        elif topic == TOPIC_WRENCH:
+            data["wrench_t"].append(t)
+            data["wrench"].append(wrench_msg_to_vec(msg))
+
     log(f"[INFO] episode {ep.idx}: scan finished")
     log(f"       scanned bag messages: {msg_count}")
     log(f"       kept messages:        {kept_count}")
@@ -705,8 +730,9 @@ def collect_single_episode_data(
     log(f"       joint msgs:           {len(data['joint_t'])}")
     log(f"       gripper state msgs:   {len(data['gripper_state_t'])}")
     log(f"       twist msgs:           {len(data['twist_t'])}")
+    log(f"       wrench msgs:          {len(data['wrench_t'])}")
 
-    required_data_keys = ["rgb_t", "joint_t", "twist_t"]
+    required_data_keys = ["rgb_t", "joint_t", "twist_t", "wrench_t"]
     if require_event_topic:
         required_data_keys.append("event_t")
 
@@ -737,11 +763,13 @@ def sample_episode_to_arrays(
     joint_t = data["joint_t"]
     gripper_state_t = data["gripper_state_t"]
     twist_t = data["twist_t"]
+    wrench_t = data["wrench_t"]
 
     rgb_msg = data["rgb_msg"]
     joint_pos = data["joint_pos"]
     gripper_state = data["gripper_state"]
     twist = data["twist"]
+    wrench = data["wrench"]
     joint_names = data["joint_names"]
 
     if raw_event_store is None:
@@ -760,6 +788,7 @@ def sample_episode_to_arrays(
     joint_idx = first_index_ge(joint_t, ep.start)
     gripper_state_idx = last_index_le(gripper_state_t, ep.start)
     twist_idx = first_index_ge(twist_t, ep.start)
+    wrench_idx = first_index_ge(wrench_t, ep.start)
 
     initial_gripper_state = np.float32(0.0)  # open
     log(f"[INFO] episode {ep.idx}: sparse gripper state event count = {len(gripper_state_t)}")
@@ -776,6 +805,7 @@ def sample_episode_to_arrays(
     qpos_seq = []
     gripper_seq = []
     twist_seq = []
+    wrench_seq = []
     for i, t in enumerate(grid):
         rgb_idx = first_index_ge(rgb_t, t, rgb_idx)
         if raw_event_store is None:
@@ -783,6 +813,7 @@ def sample_episode_to_arrays(
         joint_idx = first_index_ge(joint_t, t, joint_idx)
         gripper_state_idx = last_index_le(gripper_state_t, t, max(0, gripper_state_idx + 1))
         twist_idx = first_index_ge(twist_t, t, twist_idx)
+        wrench_idx = first_index_ge(wrench_t, t, wrench_idx)
 
         if i % 100 == 0:
             if raw_event_store is None:
@@ -792,7 +823,8 @@ def sample_episode_to_arrays(
             log(
                 f"[DEBUG] episode {ep.idx}: sample {i:04d}/{len(grid)} "
                 f"| rgb_idx={rgb_idx} {event_debug} joint_idx={joint_idx} "
-                f"gripper_state_idx={gripper_state_idx} twist_idx={twist_idx}"
+                f"gripper_state_idx={gripper_state_idx} twist_idx={twist_idx} "
+                f"wrench_idx={wrench_idx}"
             )
 
         rgb_np = image_msg_to_numpy(rgb_msg[rgb_idx])
@@ -824,12 +856,14 @@ def sample_episode_to_arrays(
 
         gripper_seq.append(np.array([gripper_value], dtype=np.float32))
         twist_seq.append(twist[twist_idx])
+        wrench_seq.append(wrench[wrench_idx])
 
     rgb_frames = np.stack(rgb_frames, axis=0)
     event_frames = np.stack(event_frames, axis=0)
     qpos_seq = np.stack(qpos_seq, axis=0).astype(np.float32)
     gripper_seq = np.stack(gripper_seq, axis=0).astype(np.float32)
     twist_seq = np.stack(twist_seq, axis=0).astype(np.float32)
+    wrench_seq = np.stack(wrench_seq, axis=0).astype(np.float32)
     action_combined = np.concatenate([twist_seq, gripper_seq], axis=1)
     timestamps = grid.astype(np.float64)
 
@@ -854,6 +888,7 @@ def sample_episode_to_arrays(
         qpos_seq = qpos_seq[initial_delay_steps:]
         gripper_seq = gripper_seq[initial_delay_steps:]
         twist_seq = twist_seq[initial_delay_steps:]
+        wrench_seq = wrench_seq[initial_delay_steps:]
         action_combined = action_combined[initial_delay_steps:]
 
     return {
@@ -862,6 +897,9 @@ def sample_episode_to_arrays(
         "event": event_frames,
         "qpos": qpos_seq,
         "twist": twist_seq,
+        "wrench": wrench_seq,
+        "wrench_o_f_ext_hat_k": wrench_seq[:, 0:6],
+        "wrench_k_f_ext_hat_k": wrench_seq[:, 6:12],
         "gripper": gripper_seq,
         "combined": action_combined,
     }
@@ -930,6 +968,31 @@ def write_episode_hdf5(
             data=arrays["event"],
             dtype=np.uint8,
             chunks=(1, *arrays["event"].shape[1:]),
+        )
+
+        wrench_group = obs.create_group("wrenches")
+        wrench_group.attrs["source_topic"] = TOPIC_WRENCH
+        wrench_group.attrs["combined_layout"] = np.array(
+            [
+                "o_Fx", "o_Fy", "o_Fz", "o_Tx", "o_Ty", "o_Tz",
+                "k_Fx", "k_Fy", "k_Fz", "k_Tx", "k_Ty", "k_Tz",
+            ],
+            dtype=h5py.string_dtype("utf-8"),
+        )
+        wrench_group.create_dataset(
+            "combined",
+            data=arrays["wrench"],
+            dtype=np.float32,
+        )
+        wrench_group.create_dataset(
+            "o_f_ext_hat_k",
+            data=arrays["wrench_o_f_ext_hat_k"],
+            dtype=np.float32,
+        )
+        wrench_group.create_dataset(
+            "k_f_ext_hat_k",
+            data=arrays["wrench_k_f_ext_hat_k"],
+            dtype=np.float32,
         )
 
         f.create_dataset("action", data=arrays["combined"], dtype=np.float32)
