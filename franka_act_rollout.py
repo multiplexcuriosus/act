@@ -683,8 +683,8 @@ class FrankaActRolloutNode(Node):
         twist_msg.header.stamp = self.get_clock().now().to_msg()
         twist_msg.header.frame_id = "base_link"
         twist_msg.twist.linear.x = float(twist[0])
-        twist_msg.twist.linear.y = float(twist[1])
-        twist_msg.twist.linear.z = float(twist[2])
+        twist_msg.twist.linear.y = float(twist[1]) #debug
+        twist_msg.twist.linear.z = float(twist[2]) #debug
         twist_msg.twist.angular.x = float(twist[3])
         twist_msg.twist.angular.y = float(twist[4])
         twist_msg.twist.angular.z = float(twist[5])
