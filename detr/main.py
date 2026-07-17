@@ -44,6 +44,7 @@ def get_args_parser():
                         help="Type of positional embedding to use on top of the image features")
     parser.add_argument('--camera_names', default=[], type=list, # will be overridden
                         help="A list of camera names")
+    parser.add_argument('--event_channel_selection', default=None, type=int)
 
     # * Transformer
     parser.add_argument('--enc_layers', default=4, type=int, # will be overridden

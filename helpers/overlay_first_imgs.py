@@ -2,27 +2,56 @@
 
 import argparse
 from pathlib import Path
-from typing import List,Tuple
+from typing import Dict, List, Tuple
+
 import cv2
 import h5py
 import numpy as np
 
 
-DEFAULT_IMAGE_KEY = "observations/images/rgb"
+DEFAULT_IMAGE_KEY = "observations/images/event"
 
 
-def load_first_image(hdf5_path: Path, image_key: str) -> np.ndarray:
-    """Load the first image from image_key in an HDF5 file."""
+def is_event_key(image_key: str) -> bool:
+    """Return True if the selected key targets event frames."""
+    normalized_key = image_key.rstrip("/")
+    return normalized_key.endswith("event") or Path(normalized_key).name == "event"
+
+
+def load_first_frame(hdf5_path: Path, image_key: str) -> np.ndarray:
+    """Load the first frame from image_key in an HDF5 file."""
     with h5py.File(hdf5_path, "r") as h5_file:
         if image_key not in h5_file:
             raise KeyError(f"Missing dataset: {image_key}")
-        image = h5_file[image_key][0]
+        dataset = h5_file[image_key]
+        if dataset.shape[0] == 0:
+            raise ValueError(f"Dataset is empty: {image_key}")
+        frame = dataset[0]
 
-    if image.dtype != np.uint8:
-        if np.max(image) <= 1.0:
-            image = (image * 255).astype(np.uint8)
-        else:
-            image = np.clip(image, 0, 255).astype(np.uint8)
+    return np.asarray(frame)
+
+
+def to_uint8(array: np.ndarray) -> np.ndarray:
+    """Convert an array to uint8 using safe event/RGB visualization rules."""
+    if array.dtype == np.uint8:
+        return array
+
+    array_float = np.asarray(array, dtype=np.float32)
+    if array_float.size == 0:
+        raise ValueError("Cannot convert empty array to uint8")
+
+    max_value = float(np.nanmax(array_float))
+    if max_value <= 1.0:
+        array_float = array_float * 255.0
+    else:
+        array_float = np.clip(array_float, 0.0, 255.0)
+
+    return np.clip(array_float, 0.0, 255.0).astype(np.uint8)
+
+
+def first_frame_to_rgb(frame: np.ndarray) -> np.ndarray:
+    """Convert a first frame to RGB uint8, preserving existing RGB behavior."""
+    image = to_uint8(frame)
 
     if image.ndim == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
@@ -32,6 +61,23 @@ def load_first_image(hdf5_path: Path, image_key: str) -> np.ndarray:
         raise ValueError(f"Unsupported image shape: {image.shape}")
 
     return image
+
+
+def first_event_frame_to_3chef(frame: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
+    """Convert first event frame to RGB composite and three grayscale channels."""
+    if frame.ndim != 3:
+        raise ValueError(f"Expected event tensor shape (H, W, 3) or (3, H, W), got {frame.shape}")
+
+    if frame.shape[2] == 3:
+        composite_rgb = frame
+    elif frame.shape[0] == 3:
+        composite_rgb = np.transpose(frame, (1, 2, 0))
+    else:
+        raise ValueError(f"Expected event tensor shape (H, W, 3) or (3, H, W), got {frame.shape}")
+
+    composite_rgb_u8 = to_uint8(composite_rgb)
+    channels = [composite_rgb_u8[..., idx] for idx in range(3)]
+    return composite_rgb_u8, channels
 
 
 def collect_hdf5_files(top_dirs: List[Path]) -> List[Path]:
@@ -48,77 +94,116 @@ def collect_hdf5_files(top_dirs: List[Path]) -> List[Path]:
     return sorted(files)
 
 
-def overlay_images(
+def dedup_name(name: str, seen: Dict[str, int]) -> str:
+    """Deduplicate repeated names by appending _1, _2, ..."""
+    count = seen.get(name, 0)
+    seen[name] = count + 1
+    if count == 0:
+        return name
+    return f"{name}_{count}"
+
+
+def save_first_images(
     hdf5_files: List[Path],
     image_key: str,
-    gamma: float,
-    white_threshold: int,
-) -> Tuple[np.ndarray, int]:
-    """Create one equal-weight overlay from all first images."""
-    overlay_shape = None
-    image_sum = None
-    pixel_count = None
-    loaded_count = 0
+    output_dir: Path,
+) -> Tuple[int, int, int, int]:
+    """Save first frames in RGB or event-3chef mode.
+
+    Returns:
+        (saved_rgb_images, saved_event_channel_images, saved_event_composites, skipped_files)
+    """
+    event_mode = is_event_key(image_key)
+    seen_stems: Dict[str, int] = {}
+
+    saved_rgb_images = 0
+    saved_event_channel_images = 0
+    saved_event_composites = 0
+    skipped_files = 0
+
+    if event_mode:
+        mode_output_root = output_dir / "event_3chef"
+    else:
+        mode_output_root = output_dir
+
+    mode_output_root.mkdir(parents=True, exist_ok=True)
 
     for file_path in hdf5_files:
         try:
-            image = load_first_image(file_path, image_key)
+            frame = load_first_frame(file_path, image_key)
         except Exception as exc:
-            print(f"Skipping {file_path}: {exc}")
+            print(f"Skipping file={file_path}, key={image_key}: {exc}")
+            skipped_files += 1
             continue
 
-        if overlay_shape is None:
-            overlay_shape = image.shape
-            image_sum = np.zeros(overlay_shape, dtype=np.float32)
-            pixel_count = np.zeros(overlay_shape[:2], dtype=np.float32)
+        unique_stem = dedup_name(file_path.stem, seen_stems)
 
-        if image.shape[:2] != overlay_shape[:2]:
-            height, width = overlay_shape[:2]
-            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        if event_mode:
+            try:
+                composite_rgb, channels = first_event_frame_to_3chef(frame)
+            except Exception as exc:
+                shape = tuple(np.asarray(frame).shape)
+                print(
+                    f"Skipping file={file_path}, key={image_key}, shape={shape}: {exc}",
+                )
+                skipped_files += 1
+                continue
 
-        # Convert to float
-        img = image.astype(np.float32)
+            sample_output_dir = mode_output_root / unique_stem
+            sample_output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Basic non-white mask
-        non_white_mask = np.any(img < white_threshold, axis=2)
+            wrote_ok = True
+            for idx, channel in enumerate(channels):
+                channel_path = sample_output_dir / f"chef_{idx}.png"
+                if not cv2.imwrite(str(channel_path), channel):
+                    print(
+                        f"Skipping file={file_path}, key={image_key}: "
+                        f"failed to write {channel_path}",
+                    )
+                    wrote_ok = False
+                    break
 
-        # --- NEW: color weighting ---
-        # Tennis ball ≈ high R + high G, low B (yellow)
-        r, g, b = img[..., 0], img[..., 1], img[..., 2]
+            if not wrote_ok:
+                skipped_files += 1
+                continue
 
-        yellow_score = (r + g) - 1.5 * b   # emphasize yellow, suppress blue
-        yellow_score = np.clip(yellow_score, 0, None)
+            composite_path = sample_output_dir / "composite_rgb.png"
+            composite_bgr = cv2.cvtColor(composite_rgb, cv2.COLOR_RGB2BGR)
+            if not cv2.imwrite(str(composite_path), composite_bgr):
+                print(
+                    f"Skipping file={file_path}, key={image_key}: "
+                    f"failed to write {composite_path}",
+                )
+                skipped_files += 1
+                continue
 
-        # Normalize weights (avoid explosion)
-        weight = 1.0 + 2.0 * (yellow_score / 255.0)  # tune 2.0 → stronger boost
+            saved_event_channel_images += 3
+            saved_event_composites += 1
+            continue
 
-        # Apply mask
-        valid = non_white_mask
+        try:
+            rgb_image = first_frame_to_rgb(frame)
+        except Exception as exc:
+            shape = tuple(np.asarray(frame).shape)
+            print(f"Skipping file={file_path}, key={image_key}, shape={shape}: {exc}")
+            skipped_files += 1
+            continue
 
-        image_sum[valid] += (img[valid] * weight[valid, None])
-        pixel_count[valid] += weight[valid]
+        output_path = mode_output_root / f"{unique_stem}_first_image.png"
+        image_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+        if not cv2.imwrite(str(output_path), image_bgr):
+            print(f"Skipping file={file_path}, key={image_key}: failed to write {output_path}")
+            skipped_files += 1
+            continue
 
-        loaded_count += 1
+        saved_rgb_images += 1
 
-    if overlay_shape is None or loaded_count == 0:
-        raise RuntimeError("No valid images were loaded.")
-
-    overlay = np.full(overlay_shape, 255.0, dtype=np.float32)
-
-    valid_pixels = pixel_count > 0
-    overlay[valid_pixels] = image_sum[valid_pixels] / pixel_count[valid_pixels, None]
-
-    overlay = 255.0 * np.power(
-        np.clip(overlay / 255.0, 0.0, 1.0),
-        gamma,
-    )
-
-    return np.clip(overlay, 0, 255).astype(np.uint8), loaded_count
+    return saved_rgb_images, saved_event_channel_images, saved_event_composites, skipped_files
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Overlay first images from all HDF5 files under one or more folders.",
+        description="Save first frames from HDF5 files (RGB mode or event-3chef mode).",
     )
 
     parser.add_argument(
@@ -131,8 +216,8 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("overlay_first_images.png"),
-        help="Output image path.",
+        default=Path("first_imgs"),
+        help="Output directory root. Default: first_imgs",
     )
 
     parser.add_argument(
@@ -146,14 +231,14 @@ def main() -> None:
         "--gamma",
         type=float,
         default=1.0,
-        help="Post-merge gamma correction. Use <1.0, e.g. 0.75, to reduce washout.",
+        help="Deprecated compatibility flag (ignored).",
     )
 
     parser.add_argument(
         "--white-threshold",
         type=int,
         default=245,
-        help="Treat pixels as white background when all channels are >= this value.",
+        help="Deprecated compatibility flag (ignored).",
     )
 
     args = parser.parse_args()
@@ -169,25 +254,22 @@ def main() -> None:
     if not hdf5_files:
         raise RuntimeError("No .hdf5/.h5 files found in provided folders.")
 
-    overlay, loaded_count = overlay_images(
+    args.output.mkdir(parents=True, exist_ok=True)
+
+    saved_rgb_images, saved_event_channel_images, saved_event_composites, skipped_files = save_first_images(
         hdf5_files=hdf5_files,
         image_key=args.image_key,
-        gamma=args.gamma,
-        white_threshold=args.white_threshold,
+        output_dir=args.output,
     )
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-    overlay_bgr = cv2.rotate(overlay_bgr, cv2.ROTATE_180)
-
-    if not cv2.imwrite(str(args.output), overlay_bgr):
-        raise RuntimeError(f"Failed to write output image: {args.output}")
 
     print(f"Input folders: {len(args.top_dirs)}")
     print(f"Found HDF5 files: {len(hdf5_files)}")
-    print(f"Successfully blended images: {loaded_count}")
-    print(f"Saved overlay to: {args.output}")
+    print(f"Event mode: {is_event_key(args.image_key)}")
+    print(f"Saved RGB images: {saved_rgb_images}")
+    print(f"Saved event channel images: {saved_event_channel_images}")
+    print(f"Saved event composite RGB images: {saved_event_composites}")
+    print(f"Skipped files: {skipped_files}")
+    print(f"Output folder: {args.output}")
 
 
 if __name__ == "__main__":

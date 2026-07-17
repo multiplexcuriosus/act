@@ -9,6 +9,45 @@ e = IPython.embed
 
 from roma.mappings import special_gramschmidt
 
+
+def _build_image_normalizer(image_channels):
+    if image_channels == 1:
+        # Collapse ImageNet RGB stats to one channel for event-only mode.
+        mean = [sum([0.485, 0.456, 0.406]) / 3.0]
+        std = [sum([0.229, 0.224, 0.225]) / 3.0]
+    elif image_channels == 3:
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+    else:
+        raise ValueError(f"Unsupported image_channels={image_channels}")
+    return transforms.Normalize(mean=mean, std=std)
+
+
+def _collect_backbone_conv1_in_channels(model):
+    in_channels = []
+    model_backbones = getattr(model, 'backbones', None)
+    if model_backbones is None:
+        return in_channels
+
+    for backbone in model_backbones:
+        try:
+            conv1 = backbone[0].body.conv1
+            in_channels.append(int(conv1.in_channels))
+        except Exception:
+            continue
+    return in_channels
+
+
+def _assert_backbone_channels(model, expected_channels):
+    channels = _collect_backbone_conv1_in_channels(model)
+    if not channels:
+        return
+    if any(channel != expected_channels for channel in channels):
+        raise AssertionError(
+            f"Backbone conv1 in_channels mismatch. expected={expected_channels}, actual={channels}"
+        )
+    print(f"[INFO] Backbone conv1 in_channels={channels}, expected={expected_channels}")
+
 class ACTPolicy(nn.Module):
     def __init__(self, args_override):
         super().__init__()
@@ -22,13 +61,14 @@ class ACTPolicy(nn.Module):
             'use_bce_last_action_dim',
             False
         )
+        self.image_channels = int(args_override.get('image_channels', 3))
+        self.normalize = _build_image_normalizer(self.image_channels)
+        _assert_backbone_channels(self.model, self.image_channels)
         print(f'KL Weight {self.kl_weight}')
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        image = self.normalize(image)
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
@@ -70,13 +110,14 @@ class ACTTaskPolicy(nn.Module):
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
+        self.image_channels = int(args_override.get('image_channels', 3))
+        self.normalize = _build_image_normalizer(self.image_channels)
+        _assert_backbone_channels(self.model, self.image_channels)
         print(f'KL Weight {self.kl_weight}')
 
     def __call__(self, pose, image, actions=None, is_pad=None):
         env_state = None
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        image = self.normalize(image)
         if actions is not None: # training time
             # change 9D rotation to 6D GSO representation
             pose_6D_rot = torch.cat([pose[:,:6], pose[:,9:]], dim=-1)
@@ -129,12 +170,13 @@ class CNNMLPPolicy(nn.Module):
         model, optimizer = build_CNNMLP_model_and_optimizer(args_override)
         self.model = model # decoder
         self.optimizer = optimizer
+        self.image_channels = int(args_override.get('image_channels', 3))
+        self.normalize = _build_image_normalizer(self.image_channels)
+        _assert_backbone_channels(self.model, self.image_channels)
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None # TODO
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        image = self.normalize(image)
         if actions is not None: # training time
             actions = actions[:, 0]
             a_hat = self.model(qpos, image, env_state, actions)

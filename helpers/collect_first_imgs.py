@@ -8,15 +8,20 @@ import h5py
 import numpy as np
 
 
-DEFAULT_IMAGE_KEY = "observations/images/rgb"
+DEFAULT_IMAGE_KEY = "observations/images/event"
 
 
-def load_first_image(hdf5_path: Path, image_key: str) -> np.ndarray:
-    """Load the first image from image_key in an HDF5 file."""
+def load_frame_at_index(hdf5_path: Path, image_key: str, frame_index: int) -> np.ndarray:
+    """Load one image frame by index from image_key in an HDF5 file."""
     with h5py.File(hdf5_path, "r") as h5_file:
         if image_key not in h5_file:
             raise KeyError(f"Missing dataset: {image_key}")
-        image = h5_file[image_key][0]
+        dataset = h5_file[image_key]
+        if dataset.shape[0] <= frame_index:
+            raise IndexError(
+                f"Frame index {frame_index} out of range for dataset length {dataset.shape[0]}",
+            )
+        image = dataset[frame_index]
 
     if image.dtype != np.uint8:
         if np.max(image) <= 1.0:
@@ -48,8 +53,13 @@ def collect_hdf5_files(top_dirs: List[Path]) -> List[Path]:
     return sorted(files)
 
 
-def save_first_images(hdf5_files: List[Path], image_key: str, output_dir: Path) -> int:
-    """Save each file's first image as <hdf5_stem>_first_image.png."""
+def save_images_at_index(
+    hdf5_files: List[Path],
+    image_key: str,
+    output_dir: Path,
+    frame_index: int,
+) -> int:
+    """Save each file's selected frame as <hdf5_stem>_frame_<idx>.png."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     saved_count = 0
@@ -57,12 +67,12 @@ def save_first_images(hdf5_files: List[Path], image_key: str, output_dir: Path) 
 
     for file_path in hdf5_files:
         try:
-            image = load_first_image(file_path, image_key)
+            image = load_frame_at_index(file_path, image_key, frame_index)
         except Exception as exc:
             print(f"Skipping {file_path}: {exc}")
             continue
 
-        base_name = f"{file_path.stem}_first_image"
+        base_name = f"{file_path.stem}_frame_{frame_index}"
         out_name = f"{base_name}.png"
 
         # Keep the requested naming pattern while avoiding accidental overwrite
@@ -87,7 +97,7 @@ def save_first_images(hdf5_files: List[Path], image_key: str, output_dir: Path) 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Save the first image from each HDF5 file under one or more folders.",
+        description="Save a selected frame from each HDF5 file under one or more folders.",
     )
 
     parser.add_argument(
@@ -111,22 +121,34 @@ def main() -> None:
         help=f"HDF5 image dataset key. Default: {DEFAULT_IMAGE_KEY}",
     )
 
+    parser.add_argument(
+        "--frame-index",
+        type=int,
+        default=0,
+        help="0-based frame index to save from each dataset. Default: 0 (first frame).",
+    )
+
     args = parser.parse_args()
+
+    if args.frame_index < 0:
+        raise ValueError(f"frame-index must be >= 0, got {args.frame_index}")
 
     hdf5_files = collect_hdf5_files(args.top_dirs)
 
     if not hdf5_files:
         raise RuntimeError("No .hdf5/.h5 files found in provided folders.")
 
-    saved_count = save_first_images(
+    saved_count = save_images_at_index(
         hdf5_files=hdf5_files,
         image_key=args.image_key,
         output_dir=args.output_dir,
+        frame_index=args.frame_index,
     )
 
     print(f"Input folders: {len(args.top_dirs)}")
     print(f"Found HDF5 files: {len(hdf5_files)}")
-    print(f"Saved first images: {saved_count}")
+    print(f"Frame index: {args.frame_index}")
+    print(f"Saved images: {saved_count}")
     print(f"Output folder: {args.output_dir}")
 
 

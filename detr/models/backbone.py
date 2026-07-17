@@ -18,6 +18,38 @@ from .position_encoding import build_position_encoding
 import IPython
 e = IPython.embed
 
+
+def adapt_resnet_input_channels(resnet, in_channels):
+    old_conv = resnet.conv1
+    if old_conv.in_channels == in_channels:
+        return resnet
+
+    new_conv = torch.nn.Conv2d(
+        in_channels=in_channels,
+        out_channels=old_conv.out_channels,
+        kernel_size=old_conv.kernel_size,
+        stride=old_conv.stride,
+        padding=old_conv.padding,
+        bias=(old_conv.bias is not None),
+    )
+
+    with torch.no_grad():
+        if old_conv.weight.shape[1] == 3 and in_channels == 1:
+            # Initialize 1-channel conv from pretrained RGB conv weights.
+            new_conv.weight.copy_(old_conv.weight.mean(dim=1, keepdim=True))
+        else:
+            torch.nn.init.kaiming_normal_(
+                new_conv.weight,
+                mode='fan_out',
+                nonlinearity='relu',
+            )
+
+        if old_conv.bias is not None:
+            new_conv.bias.copy_(old_conv.bias)
+
+    resnet.conv1 = new_conv
+    return resnet
+
 class FrozenBatchNorm2d(torch.nn.Module):
     """
     BatchNorm2d where the batch statistics and the affine parameters are fixed.
@@ -88,10 +120,12 @@ class Backbone(BackboneBase):
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
-                 dilation: bool):
+                 dilation: bool,
+                 in_channels: int = 3):
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
             pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
+        backbone = adapt_resnet_input_channels(backbone, in_channels)
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
@@ -116,7 +150,8 @@ def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
     return_interm_layers = args.masks
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+    image_channels = int(getattr(args, 'image_channels', 3))
+    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation, in_channels=image_channels)
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

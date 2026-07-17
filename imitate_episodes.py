@@ -1,4 +1,5 @@
 import argparse
+import cv2
 import datetime
 import json
 import os
@@ -86,11 +87,35 @@ def main(args):
             raise ValueError("Either --dataset_dir or --dataset_dirs must be provided.")
     camera_names = args['camera_names']
     camera_names = validate_camera_names(camera_names)
+    event_channel_selection = args['event_channel_selection']
+    if event_channel_selection is not None:
+        if camera_names != ['event']:
+            raise NotImplementedError(
+                '--event_channel_selection is currently only implemented for --camera_names event'
+            )
+        event_channel_indices = [event_channel_selection - 1]
+        image_channels = 1
+    else:
+        event_channel_indices = None
+        image_channels = 3
     data_mode = args['data_mode']
     img_aug = args['img_aug']
+    photometric_aug = args['photometric_aug']
+    spatial_aug = args['spatial_aug']
+    if img_aug:
+        print('[WARN] --img_aug is deprecated and will be removed in a future release. Use --photometric_aug and/or --spatial_aug.')
+        photometric_aug = True
+        spatial_aug = True
+    print(f'[INFO] Augmentation flags: photometric_aug={photometric_aug}, spatial_aug={spatial_aug}')
     episode_len = args['episode_len']
     action_dim = args['action_dim']
     
+    image_size = int(args['image_size'])
+    if image_size <= 0:
+        raise ValueError(f"--image_size must be a positive integer, got {image_size}")
+    if image_size % 32 != 0:
+        print(f"[WARN] image_size={image_size} is not a multiple of 32; this may affect model performance.")
+
     if use_waypoint:
         print('Using waypoint')
     if constant_waypoint is not None:
@@ -145,12 +170,19 @@ def main(args):
                          'state_dim': state_dim,
                          'action_dim': action_dim,
                          'use_bce_last_action_dim': use_bce_last_action_dim,
-                         'device': device.type
+                         'device': device.type,
+                         'image_size': image_size,
+                         'event_channel_selection': event_channel_selection,
+                         'event_channel_indices': event_channel_indices,
+                         'image_channels': image_channels,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
                          'camera_names': camera_names, 'state_dim': state_dim, 'action_dim': action_dim,
-                         'device': device.type}
+                         'device': device.type, 'image_size': image_size,
+                         'event_channel_selection': event_channel_selection,
+                         'event_channel_indices': event_channel_indices,
+                         'image_channels': image_channels}
     else:
         raise NotImplementedError
 
@@ -175,9 +207,15 @@ def main(args):
         'batch_size_train': batch_size_train,
         'batch_size_val': batch_size_val,
         'img_aug': img_aug,
+        'photometric_aug': photometric_aug,
+        'spatial_aug': spatial_aug,
         'data_mode': data_mode,
         'use_waypoint': use_waypoint,
         'constant_waypoint': constant_waypoint,
+        'image_size': image_size,
+        'event_channel_selection': event_channel_selection,
+        'event_channel_indices': event_channel_indices,
+        'image_channels': image_channels,
         'profile_memory': args['profile_memory'],
         'memory_profile_num_epochs': args['memory_profile_num_epochs'],
         'json_log_interval_epochs': 500,
@@ -223,7 +261,10 @@ def main(args):
             args['chunk_size'],
             batch_size_train,
             batch_size_val,
-            img_aug=img_aug,
+            photometric_aug=photometric_aug,
+            spatial_aug=spatial_aug,
+            image_size=image_size,
+            event_channel_indices=event_channel_indices,
         )
     elif args['data_mode'] == 'joint':
         train_dataloader, val_dataloader, stats, _ = load_joint_data(
@@ -233,10 +274,13 @@ def main(args):
             batch_size_train,
             batch_size_val,
             model_dof=None,
-            img_aug=img_aug,
+            photometric_aug=photometric_aug,
+            spatial_aug=spatial_aug,
             qpos_dim=state_dim,
             action_dim=action_dim,
             action_key='/action',
+            image_size=image_size,
+            event_channel_indices=event_channel_indices,
         )
         if use_bce_last_action_dim:
             # Keep binary gripper-state target (last action dim) in raw 0/1 space.
@@ -253,6 +297,10 @@ def main(args):
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
         os.makedirs(ckpt_dir)
+    stats['image_size'] = image_size
+    stats['event_channel_selection'] = event_channel_selection
+    stats['event_channel_indices'] = event_channel_indices
+    stats['image_channels'] = image_channels
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
@@ -394,10 +442,27 @@ def summarize_memory_samples(samples, phase):
     }
 
 
-def get_image(ts, camera_names, device):
+def get_image(ts, camera_names, device, image_size=320, event_channel_indices=None):
     curr_images = []
+    expected_channels = None
     for cam_name in camera_names:
-        curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
+        curr_image = np.asarray(ts.observation['images'][cam_name])
+        if curr_image.ndim == 2:
+            curr_image = curr_image[..., None]
+        if cam_name == 'event' and event_channel_indices is not None:
+            curr_image = curr_image[..., event_channel_indices]
+        if curr_image.shape[-1] not in (1, 3):
+            raise ValueError(
+                f"Unsupported number of channels for camera '{cam_name}': {curr_image.shape[-1]}"
+            )
+        if expected_channels is None:
+            expected_channels = curr_image.shape[-1]
+        elif curr_image.shape[-1] != expected_channels:
+            raise ValueError(
+                f"All cameras must have matching channels for stacking. Expected {expected_channels}, got {curr_image.shape[-1]} for {cam_name}."
+            )
+        curr_image = cv2.resize(curr_image, (image_size, image_size), interpolation=cv2.INTER_AREA)
+        curr_image = rearrange(curr_image, 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
     curr_image = torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
@@ -432,6 +497,14 @@ def eval_bc(config, ckpt_name, save_episode=True):
     with open(stats_path, 'rb') as f:
         stats = pickle.load(f)
 
+    eval_image_size = int(stats.get('image_size', config.get('image_size', 320)))
+    event_channel_indices = stats.get('event_channel_indices', config.get('event_channel_indices', None))
+    if event_channel_indices is not None and camera_names != ['event']:
+        raise NotImplementedError(
+            '--event_channel_selection is currently only implemented for --camera_names event'
+        )
+    print(f"[INFO] Eval image_size={eval_image_size}")
+
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
 
@@ -456,6 +529,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     num_rollouts = 50
     episode_returns = []
     highest_rewards = []
+    _printed_eval_shape = False
     for rollout_id in range(num_rollouts):
         rollout_id += 0
         ### set task
@@ -499,7 +573,21 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 qpos = pre_process(qpos_numpy)
                 qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names, device)
+                curr_image = get_image(
+                    ts,
+                    camera_names,
+                    device,
+                    image_size=eval_image_size,
+                    event_channel_indices=event_channel_indices,
+                )
+
+                if not _printed_eval_shape:
+                    print(f"[DEBUG] eval curr_image.shape={tuple(curr_image.shape)}")
+                    if event_channel_indices is not None:
+                        assert curr_image.ndim == 5, curr_image.shape
+                        assert curr_image.shape[1] == 1, curr_image.shape
+                        assert curr_image.shape[2] == 1, curr_image.shape
+                    _printed_eval_shape = True
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -628,7 +716,13 @@ def train_bc(train_dataloader, val_dataloader, config):
             'use_bce_last_action_dim': policy_config.get('use_bce_last_action_dim'),
             'temporal_agg': config.get('temporal_agg'),
             'batch_size_train': config.get('batch_size_train'),
-            'batch_size_val': config.get('batch_size_val')
+            'batch_size_val': config.get('batch_size_val'),
+            'image_size': policy_config.get('image_size'),
+            'photometric_aug': config.get('photometric_aug'),
+            'spatial_aug': config.get('spatial_aug'),
+            'event_channel_selection': policy_config.get('event_channel_selection'),
+            'event_channel_indices': policy_config.get('event_channel_indices'),
+            'image_channels': policy_config.get('image_channels'),
         },
         'model': count_parameters(policy),
         'profile_memory': profile_memory_enabled,
@@ -652,6 +746,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     best_epoch = None
     epoch_val_loss = None
     epoch_train_loss = None
+    printed_train_image_shape = False
     for epoch in tqdm(range(latest_idx, num_epochs)):
         wandb_log = {}
         epoch_start_time = time.perf_counter()
@@ -667,6 +762,15 @@ def train_bc(train_dataloader, val_dataloader, config):
         optimizer.zero_grad()
         train_epoch_dicts = []
         for batch_idx, data in enumerate(train_dataloader):
+            if not printed_train_image_shape:
+                image_data = data[0]
+                if policy_config.get('event_channel_indices') is not None:
+                    print(f"[DEBUG] train image_data.shape={tuple(image_data.shape)}")
+                    assert image_data.ndim == 5, image_data.shape
+                    assert image_data.shape[1] == 1, image_data.shape
+                    assert image_data.shape[2] == 1, image_data.shape
+                printed_train_image_shape = True
+
             if should_profile_epoch:
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
@@ -905,16 +1009,27 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
     parser.add_argument('--camera_names', nargs='+', required=True, help='camera names to load from dataset')
+    parser.add_argument(
+        '--event_channel_selection',
+        type=int,
+        choices=[1, 2, 3],
+        default=None,
+        help='For event camera only: select one event channel to train on. Example: --event_channel_selection 3'
+    )
     parser.add_argument('--data_mode', choices=['joint', 'pose'], required=True, help='dataset mode')
     parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (required for joint mode; optional override for pose mode)')
     parser.add_argument('--action_dim', action='store', type=int, required=False, default=None, help='action dimension (required for joint mode; optional override for pose mode)')
-    parser.add_argument('--img_aug', action='store_true', help='enable image augmentation (disabled by default)')
+    parser.add_argument('--photometric_aug', action='store_true', help='enable photometric augmentation (ColorJitter on non-event images only)')
+    parser.add_argument('--spatial_aug', action='store_true', help='enable spatial augmentation (rotate/crop transform)')
+    parser.add_argument('--img_aug', action='store_true', help='[DEPRECATED] enable both --photometric_aug and --spatial_aug')
     parser.add_argument('--use_bce_last_action_dim', action='store_true', help='use BCEWithLogits on final action dim')
     parser.add_argument('--no_use_bce_last_action_dim', action='store_false', dest='use_bce_last_action_dim', help='disable BCEWithLogits on final action dim')
     parser.add_argument('--profile_memory', action='store_true', help='enable sparse CUDA memory profiling at first/mid/last epoch')
     parser.add_argument('--memory_profile_num_epochs', type=int, default=3, help='number of epochs to profile across training; default 3 gives first/mid/last')
     parser.add_argument('--save_extra_checkpoints', action='store_true', help='enable extra checkpoint files (policy_epoch_*, policy_last.ckpt, policy_train_best.ckpt). Disabled by default.')
     parser.add_argument('--checkpoint_interval', type=int, default=1000, help='Save intermediate best checkpoints every N epochs. Use 0 to disable intermediate checkpointing.')
+
+    parser.add_argument('--image_size', type=int, default=320, help='Canonical square image size, e.g. 320, 224, or 160')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)

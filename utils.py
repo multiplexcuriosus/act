@@ -20,6 +20,23 @@ color_transform = transforms.ColorJitter(brightness=0.5,
 DEFAULT_IMAGE_SIZE = (320, 320)
 
 
+def canonical_image_size(image_size=None):
+    """Normalize image_size to a (H, W) tuple."""
+    if image_size is None:
+        return DEFAULT_IMAGE_SIZE
+    if isinstance(image_size, int):
+        if image_size <= 0:
+            raise ValueError(f"image_size must be positive, got {image_size}")
+        return (image_size, image_size)
+    if isinstance(image_size, (tuple, list)) and len(image_size) == 2:
+        h, w = int(image_size[0]), int(image_size[1])
+        if h <= 0 or w <= 0:
+            raise ValueError(f"image_size dimensions must be positive, got ({h}, {w})")
+        return (h, w)
+    raise ValueError(f"Unsupported image_size type/shape: {image_size!r}")
+
+
+
 DEFAULT_JOINT_DATA_CONFIG = {
     "qpos_dim": None,
     "action_dim": None,
@@ -118,21 +135,23 @@ def ensure_hwc3(image, cam_name):
     return image
 
 
-def maybe_resize_for_rgb_event(image, cam_name, camera_names):
+def maybe_resize_for_rgb_event(image, cam_name, camera_names, target_size=DEFAULT_IMAGE_SIZE):
     if camera_names == ["rgb", "event"]:
-        if image.shape[:2] != DEFAULT_IMAGE_SIZE:
-            image = cv2.resize(image, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
-        if image.shape[:2] != DEFAULT_IMAGE_SIZE:
+        target_size = canonical_image_size(target_size)
+        if image.shape[:2] != target_size:
+            image = cv2.resize(image, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
+        if image.shape[:2] != target_size:
             raise ValueError(
-                f"RGB+event mode requires 320x320 images. camera={cam_name}, got={image.shape}"
+                f"RGB+event mode requires {target_size[0]}x{target_size[1]} images. camera={cam_name}, got={image.shape}"
             )
     return image
 
 
-def _print_image_pipeline_info(camera_names):
+def _print_image_pipeline_info(camera_names, target_size=DEFAULT_IMAGE_SIZE, event_channel_indices=None):
     camera_list = ', '.join(camera_names)
     event_camera_names = [name for name in camera_names if 'event' in name.lower()]
-    target_h, target_w = DEFAULT_IMAGE_SIZE
+    target_size = canonical_image_size(target_size)
+    target_h, target_w = target_size
 
     print(f"[INFO] Camera names: {camera_list}")
     if event_camera_names:
@@ -142,7 +161,33 @@ def _print_image_pipeline_info(camera_names):
         print("[INFO] Event camera detected: none (grayscale auto-detect still enabled)")
     print("[INFO] Event preprocessing enabled: True (camera-name or grayscale auto-detect)")
     print(f"[INFO] Resizing all images to {target_h}x{target_w}")
-    print("[INFO] Event frames converted to fake RGB for ResNet compatibility")
+    if event_channel_indices is not None:
+        print(f"[INFO] Event channel selection enabled: indices={event_channel_indices}")
+    else:
+        print("[INFO] Event frames converted to fake RGB for ResNet compatibility")
+
+
+def _prepare_camera_image(curr_image, cam_name, camera_names, image_size, event_channel_indices=None):
+    curr_image = np.asarray(curr_image)
+    if curr_image.ndim == 2:
+        curr_image = curr_image[..., None]
+
+    if cam_name == 'event' and event_channel_indices is not None:
+        curr_image = curr_image[..., event_channel_indices]
+        if curr_image.shape[-1] != len(event_channel_indices):
+            raise ValueError(
+                f"Event channel selection failed for {cam_name}: got shape {curr_image.shape}"
+            )
+    else:
+        curr_image = ensure_hwc3(curr_image, cam_name)
+
+    if camera_names != ["rgb", "event"]:
+        curr_image = cv2.resize(curr_image, (image_size[1], image_size[0]), interpolation=cv2.INTER_AREA)
+
+    curr_image = maybe_resize_for_rgb_event(curr_image, cam_name, camera_names, target_size=image_size)
+    if curr_image.ndim == 2:
+        curr_image = curr_image[..., None]
+    return curr_image
 
 
 def _natural_episode_sort_key(dataset_path):
@@ -383,7 +428,7 @@ def _choose_balanced_episode_split(
 
 
 class EpisodicJointDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', img_aug=False):
+    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', photometric_aug=False, spatial_aug=False, image_size=None, event_channel_indices=None):
         super(EpisodicJointDataset).__init__()
         self.qpos_indices = qpos_indices
         self.action_indices = action_indices
@@ -392,10 +437,17 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         self.camera_names = camera_names
         self.chunk_size = chunk_size
         self.norm_stats = norm_stats
-        self.img_aug = img_aug
+        self.photometric_aug = photometric_aug
+        self.spatial_aug = spatial_aug
         self.is_sim = None
         self._printed_image_debug = False
-        _print_image_pipeline_info(self.camera_names)
+        self.image_size = canonical_image_size(image_size)
+        self.event_channel_indices = event_channel_indices
+        _print_image_pipeline_info(
+            self.camera_names,
+            target_size=self.image_size,
+            event_channel_indices=self.event_channel_indices,
+        )
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -425,27 +477,29 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                     right_is_event = _is_event_frame(cam_name, right_img)
                     left_img = transforms.functional.to_pil_image(left_img)
                     right_img = transforms.functional.to_pil_image(right_img)
-                    if self.img_aug:
+                    if self.spatial_aug:
                         angle = np.random.random() * 10 - 5
                         top_h = np.random.randint(0, 120)
                         top_w = np.random.randint(0, 160)
-                        if not left_is_event:
-                            left_img = color_transform(left_img)
+                    if self.photometric_aug and not left_is_event:
+                        left_img = color_transform(left_img)
+                    if self.spatial_aug:
                         left_img = rotate_n_crop_transform(left_img, [480, 640], angle, (top_h, top_w))
-                        if not right_is_event:
-                            right_img = color_transform(right_img)
+                    if self.photometric_aug and not right_is_event:
+                        right_img = color_transform(right_img)
+                    if self.spatial_aug:
                         right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
                     left_img = np.asarray(left_img)
                     right_img = np.asarray(right_img)
                     left_img = ensure_hwc3(left_img, f'{cam_name}_left')
                     right_img = ensure_hwc3(right_img, f'{cam_name}_right')
-                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names)
-                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names)
+                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names, target_size=self.image_size)
+                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names, target_size=self.image_size)
                     stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
                     if self.camera_names != ["rgb", "event"]:
                         stereo_img = cv2.resize(
                             stereo_img,
-                            (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]),
+                            (self.image_size[1], self.image_size[0]),
                             interpolation=cv2.INTER_AREA,
                         )
                     image_dict[cam_name] = ensure_hwc3(stereo_img, cam_name)
@@ -453,15 +507,18 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                     img = root[f'/observations/images/{cam_name}'][start_ts]
                     is_event = _is_event_frame(cam_name, img)
                     img = transforms.functional.to_pil_image(img)
-                    if self.img_aug:
-                        if not is_event:
-                            img = color_transform(img)
+                    if self.photometric_aug and not is_event:
+                        img = color_transform(img)
+                    if self.spatial_aug:
                         img = rotate_n_crop_transform(img)
                     img = np.asarray(img)
-                    img = ensure_hwc3(img, cam_name)
-                    if self.camera_names != ["rgb", "event"]:
-                        img = cv2.resize(img, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
-                    img = maybe_resize_for_rgb_event(img, cam_name, self.camera_names)
+                    img = _prepare_camera_image(
+                        img,
+                        cam_name,
+                        self.camera_names,
+                        self.image_size,
+                        event_channel_indices=self.event_channel_indices,
+                    )
                     image_dict[cam_name] = img
             # get all actions after and including start_ts
             action = root[self.action_key][start_ts:min(start_ts+self.chunk_size, episode_len)]
@@ -478,8 +535,9 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         # new axis for different cameras in exact camera_names order
         all_cam_images = []
         for cam_name in self.camera_names:
-            cam_image = ensure_hwc3(image_dict[cam_name], cam_name)
-            cam_image = maybe_resize_for_rgb_event(cam_image, cam_name, self.camera_names)
+            cam_image = np.asarray(image_dict[cam_name])
+            if cam_image.ndim == 2:
+                cam_image = cam_image[..., None]
             cam_image = np.transpose(cam_image, (2, 0, 1))
             all_cam_images.append(cam_image)
         image_data = torch.from_numpy(np.stack(all_cam_images, axis=0))
@@ -489,12 +547,16 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
 
         assert image_data.ndim == 4, image_data.shape
         assert image_data.shape[0] == len(self.camera_names), image_data.shape
-        assert image_data.shape[1] == 3, image_data.shape
+        if self.event_channel_indices is None:
+            assert image_data.shape[1] == 3, image_data.shape
+        else:
+            assert self.camera_names == ['event'], self.camera_names
+            assert image_data.shape[1] == len(self.event_channel_indices), image_data.shape
         if self.camera_names == ["rgb", "event"]:
-            assert image_data.shape == (2, 3, 320, 320), image_data.shape
-            if not self._printed_image_debug:
-                print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
-                self._printed_image_debug = True
+            assert image_data.shape == (2, 3, self.image_size[0], self.image_size[1]), image_data.shape
+        if not self._printed_image_debug:
+            print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
+            self._printed_image_debug = True
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0
@@ -548,7 +610,8 @@ def load_joint_data(
     batch_size_train,
     batch_size_val,
     model_dof=None,
-    img_aug=False,
+    photometric_aug=False,
+    spatial_aug=False,
     split_num_trials=500,
     split_seed=0,
     qpos_dim=None,
@@ -556,7 +619,14 @@ def load_joint_data(
     qpos_indices=None,
     action_indices=None,
     action_key='/action',
+    image_size=None,
+    event_channel_indices=None,
 ):
+    if event_channel_indices is not None and camera_names != ['event']:
+        raise NotImplementedError(
+            '--event_channel_selection is currently only implemented for --camera_names event'
+        )
+
     # Backward-compatible default: model_dof applies to both if explicit dims are not provided.
     if qpos_dim is None and model_dof is not None:
         qpos_dim = model_dof
@@ -617,6 +687,8 @@ def load_joint_data(
 
     print(f'Train episode count: {len(train_indices)}')
     print(f'Val episode count: {len(val_indices)}')
+    print(f'[INFO] Augmentation (train): photometric_aug={photometric_aug}, spatial_aug={spatial_aug}')
+    print('[INFO] Augmentation (val): photometric_aug=False, spatial_aug=False')
 
     # obtain normalization stats for qpos and action
     norm_stats = get_joint_norm_stats(
@@ -635,7 +707,10 @@ def load_joint_data(
         qpos_indices=joint_data_cfg['qpos_indices'],
         action_indices=joint_data_cfg['action_indices'],
         action_key=joint_data_cfg['action_key'],
-        img_aug=img_aug,
+        photometric_aug=photometric_aug,
+        spatial_aug=spatial_aug,
+        image_size=image_size,
+        event_channel_indices=event_channel_indices,
     )
     val_dataset = EpisodicJointDataset(
         [episode_paths[index] for index in val_indices],
@@ -645,7 +720,10 @@ def load_joint_data(
         qpos_indices=joint_data_cfg['qpos_indices'],
         action_indices=joint_data_cfg['action_indices'],
         action_key=joint_data_cfg['action_key'],
-        img_aug=img_aug,
+        photometric_aug=False,
+        spatial_aug=False,
+        image_size=image_size,
+        event_channel_indices=event_channel_indices,
     )
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
@@ -654,16 +732,23 @@ def load_joint_data(
 
 
 class EpisodicPoseDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, img_aug):
+    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, photometric_aug=False, spatial_aug=False, image_size=None, event_channel_indices=None):
         super(EpisodicPoseDataset).__init__()
         self.episode_paths = list(episode_paths)
         self.camera_names = camera_names
         self.chunk_size = chunk_size
         self.norm_stats = norm_stats
-        self.img_aug = img_aug
+        self.photometric_aug = photometric_aug
+        self.spatial_aug = spatial_aug
         self.is_sim = None
         self._printed_image_debug = False
-        _print_image_pipeline_info(self.camera_names)
+        self.image_size = canonical_image_size(image_size)
+        self.event_channel_indices = event_channel_indices
+        _print_image_pipeline_info(
+            self.camera_names,
+            target_size=self.image_size,
+            event_channel_indices=self.event_channel_indices,
+        )
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -691,27 +776,29 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                     right_is_event = _is_event_frame(cam_name, right_img)
                     left_img = transforms.functional.to_pil_image(left_img)
                     right_img = transforms.functional.to_pil_image(right_img)
-                    if self.img_aug:
+                    if self.spatial_aug:
                         angle = np.random.random() * 10 - 5
                         top_h = np.random.randint(0, 120)
                         top_w = np.random.randint(0, 160)
-                        if not left_is_event:
-                            left_img = color_transform(left_img)
+                    if self.photometric_aug and not left_is_event:
+                        left_img = color_transform(left_img)
+                    if self.spatial_aug:
                         left_img = rotate_n_crop_transform(left_img, [480, 640], angle, (top_h, top_w))
-                        if not right_is_event:
-                            right_img = color_transform(right_img)
+                    if self.photometric_aug and not right_is_event:
+                        right_img = color_transform(right_img)
+                    if self.spatial_aug:
                         right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
                     left_img = np.asarray(left_img)
                     right_img = np.asarray(right_img)
                     left_img = ensure_hwc3(left_img, f'{cam_name}_left')
                     right_img = ensure_hwc3(right_img, f'{cam_name}_right')
-                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names)
-                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names)
+                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names, target_size=self.image_size)
+                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names, target_size=self.image_size)
                     stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
                     if self.camera_names != ["rgb", "event"]:
                         stereo_img = cv2.resize(
                             stereo_img,
-                            (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]),
+                            (self.image_size[1], self.image_size[0]),
                             interpolation=cv2.INTER_AREA,
                         )
                     image_dict[cam_name] = ensure_hwc3(stereo_img, cam_name)
@@ -719,15 +806,18 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
                     img = root[f'/observations/images/{cam_name}'][start_ts]
                     is_event = _is_event_frame(cam_name, img)
                     img = transforms.functional.to_pil_image(img)
-                    if self.img_aug:
-                        if not is_event:
-                            img = color_transform(img)
+                    if self.photometric_aug and not is_event:
+                        img = color_transform(img)
+                    if self.spatial_aug:
                         img = rotate_n_crop_transform(img)
                     img = np.asarray(img)
-                    img = ensure_hwc3(img, cam_name)
-                    if self.camera_names != ["rgb", "event"]:
-                        img = cv2.resize(img, (DEFAULT_IMAGE_SIZE[1], DEFAULT_IMAGE_SIZE[0]), interpolation=cv2.INTER_AREA)
-                    img = maybe_resize_for_rgb_event(img, cam_name, self.camera_names)
+                    img = _prepare_camera_image(
+                        img,
+                        cam_name,
+                        self.camera_names,
+                        self.image_size,
+                        event_channel_indices=self.event_channel_indices,
+                    )
                     image_dict[cam_name] = img
             # get all actions after and including start_ts
             action = root['/ee_action_global'][start_ts:min(start_ts+self.chunk_size, episode_len)]
@@ -742,8 +832,9 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
         # new axis for different cameras in exact camera_names order
         all_cam_images = []
         for cam_name in self.camera_names:
-            cam_image = ensure_hwc3(image_dict[cam_name], cam_name)
-            cam_image = maybe_resize_for_rgb_event(cam_image, cam_name, self.camera_names)
+            cam_image = np.asarray(image_dict[cam_name])
+            if cam_image.ndim == 2:
+                cam_image = cam_image[..., None]
             cam_image = np.transpose(cam_image, (2, 0, 1))
             all_cam_images.append(cam_image)
         image_data = torch.from_numpy(np.stack(all_cam_images, axis=0))
@@ -753,12 +844,16 @@ class EpisodicPoseDataset(torch.utils.data.Dataset):
 
         assert image_data.ndim == 4, image_data.shape
         assert image_data.shape[0] == len(self.camera_names), image_data.shape
-        assert image_data.shape[1] == 3, image_data.shape
+        if self.event_channel_indices is None:
+            assert image_data.shape[1] == 3, image_data.shape
+        else:
+            assert self.camera_names == ['event'], self.camera_names
+            assert image_data.shape[1] == len(self.event_channel_indices), image_data.shape
         if self.camera_names == ["rgb", "event"]:
-            assert image_data.shape == (2, 3, 320, 320), image_data.shape
-            if not self._printed_image_debug:
-                print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
-                self._printed_image_debug = True
+            assert image_data.shape == (2, 3, self.image_size[0], self.image_size[1]), image_data.shape
+        if not self._printed_image_debug:
+            print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
+            self._printed_image_debug = True
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0
@@ -808,10 +903,18 @@ def load_pose_data(
     chunk_size,
     batch_size_train,
     batch_size_val,
-    img_aug=False,
+    photometric_aug=False,
+    spatial_aug=False,
     split_num_trials=100,
     split_seed=0,
+    image_size=None,
+    event_channel_indices=None,
 ):
+    if event_channel_indices is not None and camera_names != ['event']:
+        raise NotImplementedError(
+            '--event_channel_selection is currently only implemented for --camera_names event'
+        )
+
     episode_paths = collect_episode_paths(dataset_dirs)
     total_episode_count = len(episode_paths)
     if total_episode_count < 2:
@@ -845,13 +948,33 @@ def load_pose_data(
 
     print(f'Train episode count: {len(train_indices)}')
     print(f'Val episode count: {len(val_indices)}')
+    print(f'[INFO] Augmentation (train): photometric_aug={photometric_aug}, spatial_aug={spatial_aug}')
+    print('[INFO] Augmentation (val): photometric_aug=False, spatial_aug=False')
 
     # obtain normalization stats for qpos and action
     norm_stats = get_pose_norm_stats(episode_paths)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicPoseDataset([episode_paths[index] for index in train_indices], camera_names, chunk_size, norm_stats, img_aug)
-    val_dataset = EpisodicPoseDataset([episode_paths[index] for index in val_indices], camera_names, chunk_size, norm_stats, img_aug)
+    train_dataset = EpisodicPoseDataset(
+        [episode_paths[index] for index in train_indices],
+        camera_names,
+        chunk_size,
+        norm_stats,
+        photometric_aug=photometric_aug,
+        spatial_aug=spatial_aug,
+        image_size=image_size,
+        event_channel_indices=event_channel_indices,
+    )
+    val_dataset = EpisodicPoseDataset(
+        [episode_paths[index] for index in val_indices],
+        camera_names,
+        chunk_size,
+        norm_stats,
+        photometric_aug=False,
+        spatial_aug=False,
+        image_size=image_size,
+        event_channel_indices=event_channel_indices,
+    )
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 

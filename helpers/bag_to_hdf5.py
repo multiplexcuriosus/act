@@ -52,7 +52,7 @@ def bag_top_level_name(bag_path: str) -> str:
     """
     Derive a stable output directory name from the bag path.
     - If bag_path is a directory: use the directory name.
-    - If bag_path is a file (e.g. *.db3): use filename without extension.
+    - If bag_path is a file (e.g. *.mcap or *.db3): use filename without extension.
     """
     norm = os.path.normpath(bag_path)
     if os.path.isdir(norm):
@@ -124,10 +124,10 @@ def resolve_recording_dir(recording_dir: str) -> Tuple[str, Optional[str], str]:
     return os.path.abspath(bag_path), raw_events_h5_path, recording_name
 
 
-def open_reader(bag_path: str):
+def open_reader(bag_path: str, storage_id: str = "mcap"):
     storage_options = rosbag2_py.StorageOptions(
         uri=bag_path,
-        storage_id="sqlite3",
+        storage_id=storage_id,
     )
     converter_options = rosbag2_py.ConverterOptions(
         input_serialization_format="cdr",
@@ -466,9 +466,9 @@ def infer_initial_gripper_width(joint_names: List[str], joint_pos: np.ndarray) -
     )
 
 
-def extract_episode_windows(bag_path: str) -> List[EpisodeWindow]:
+def extract_episode_windows(bag_path: str, storage_id: str = "mcap") -> List[EpisodeWindow]:
     log("[INFO] Pass 1/2: scanning /episode/control for episode boundaries...")
-    reader = open_reader(bag_path)
+    reader = open_reader(bag_path, storage_id=storage_id)
     topic_type_map = get_topic_type_map(reader)
     msg_types = get_type_class_map(topic_type_map, only_topics={TOPIC_EPISODE})
 
@@ -606,6 +606,7 @@ def collect_single_episode_data(
     bag_path: str,
     ep: EpisodeWindow,
     require_event_topic: bool = True,
+    storage_id: str = "mcap",
 ) -> Dict[str, Any]:
     """
     Stream only one episode into memory.
@@ -615,7 +616,7 @@ def collect_single_episode_data(
     log(f"[INFO] Pass 2/2: collecting episode {ep.idx}")
     log(f"[INFO] time window: [{ep.start:.6f}, {ep.end:.6f}]  dur={ep.end - ep.start:.3f}s")
 
-    reader = open_reader(bag_path)
+    reader = open_reader(bag_path, storage_id=storage_id)
     topic_type_map = get_topic_type_map(reader)
 
     # We include only messages within this episode window.
@@ -1033,6 +1034,7 @@ def resolve_recording_collection_dir(collection_dir: str) -> List[Tuple[str, Opt
 
 def process_one_recording(
     bag_path: str,
+    storage_id: str,
     raw_events_h5: Optional[str],
     output_parent_dir: str,
     output_name: str,
@@ -1047,18 +1049,19 @@ def process_one_recording(
     out_dir = os.path.join(output_parent_dir, output_name)
     ensure_dir(out_dir)
     log(f"[INFO] Output directory: {out_dir}")
+    log(f"[INFO] rosbag2 storage_id: {storage_id}")
     log(f"[INFO] initial_delay_steps: {initial_delay_steps} ({initial_delay_steps / FPS:.3f}s)")
     log(f"[INFO] event_frame_windows_ms/time_shifts: {event_frame_windows_ms}")
 
     log("[INFO] Opening bag for metadata check...")
-    reader = open_reader(bag_path)
+    reader = open_reader(bag_path, storage_id=storage_id)
     topic_type_map = get_topic_type_map(reader)
     check_required_topics(
         topic_type_map,
         require_event_topic=(raw_events_h5 is None),
     )
 
-    windows = extract_episode_windows(bag_path)
+    windows = extract_episode_windows(bag_path, storage_id=storage_id)
     filtered_windows = []
     for ep in windows:
         duration = ep.end - ep.start
@@ -1112,6 +1115,7 @@ def process_one_recording(
                     bag_path,
                     ep,
                     require_event_topic=(raw_event_store is None),
+                    storage_id=storage_id,
                 )
                 arrays = sample_episode_to_arrays(
                     data,
@@ -1182,7 +1186,17 @@ def main():
         "--bag",
         type=str,
         default=None,
-        help="Path to rosbag2 bag directory OR sqlite file path. Required unless --recording_dir is provided.",
+        help=(
+            "Path to rosbag2 bag directory. Direct .mcap or .db3 file paths may also work "
+            "depending on rosbag2 storage backend. Required unless --recording_dir is provided."
+        ),
+    )
+    parser.add_argument(
+        "--storage_id",
+        type=str,
+        default="mcap",
+        choices=["mcap", "sqlite3"],
+        help="rosbag2 storage backend to use. Default: mcap. Use sqlite3 for legacy .db3 bags.",
     )
     parser.add_argument(
         "--out_dir",
@@ -1329,12 +1343,14 @@ def main():
         ]
 
     # --- process each recording ---
+    log(f"[INFO] rosbag2 storage_id: {args.storage_id}")
     all_lengths: Dict[str, List[int]] = {}
     for i, rec in enumerate(recordings):
         log("")
         log("=" * 80)
         log(f"[INFO] Processing recording {i + 1}/{len(recordings)}: {rec['output_name']}")
         log(f"[INFO] bag_path: {rec['bag_path']}")
+        log(f"[INFO] storage_id: {args.storage_id}")
         if rec["raw_events_h5"]:
             log(f"[INFO] raw_events_h5: {rec['raw_events_h5']}")
         else:
@@ -1344,6 +1360,7 @@ def main():
         try:
             lengths = process_one_recording(
                 bag_path=rec["bag_path"],
+                storage_id=args.storage_id,
                 raw_events_h5=rec["raw_events_h5"],
                 output_parent_dir=args.out_dir,
                 output_name=rec["output_name"],
