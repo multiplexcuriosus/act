@@ -18,7 +18,7 @@ import time
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils import load_joint_data, load_pose_data # data functions
+from utils import load_intercept_data, load_joint_data, load_pose_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, ACTTaskPolicy, CNNMLPPolicy
@@ -146,11 +146,12 @@ def main(args):
     lr_backbone = 1e-5
     backbone = 'resnet18'
     device = resolve_device()
+    is_intercept_task = ('intercept' in task_name.lower())
     use_bce_last_action_dim = (
         policy_class == 'ACT' and
         data_mode == 'joint' and
-        action_dim == 7 and
-        args['use_bce_last_action_dim']
+        args['use_bce_last_action_dim'] and
+        (action_dim == 7 or (is_intercept_task and action_dim == 2))
     )
     if policy_class.startswith('ACT'):
         enc_layers = 4
@@ -267,21 +268,36 @@ def main(args):
             event_channel_indices=event_channel_indices,
         )
     elif args['data_mode'] == 'joint':
-        train_dataloader, val_dataloader, stats, _ = load_joint_data(
-            dataset_source,
-            camera_names,
-            args['chunk_size'],
-            batch_size_train,
-            batch_size_val,
-            model_dof=None,
-            photometric_aug=photometric_aug,
-            spatial_aug=spatial_aug,
-            qpos_dim=state_dim,
-            action_dim=action_dim,
-            action_key='/action',
-            image_size=image_size,
-            event_channel_indices=event_channel_indices,
-        )
+        if is_intercept_task:
+            train_dataloader, val_dataloader, stats, _ = load_intercept_data(
+                dataset_source,
+                camera_names,
+                args['chunk_size'],
+                batch_size_train,
+                batch_size_val,
+                model_dof=None,
+                photometric_aug=photometric_aug,
+                spatial_aug=spatial_aug,
+                qpos_dim=state_dim,
+                image_size=image_size,
+                event_channel_indices=event_channel_indices,
+            )
+        else:
+            train_dataloader, val_dataloader, stats, _ = load_joint_data(
+                dataset_source,
+                camera_names,
+                args['chunk_size'],
+                batch_size_train,
+                batch_size_val,
+                model_dof=None,
+                photometric_aug=photometric_aug,
+                spatial_aug=spatial_aug,
+                qpos_dim=state_dim,
+                action_dim=action_dim,
+                action_key='/action',
+                image_size=image_size,
+                event_channel_indices=event_channel_indices,
+            )
         if use_bce_last_action_dim:
             # Keep binary gripper-state target (last action dim) in raw 0/1 space.
             stats['action_mean'][-1] = 0.0

@@ -603,6 +603,85 @@ def get_joint_norm_stats(episode_paths, qpos_indices=None, action_indices=None, 
     return stats
 
 
+def _validate_intercept_episode_schema(dataset_path, camera_names):
+    with h5py.File(dataset_path, 'r') as root:
+        if '/action_is_commanded' in root:
+            raise RuntimeError(
+                f"Old split intercept schema detected in {dataset_path}: found '/action_is_commanded'. "
+                "Regenerate episodes with the updated bag_to_il_intercept converter that writes canonical '/action' as (N,2)."
+            )
+        if '/action' not in root:
+            raise RuntimeError(f"Missing required dataset '/action' in {dataset_path}")
+        if '/observations/qpos' not in root:
+            raise RuntimeError(f"Missing required dataset '/observations/qpos' in {dataset_path}")
+
+        action = root['/action']
+        qpos = root['/observations/qpos']
+
+        if action.ndim != 2:
+            raise RuntimeError(
+                f"Invalid intercept action rank in {dataset_path}: expected 2D '/action', got shape {action.shape}"
+            )
+        if action.shape[1] != 2:
+            raise RuntimeError(
+                f"Invalid intercept action width in {dataset_path}: expected '/action' shape (N,2), got {action.shape}"
+            )
+        if action.shape[0] != qpos.shape[0]:
+            raise RuntimeError(
+                f"Length mismatch in {dataset_path}: '/action' has {action.shape[0]} rows but '/observations/qpos' has {qpos.shape[0]}"
+            )
+
+        expected_len = int(action.shape[0])
+        for cam_name in camera_names:
+            image_key = f'/observations/images/{cam_name}'
+            if image_key not in root:
+                raise RuntimeError(f"Missing required dataset '{image_key}' in {dataset_path}")
+            image_len = int(root[image_key].shape[0])
+            if image_len != expected_len:
+                raise RuntimeError(
+                    f"Length mismatch in {dataset_path}: '{image_key}' has {image_len} frames but '/action' has {expected_len} rows"
+                )
+
+
+def load_intercept_data(
+    dataset_dirs,
+    camera_names,
+    chunk_size,
+    batch_size_train,
+    batch_size_val,
+    model_dof=None,
+    photometric_aug=False,
+    spatial_aug=False,
+    split_num_trials=500,
+    split_seed=0,
+    qpos_dim=None,
+    image_size=None,
+    event_channel_indices=None,
+):
+    """Canonical intercept loader: read '/action' directly as dense (N,2)."""
+    episode_paths = collect_episode_paths(dataset_dirs)
+    for dataset_path in episode_paths:
+        _validate_intercept_episode_schema(dataset_path, camera_names)
+
+    return load_joint_data(
+        dataset_dirs=dataset_dirs,
+        camera_names=camera_names,
+        chunk_size=chunk_size,
+        batch_size_train=batch_size_train,
+        batch_size_val=batch_size_val,
+        model_dof=model_dof,
+        photometric_aug=photometric_aug,
+        spatial_aug=spatial_aug,
+        split_num_trials=split_num_trials,
+        split_seed=split_seed,
+        qpos_dim=qpos_dim,
+        action_dim=2,
+        action_key='/action',
+        image_size=image_size,
+        event_channel_indices=event_channel_indices,
+    )
+
+
 def load_joint_data(
     dataset_dirs,
     camera_names,

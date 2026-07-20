@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+from pathlib import Path
 import h5py
 import cv2
 import numpy as np
@@ -58,11 +59,36 @@ def get_screen_width(default_width=1920):
     return default_width
 
 
+def resolve_hdf5_path(path_str):
+    path = Path(path_str)
+
+    if path.is_file():
+        return path
+
+    if path.is_dir():
+        episode_files = sorted(path.glob("episode_*.hdf5"))
+        if not episode_files:
+            episode_files = sorted(path.glob("*.hdf5"))
+        if not episode_files:
+            raise FileNotFoundError(f"No .hdf5 files found in directory: {path}")
+
+        selected = episode_files[0]
+        print(f"[INFO] Input is a directory; using {selected}")
+        return selected
+
+    raise FileNotFoundError(f"HDF5 path does not exist: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("hdf5_path")
     parser.add_argument("--rgb-path", default="/observations/images/rgb")
     parser.add_argument("--event-path", default="/observations/images/event")
+    parser.add_argument(
+        "--rgb-only",
+        action="store_true",
+        help="Replay only RGB images and do not require an event dataset",
+    )
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--window", default="rgb_event_replay")
     parser.add_argument(
@@ -78,11 +104,21 @@ def main():
     )
     args = parser.parse_args()
 
-    with h5py.File(args.hdf5_path, "r") as f:
-        rgb = f[args.rgb_path]
-        event = f[args.event_path]
+    hdf5_path = resolve_hdf5_path(args.hdf5_path)
 
-        n = min(len(rgb), len(event))
+    with h5py.File(hdf5_path, "r") as f:
+        rgb = f[args.rgb_path]
+
+        event = None
+        if not args.rgb_only:
+            if args.event_path not in f:
+                raise KeyError(
+                    f"Dataset '{args.event_path}' not found in {hdf5_path}. "
+                    "Use --rgb-only to replay just the RGB images."
+                )
+            event = f[args.event_path]
+
+        n = len(rgb) if args.rgb_only else min(len(rgb), len(event))
         delay_ms = max(1, int(1000 / args.fps))
         n_view = max(1, min(args.n_frames, 10))
         screen_width = get_screen_width()
@@ -91,7 +127,10 @@ def main():
             print(f"[WARN] --n-frames clipped to {n_view} (allowed range: 1-10)")
 
         print(f"[INFO] RGB shape:   {rgb.shape}")
-        print(f"[INFO] Event shape: {event.shape}")
+        if event is not None:
+            print(f"[INFO] Event shape: {event.shape}")
+        else:
+            print("[INFO] Event shape: disabled (--rgb-only)")
         print(f"[INFO] Playing {n} frames on repeat")
         if args.n_frame_view:
             print(f"[INFO] n-frame view enabled: showing {n_view} frames side-by-side")
@@ -109,12 +148,10 @@ def main():
                 for k in range(n_view):
                     idx = (i + k) % n
 
-                    event_img = ensure_bgr(event[idx])
-
-                    #event_img = cv2.rotate(event_img, cv2.ROTATE_180)
+                    tile_img = ensure_bgr(rgb[idx] if args.rgb_only else event[idx])
 
                     cv2.putText(
-                        event_img,
+                        tile_img,
                         f"{idx}",
                         (20, 35),
                         cv2.FONT_HERSHEY_SIMPLEX,
@@ -122,8 +159,8 @@ def main():
                         (255, 255, 255),
                         2,
                     )
-                    event_img = cv2.copyMakeBorder(
-                        event_img,
+                    tile_img = cv2.copyMakeBorder(
+                        tile_img,
                         2,
                         2,
                         2,
@@ -131,7 +168,7 @@ def main():
                         cv2.BORDER_CONSTANT,
                         value=(0, 0, 0),
                     )
-                    tiles.append(event_img)
+                    tiles.append(tile_img)
 
                 frame = np.hstack(tiles)
                 end_idx = (i + n_view - 1) % n
@@ -155,19 +192,23 @@ def main():
                     )
             else:
                 rgb_img = ensure_bgr(rgb[i])
-                event_img = ensure_bgr(event[i])
 
-                if event_img.shape[:2] != rgb_img.shape[:2]:
-                    event_img = cv2.resize(
-                        event_img,
-                        (rgb_img.shape[1], rgb_img.shape[0]),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
+                if args.rgb_only:
+                    frame = rgb_img
+                else:
+                    event_img = ensure_bgr(event[i])
 
-                event_img = cv2.rotate(event_img, cv2.ROTATE_180)
+                    if event_img.shape[:2] != rgb_img.shape[:2]:
+                        event_img = cv2.resize(
+                            event_img,
+                            (rgb_img.shape[1], rgb_img.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
 
-                frame = np.hstack([event_img, rgb_img])
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
+                    event_img = cv2.rotate(event_img, cv2.ROTATE_180)
+
+                    frame = np.hstack([event_img, rgb_img])
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
 
                 cv2.putText(frame, f"frame {i}/{n-1}", (20, 35),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)

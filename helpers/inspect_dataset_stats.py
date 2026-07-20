@@ -1,6 +1,7 @@
-# Datset_stats.pkl
+import argparse
 import pickle
 import numpy as np
+
 parser = argparse.ArgumentParser()
 parser.add_argument("path", help="Path to dataset_stats.pkl")
 args = parser.parse_args()
