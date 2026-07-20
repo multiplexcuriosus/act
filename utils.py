@@ -43,6 +43,7 @@ DEFAULT_JOINT_DATA_CONFIG = {
     "qpos_indices": None,
     "action_indices": None,
     "action_key": "/action",
+    "command_flag_key": None,
 }
 
 
@@ -52,11 +53,13 @@ def _build_joint_data_config(
     qpos_indices=None,
     action_indices=None,
     action_key=None,
+    command_flag_key=None,
 ):
     cfg = dict(DEFAULT_JOINT_DATA_CONFIG)
     cfg["qpos_dim"] = qpos_dim
     cfg["action_dim"] = action_dim
     cfg["action_key"] = action_key if action_key is not None else cfg["action_key"]
+    cfg["command_flag_key"] = command_flag_key
 
     # qpos/action indexing is intentionally decoupled.
     if qpos_indices is not None:
@@ -70,6 +73,102 @@ def _build_joint_data_config(
         cfg["action_indices"] = list(range(action_dim))
 
     return cfg
+
+
+def _read_action_array(root, action_key='/action', command_flag_key=None):
+    if action_key not in root:
+        raise ValueError(f"Missing required dataset: {action_key}")
+
+    action = np.asarray(root[action_key][()], dtype=np.float32)
+    if action.ndim == 0:
+        raise ValueError(f"Action dataset {action_key} must have a time dimension, got shape {action.shape}")
+    action = action.reshape(action.shape[0], -1)
+
+    if command_flag_key is not None:
+        if command_flag_key not in root:
+            raise ValueError(f"Missing required dataset: {command_flag_key}")
+
+        flag = np.asarray(root[command_flag_key][()], dtype=np.float32)
+        if flag.ndim == 0:
+            raise ValueError(
+                f"Command-flag dataset {command_flag_key} must have a time dimension, got shape {flag.shape}"
+            )
+        flag = flag.reshape(flag.shape[0], -1)
+        if flag.shape[1] != 1:
+            raise ValueError(
+                f"Command-flag dataset {command_flag_key} must have width 1 after reshape, got shape {flag.shape}"
+            )
+        if flag.shape[0] != action.shape[0]:
+            raise ValueError(
+                f"Unequal action/flag lengths for {action_key} and {command_flag_key}: "
+                f"{action.shape[0]} != {flag.shape[0]}"
+            )
+
+        action = np.concatenate([action, flag], axis=1)
+
+    return action
+
+
+def _validate_joint_episode_structure(
+    root,
+    dataset_path,
+    camera_names,
+    qpos_dim=None,
+    action_dim=None,
+    action_key='/action',
+    command_flag_key=None,
+):
+    if '/observations/qpos' not in root:
+        raise ValueError(f"Missing required dataset: /observations/qpos in {dataset_path}")
+
+    qpos = np.asarray(root['/observations/qpos'][()], dtype=np.float32)
+    if qpos.ndim != 2:
+        raise ValueError(f"Expected /observations/qpos to have shape (T, Q) in {dataset_path}, got {qpos.shape}")
+
+    action = _read_action_array(root, action_key=action_key, command_flag_key=command_flag_key)
+    if action.ndim != 2:
+        raise ValueError(f"Expected dense action array to have shape (T, A) in {dataset_path}, got {action.shape}")
+
+    if command_flag_key is not None and action.shape[1] != 2:
+        raise ValueError(
+            f"Intercept actions must have width 2 after concatenation in {dataset_path}, got {action.shape[1]}"
+        )
+
+    if qpos.shape[0] != action.shape[0]:
+        raise ValueError(
+            f"Unequal numbers of qpos and dense actions in {dataset_path}: {qpos.shape[0]} != {action.shape[0]}"
+        )
+
+    for cam_name in camera_names:
+        if cam_name.endswith('stereo'):
+            image_keys = [
+                f'/observations/images/{cam_name[:-6]}left',
+                f'/observations/images/{cam_name[:-6]}right',
+            ]
+        else:
+            image_keys = [f'/observations/images/{cam_name}']
+
+        for image_key in image_keys:
+            if image_key not in root:
+                raise ValueError(f"Missing required dataset: {image_key} in {dataset_path}")
+            image_steps = root[image_key].shape[0]
+            if image_steps != action.shape[0]:
+                raise ValueError(
+                    f"Unequal numbers of images and dense actions in {dataset_path} for {image_key}: "
+                    f"{image_steps} != {action.shape[0]}"
+                )
+
+    if qpos_dim is not None and qpos.shape[1] != qpos_dim:
+        raise ValueError(
+            f"state_dim mismatch for {dataset_path}: expected {qpos_dim}, found qpos width {qpos.shape[1]}"
+        )
+
+    if action_dim is not None and action.shape[1] != action_dim:
+        raise ValueError(
+            f"action_dim mismatch for {dataset_path}: expected {action_dim}, found action width {action.shape[1]}"
+        )
+
+    return qpos, action
 
 def rotate_n_crop_transform(img, size=(360, 480), angle=None, top=None):
     if angle is None:
@@ -256,7 +355,7 @@ def collect_episode_paths(dataset_dirs):
 # split-selection helpers
 # =========================
 
-def _compute_episode_action_stats_joint(episode_paths, action_indices=None, action_key='/action'):
+def _compute_episode_action_stats_joint(episode_paths, action_indices=None, action_key='/action', command_flag_key=None):
     """
     Per-episode stats for joint/action datasets.
     Uses only action distribution, since this generic loader does not know dx/dy.
@@ -264,7 +363,7 @@ def _compute_episode_action_stats_joint(episode_paths, action_indices=None, acti
     episode_stats = []
     for episode_idx, dataset_path in enumerate(episode_paths):
         with h5py.File(dataset_path, 'r') as root:
-            action = root[action_key][()]
+            action = _read_action_array(root, action_key=action_key, command_flag_key=command_flag_key)
             if action_indices is not None:
                 action = action[:, action_indices]
         action = np.asarray(action, dtype=np.float32)
@@ -428,11 +527,12 @@ def _choose_balanced_episode_split(
 
 
 class EpisodicJointDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', photometric_aug=False, spatial_aug=False, image_size=None, event_channel_indices=None):
+    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', command_flag_key=None, photometric_aug=False, spatial_aug=False, image_size=None, event_channel_indices=None):
         super(EpisodicJointDataset).__init__()
         self.qpos_indices = qpos_indices
         self.action_indices = action_indices
         self.action_key = action_key
+        self.command_flag_key = command_flag_key
         self.episode_paths = list(episode_paths)
         self.camera_names = camera_names
         self.chunk_size = chunk_size
@@ -458,8 +558,13 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         
         dataset_path = self.episode_paths[index]
         with h5py.File(dataset_path, 'r') as root:
-            is_sim = root.attrs['sim']
-            episode_len = root[self.action_key].shape[0]
+            is_sim = bool(root.attrs.get('sim', False))
+            action_full = _read_action_array(
+                root,
+                action_key=self.action_key,
+                command_flag_key=self.command_flag_key,
+            )
+            episode_len = action_full.shape[0]
             if sample_full_episode:
                 start_ts = 0
             else:
@@ -521,7 +626,7 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                     )
                     image_dict[cam_name] = img
             # get all actions after and including start_ts
-            action = root[self.action_key][start_ts:min(start_ts+self.chunk_size, episode_len)]
+            action = action_full[start_ts:min(start_ts+self.chunk_size, episode_len)]
             if self.action_indices is not None:
                 action = action[:, self.action_indices]
             action_len, action_dof = action.shape
@@ -566,14 +671,14 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def get_joint_norm_stats(episode_paths, qpos_indices=None, action_indices=None, action_key='/action'):
+def get_joint_norm_stats(episode_paths, qpos_indices=None, action_indices=None, action_key='/action', command_flag_key=None):
     all_qpos_data = []
     all_action_data = []
 
     for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
             qpos = root['/observations/qpos'][()]
-            action = root[action_key][()]
+            action = _read_action_array(root, action_key=action_key, command_flag_key=command_flag_key)
 
         if qpos_indices is not None:
             qpos = qpos[:, qpos_indices]
@@ -591,6 +696,9 @@ def get_joint_norm_stats(episode_paths, qpos_indices=None, action_indices=None, 
 
     action_mean = all_action_data.mean(dim=0).numpy()
     action_std = all_action_data.std(dim=0).numpy().clip(1e-2, np.inf)
+    if command_flag_key is not None:
+        action_mean[-1] = 0.0
+        action_std[-1] = 1.0
 
     stats = {
         "action_mean": action_mean,
@@ -619,6 +727,7 @@ def load_joint_data(
     qpos_indices=None,
     action_indices=None,
     action_key='/action',
+    command_flag_key=None,
     image_size=None,
     event_channel_indices=None,
 ):
@@ -639,6 +748,7 @@ def load_joint_data(
         qpos_indices=qpos_indices,
         action_indices=action_indices,
         action_key=action_key,
+        command_flag_key=command_flag_key,
     )
 
     episode_paths = collect_episode_paths(dataset_dirs)
@@ -660,6 +770,18 @@ def load_joint_data(
         print(dataset_path)
     print('')
     _warn_if_episode_indices_noncontiguous(episode_paths)
+
+    for dataset_path in episode_paths:
+        with h5py.File(dataset_path, 'r') as root:
+            _validate_joint_episode_structure(
+                root,
+                dataset_path,
+                camera_names,
+                qpos_dim=joint_data_cfg['qpos_dim'],
+                action_dim=joint_data_cfg['action_dim'],
+                action_key=joint_data_cfg['action_key'],
+                command_flag_key=joint_data_cfg['command_flag_key'],
+            )
 
     # obtain train/val split using balanced random search
     # train_ratio = 0.8
@@ -696,6 +818,7 @@ def load_joint_data(
         qpos_indices=joint_data_cfg['qpos_indices'],
         action_indices=joint_data_cfg['action_indices'],
         action_key=joint_data_cfg['action_key'],
+        command_flag_key=joint_data_cfg['command_flag_key'],
     )
 
     # construct dataset and dataloader
@@ -707,6 +830,7 @@ def load_joint_data(
         qpos_indices=joint_data_cfg['qpos_indices'],
         action_indices=joint_data_cfg['action_indices'],
         action_key=joint_data_cfg['action_key'],
+        command_flag_key=joint_data_cfg['command_flag_key'],
         photometric_aug=photometric_aug,
         spatial_aug=spatial_aug,
         image_size=image_size,
@@ -720,6 +844,7 @@ def load_joint_data(
         qpos_indices=joint_data_cfg['qpos_indices'],
         action_indices=joint_data_cfg['action_indices'],
         action_key=joint_data_cfg['action_key'],
+        command_flag_key=joint_data_cfg['command_flag_key'],
         photometric_aug=False,
         spatial_aug=False,
         image_size=image_size,
@@ -729,6 +854,45 @@ def load_joint_data(
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
+
+
+def load_intercept_data(
+    dataset_dirs,
+    camera_names,
+    chunk_size,
+    batch_size_train,
+    batch_size_val,
+    photometric_aug=False,
+    spatial_aug=False,
+    split_num_trials=500,
+    split_seed=0,
+    qpos_dim=None,
+    action_dim=2,
+    qpos_indices=None,
+    action_indices=None,
+    image_size=None,
+    event_channel_indices=None,
+):
+    return load_joint_data(
+        dataset_dirs=dataset_dirs,
+        camera_names=camera_names,
+        chunk_size=chunk_size,
+        batch_size_train=batch_size_train,
+        batch_size_val=batch_size_val,
+        model_dof=None,
+        photometric_aug=photometric_aug,
+        spatial_aug=spatial_aug,
+        split_num_trials=split_num_trials,
+        split_seed=split_seed,
+        qpos_dim=qpos_dim,
+        action_dim=action_dim,
+        qpos_indices=qpos_indices,
+        action_indices=action_indices,
+        action_key='/action',
+        command_flag_key='/action_is_commanded',
+        image_size=image_size,
+        event_channel_indices=event_channel_indices,
+    )
 
 
 class EpisodicPoseDataset(torch.utils.data.Dataset):

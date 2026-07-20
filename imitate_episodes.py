@@ -18,7 +18,7 @@ import time
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils import load_joint_data, load_pose_data # data functions
+from utils import load_intercept_data, load_joint_data, load_pose_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, ACTTaskPolicy, CNNMLPPolicy
@@ -129,6 +129,14 @@ def main(args):
         if action_dim is None:
             raise ValueError("--action_dim is required when --data_mode joint")
         state_dim = args['state_dim']
+    elif data_mode == 'intercept':
+        if args['state_dim'] is None:
+            raise ValueError("--state_dim is required when --data_mode intercept")
+        state_dim = args['state_dim']
+        if action_dim is None:
+            action_dim = 2
+        elif action_dim != 2:
+            raise ValueError(f"--action_dim must be 2 when --data_mode intercept, got {action_dim}")
     elif data_mode == 'pose':
         # Keep existing ACTTask pose default while allowing override.
         state_dim = args['state_dim'] if args['state_dim'] is not None else 10
@@ -147,10 +155,12 @@ def main(args):
     backbone = 'resnet18'
     device = resolve_device()
     use_bce_last_action_dim = (
-        policy_class == 'ACT' and
-        data_mode == 'joint' and
-        action_dim == 7 and
+        policy_class.startswith('ACT') and
         args['use_bce_last_action_dim']
+        and (
+            (data_mode == 'joint' and action_dim == 7)
+            or data_mode == 'intercept'
+        )
     )
     if policy_class.startswith('ACT'):
         enc_layers = 4
@@ -291,6 +301,20 @@ def main(args):
             val_dataloader.dataset.norm_stats['action_mean'][-1] = 0.0
             val_dataloader.dataset.norm_stats['action_std'][-1] = 1.0
             print('[INFO] Using BCE on last action dim; forcing action_mean[-1]=0 and action_std[-1]=1')
+    elif args['data_mode'] == 'intercept':
+        train_dataloader, val_dataloader, stats, _ = load_intercept_data(
+            dataset_source,
+            camera_names,
+            args['chunk_size'],
+            batch_size_train,
+            batch_size_val,
+            photometric_aug=photometric_aug,
+            spatial_aug=spatial_aug,
+            qpos_dim=state_dim,
+            action_dim=action_dim,
+            image_size=image_size,
+            event_channel_indices=event_channel_indices,
+        )
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
 
@@ -1016,9 +1040,9 @@ if __name__ == '__main__':
         default=None,
         help='For event camera only: select one event channel to train on. Example: --event_channel_selection 3'
     )
-    parser.add_argument('--data_mode', choices=['joint', 'pose'], required=True, help='dataset mode')
-    parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (required for joint mode; optional override for pose mode)')
-    parser.add_argument('--action_dim', action='store', type=int, required=False, default=None, help='action dimension (required for joint mode; optional override for pose mode)')
+    parser.add_argument('--data_mode', choices=['joint', 'intercept', 'pose'], required=True, help='dataset mode')
+    parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (required for joint/intercept mode; optional override for pose mode)')
+    parser.add_argument('--action_dim', action='store', type=int, required=False, default=None, help='action dimension (required for joint mode; intercept mode uses 2; optional override for pose mode)')
     parser.add_argument('--photometric_aug', action='store_true', help='enable photometric augmentation (ColorJitter on non-event images only)')
     parser.add_argument('--spatial_aug', action='store_true', help='enable spatial augmentation (rotate/crop transform)')
     parser.add_argument('--img_aug', action='store_true', help='[DEPRECATED] enable both --photometric_aug and --spatial_aug')
