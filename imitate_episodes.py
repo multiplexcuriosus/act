@@ -1,4 +1,5 @@
 import argparse
+from collections import deque
 import cv2
 import datetime
 import json
@@ -65,6 +66,66 @@ def validate_camera_names(camera_names):
         "Allowed: ['rgb'], ['event'], or ['rgb', 'event']."
     )
 
+
+def validate_rgb_history_settings(camera_names, data_mode, rgb_history_frames, event_channel_selection):
+    rgb_history_frames = int(rgb_history_frames)
+    if rgb_history_frames == 1:
+        return rgb_history_frames
+    if camera_names != ['rgb']:
+        raise ValueError(
+            f"rgb_history_frames={rgb_history_frames} currently supports only --camera_names rgb, got {camera_names}"
+        )
+    if event_channel_selection is not None:
+        raise ValueError('rgb_history_frames > 1 does not support --event_channel_selection.')
+    if data_mode not in ('joint', 'intercept'):
+        raise ValueError(
+            f"rgb_history_frames={rgb_history_frames} is only supported for joint/intercept mode, got data_mode={data_mode}"
+        )
+    return rgb_history_frames
+
+
+def _infer_legacy_image_channels(stats, fallback_camera_names=None, fallback_event_channel_selection=None):
+    if 'image_channels' in stats:
+        return int(stats['image_channels'])
+    if stats.get('event_channel_selection', fallback_event_channel_selection) is not None:
+        return 1
+    saved_rgb_history_frames = int(stats.get('rgb_history_frames', 1))
+    saved_camera_names = stats.get('camera_names', fallback_camera_names)
+    if saved_rgb_history_frames > 1 and saved_camera_names == ['rgb']:
+        return 3 * saved_rgb_history_frames
+    return 3
+
+
+def _validate_eval_image_config(config, stats):
+    policy_config = config['policy_config']
+    configured_rgb_history_frames = int(policy_config.get('rgb_history_frames', config.get('rgb_history_frames', 1)))
+    configured_image_channels = int(
+        policy_config.get(
+            'image_channels',
+            config.get('image_channels', 3 * configured_rgb_history_frames),
+        )
+    )
+
+    saved_rgb_history_frames = int(stats.get('rgb_history_frames', 1))
+    saved_image_channels = _infer_legacy_image_channels(
+        stats,
+        fallback_camera_names=config.get('camera_names'),
+        fallback_event_channel_selection=config.get('event_channel_selection'),
+    )
+
+    if configured_rgb_history_frames != saved_rgb_history_frames or configured_image_channels != saved_image_channels:
+        raise ValueError(
+            'Configured image stack does not match dataset_stats.pkl: '
+            f'configured rgb_history_frames={configured_rgb_history_frames}, '
+            f'configured image_channels={configured_image_channels}, '
+            f'saved rgb_history_frames={saved_rgb_history_frames}, '
+            f'saved image_channels={saved_image_channels}. '
+            'Use matching settings or retrain; do not reuse 3-channel checkpoints with 6/9-channel temporal RGB models.'
+        )
+
+    policy_config['rgb_history_frames'] = configured_rgb_history_frames
+    policy_config['image_channels'] = configured_image_channels
+
 def main(args):
     set_seed(args['seed'])
     # command line parameters
@@ -87,6 +148,13 @@ def main(args):
             raise ValueError("Either --dataset_dir or --dataset_dirs must be provided.")
     camera_names = args['camera_names']
     camera_names = validate_camera_names(camera_names)
+    data_mode = args['data_mode']
+    rgb_history_frames = validate_rgb_history_settings(
+        camera_names,
+        data_mode,
+        args['rgb_history_frames'],
+        args['event_channel_selection'],
+    )
     event_channel_selection = args['event_channel_selection']
     if event_channel_selection is not None:
         if camera_names != ['event']:
@@ -95,10 +163,12 @@ def main(args):
             )
         event_channel_indices = [event_channel_selection - 1]
         image_channels = 1
+    elif camera_names == ['rgb']:
+        event_channel_indices = None
+        image_channels = 3 * rgb_history_frames
     else:
         event_channel_indices = None
         image_channels = 3
-    data_mode = args['data_mode']
     img_aug = args['img_aug']
     photometric_aug = args['photometric_aug']
     spatial_aug = args['spatial_aug']
@@ -184,6 +254,7 @@ def main(args):
                          'image_size': image_size,
                          'event_channel_selection': event_channel_selection,
                          'event_channel_indices': event_channel_indices,
+                         'rgb_history_frames': rgb_history_frames,
                          'image_channels': image_channels,
                          }
     elif policy_class == 'CNNMLP':
@@ -192,6 +263,7 @@ def main(args):
                          'device': device.type, 'image_size': image_size,
                          'event_channel_selection': event_channel_selection,
                          'event_channel_indices': event_channel_indices,
+                         'rgb_history_frames': rgb_history_frames,
                          'image_channels': image_channels}
     else:
         raise NotImplementedError
@@ -225,6 +297,7 @@ def main(args):
         'image_size': image_size,
         'event_channel_selection': event_channel_selection,
         'event_channel_indices': event_channel_indices,
+        'rgb_history_frames': rgb_history_frames,
         'image_channels': image_channels,
         'profile_memory': args['profile_memory'],
         'memory_profile_num_epochs': args['memory_profile_num_epochs'],
@@ -291,6 +364,7 @@ def main(args):
             action_key='/action',
             image_size=image_size,
             event_channel_indices=event_channel_indices,
+            rgb_history_frames=rgb_history_frames,
         )
         if use_bce_last_action_dim:
             # Keep binary gripper-state target (last action dim) in raw 0/1 space.
@@ -314,6 +388,7 @@ def main(args):
             action_dim=action_dim,
             image_size=image_size,
             event_channel_indices=event_channel_indices,
+            rgb_history_frames=rgb_history_frames,
         )
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
@@ -324,7 +399,10 @@ def main(args):
     stats['image_size'] = image_size
     stats['event_channel_selection'] = event_channel_selection
     stats['event_channel_indices'] = event_channel_indices
+    stats['rgb_history_frames'] = rgb_history_frames
+    stats['rgb_frame_order'] = 'oldest_to_newest'
     stats['image_channels'] = image_channels
+    stats['camera_names'] = camera_names
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
@@ -466,7 +544,45 @@ def summarize_memory_samples(samples, phase):
     }
 
 
-def get_image(ts, camera_names, device, image_size=320, event_channel_indices=None):
+def get_image(ts, camera_names, device, image_size=320, event_channel_indices=None, rgb_history_frames=1, rgb_history_buffer=None, padding_notice_state=None):
+    rgb_history_frames = int(rgb_history_frames)
+    if rgb_history_frames > 1:
+        if camera_names != ['rgb']:
+            raise ValueError(
+                f"rgb_history_frames={rgb_history_frames} currently supports only camera_names=['rgb'], got {camera_names}"
+            )
+        if event_channel_indices is not None:
+            raise ValueError('rgb_history_frames > 1 does not support event_channel_selection in eval.')
+        if rgb_history_buffer is None:
+            raise ValueError('rgb_history_buffer is required when rgb_history_frames > 1.')
+
+        curr_image = np.asarray(ts.observation['images']['rgb'])
+        if curr_image.ndim == 2:
+            curr_image = curr_image[..., None]
+        if curr_image.ndim != 3 or curr_image.shape[-1] != 3:
+            raise ValueError(f"Temporal RGB eval expects HWC3 rgb images, got shape {curr_image.shape}")
+
+        rgb_history_buffer.append(curr_image)
+        temporal_frames = list(rgb_history_buffer)
+        if len(temporal_frames) < rgb_history_frames:
+            pad_count = rgb_history_frames - len(temporal_frames)
+            temporal_frames = [temporal_frames[0]] * pad_count + temporal_frames
+            if padding_notice_state is not None and not padding_notice_state.get('printed', False):
+                print(
+                    f"[WARN] Eval RGB history deque is shorter than rgb_history_frames={rgb_history_frames}; "
+                    'left-padding with the earliest available frame for initial rollout steps.'
+                )
+                padding_notice_state['printed'] = True
+
+        processed_frames = []
+        for frame in temporal_frames:
+            resized_frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
+            processed_frames.append(rearrange(resized_frame, 'h w c -> c h w'))
+
+        curr_image = np.concatenate(processed_frames, axis=0)
+        curr_image = np.expand_dims(curr_image, axis=0)
+        return torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
+
     curr_images = []
     expected_channels = None
     for cam_name in camera_names:
@@ -509,7 +625,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
     temporal_agg = config['temporal_agg']
     onscreen_cam = 'angle'
 
-    # load policy and stats
+    # load stats before policy to catch image-stack mismatches clearly.
+    stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
+    with open(stats_path, 'rb') as f:
+        stats = pickle.load(f)
+    _validate_eval_image_config(config, stats)
+
+    # load policy and checkpoint
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
     loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location=device))
@@ -517,12 +639,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
     policy.to(device)
     policy.eval()
     print(f'Loaded: {ckpt_path}')
-    stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
-    with open(stats_path, 'rb') as f:
-        stats = pickle.load(f)
 
     eval_image_size = int(stats.get('image_size', config.get('image_size', 320)))
     event_channel_indices = stats.get('event_channel_indices', config.get('event_channel_indices', None))
+    rgb_history_frames = int(stats.get('rgb_history_frames', policy_config.get('rgb_history_frames', 1)))
     if event_channel_indices is not None and camera_names != ['event']:
         raise NotImplementedError(
             '--event_channel_selection is currently only implemented for --camera_names event'
@@ -556,6 +676,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
     _printed_eval_shape = False
     for rollout_id in range(num_rollouts):
         rollout_id += 0
+        rgb_history_buffer = deque(maxlen=rgb_history_frames) if rgb_history_frames > 1 else None
+        rgb_padding_notice_state = {'printed': False}
         ### set task
         if 'sim_transfer_cube' in task_name:
             BOX_POSE[0] = sample_box_pose() # used in sim reset
@@ -603,6 +725,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     device,
                     image_size=eval_image_size,
                     event_channel_indices=event_channel_indices,
+                    rgb_history_frames=rgb_history_frames,
+                    rgb_history_buffer=rgb_history_buffer,
+                    padding_notice_state=rgb_padding_notice_state,
                 )
 
                 if not _printed_eval_shape:
@@ -611,6 +736,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         assert curr_image.ndim == 5, curr_image.shape
                         assert curr_image.shape[1] == 1, curr_image.shape
                         assert curr_image.shape[2] == 1, curr_image.shape
+                    elif rgb_history_frames > 1:
+                        assert curr_image.shape == (1, 1, 3 * rgb_history_frames, eval_image_size, eval_image_size), curr_image.shape
                     _printed_eval_shape = True
 
                 ### query policy
@@ -746,6 +873,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             'spatial_aug': config.get('spatial_aug'),
             'event_channel_selection': policy_config.get('event_channel_selection'),
             'event_channel_indices': policy_config.get('event_channel_indices'),
+            'rgb_history_frames': policy_config.get('rgb_history_frames', 1),
             'image_channels': policy_config.get('image_channels'),
         },
         'model': count_parameters(policy),
@@ -788,11 +916,15 @@ def train_bc(train_dataloader, val_dataloader, config):
         for batch_idx, data in enumerate(train_dataloader):
             if not printed_train_image_shape:
                 image_data = data[0]
+                print(f"[DEBUG] train image_data.shape={tuple(image_data.shape)}")
                 if policy_config.get('event_channel_indices') is not None:
-                    print(f"[DEBUG] train image_data.shape={tuple(image_data.shape)}")
                     assert image_data.ndim == 5, image_data.shape
                     assert image_data.shape[1] == 1, image_data.shape
                     assert image_data.shape[2] == 1, image_data.shape
+                elif int(policy_config.get('rgb_history_frames', 1)) > 1:
+                    expected_channels = 3 * int(policy_config['rgb_history_frames'])
+                    assert image_data.shape[1] == 1, image_data.shape
+                    assert image_data.shape[2] == expected_channels, image_data.shape
                 printed_train_image_shape = True
 
             if should_profile_epoch:
@@ -1039,6 +1171,13 @@ if __name__ == '__main__':
         choices=[1, 2, 3],
         default=None,
         help='For event camera only: select one event channel to train on. Example: --event_channel_selection 3'
+    )
+    parser.add_argument(
+        '--rgb_history_frames',
+        type=int,
+        choices=[1, 2, 3],
+        default=1,
+        help='Number of consecutive RGB frames fused along channels; values >1 currently support RGB-only joint/intercept mode.'
     )
     parser.add_argument('--data_mode', choices=['joint', 'intercept', 'pose'], required=True, help='dataset mode')
     parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (required for joint/intercept mode; optional override for pose mode)')

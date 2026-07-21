@@ -37,7 +37,15 @@ def adapt_resnet_input_channels(resnet, in_channels):
         if old_conv.weight.shape[1] == 3 and in_channels == 1:
             # Initialize 1-channel conv from pretrained RGB conv weights.
             new_conv.weight.copy_(old_conv.weight.mean(dim=1, keepdim=True))
+        elif old_conv.weight.shape[1] == 3 and in_channels in (6, 9):
+            repeats = in_channels // 3
+            repeated_weight = old_conv.weight.repeat(1, repeats, 1, 1)
+            new_conv.weight.copy_(repeated_weight / repeats)
         else:
+            print(
+                f"[INFO] Falling back to Kaiming init for ResNet conv1 channel adaptation: "
+                f"{old_conv.in_channels} -> {in_channels}"
+            )
             torch.nn.init.kaiming_normal_(
                 new_conv.weight,
                 mode='fan_out',

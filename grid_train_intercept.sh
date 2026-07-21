@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DATASETS=(
-/home/dyros/Data/jg_data/hdf5/recording_20260716_161544_intercept_pipeline_test
+"/home/dyros/Data/jg_data/hdf5/recording_20260716_161544_intercept_rgb_normal_light"
 )
 
 # Must equal /observations/qpos.shape[1].
@@ -55,6 +55,7 @@ for IMAGE_SIZE in 320; do
             --ckpt_dir "$CKPT_DIR"
             --dataset_dirs "${DATASETS[@]}"
             --camera_names "${CAM_NAMES[@]}"
+            --rgb_history_frames 2
 
             --data_mode intercept
             --state_dim "$STATE_DIM"
@@ -64,7 +65,7 @@ for IMAGE_SIZE in 320; do
             --batch_size "$BS"
             --num_epochs 5000
             --lr "$LR"
-            --chunk_size 30
+            --chunk_size 1
             --hidden_dim 512
             --dim_feedforward 3200
             --kl_weight "$KL"

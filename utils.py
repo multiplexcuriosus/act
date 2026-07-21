@@ -289,6 +289,54 @@ def _prepare_camera_image(curr_image, cam_name, camera_names, image_size, event_
     return curr_image
 
 
+def _sample_shared_color_jitter_params():
+    return {
+        'brightness': np.random.uniform(0.5, 1.5),
+        'contrast': np.random.uniform(0.8, 1.2),
+        'saturation': np.random.uniform(0.8, 1.2),
+        'hue': np.random.uniform(-0.1, 0.1),
+    }
+
+
+def _apply_shared_color_jitter(img, jitter_params):
+    img = transforms.functional.adjust_brightness(img, jitter_params['brightness'])
+    img = transforms.functional.adjust_contrast(img, jitter_params['contrast'])
+    img = transforms.functional.adjust_saturation(img, jitter_params['saturation'])
+    img = transforms.functional.adjust_hue(img, jitter_params['hue'])
+    return img
+
+
+def _sample_spatial_aug_params():
+    angle = np.random.random() * 10 - 5
+    top_h = np.random.randint(0, 120)
+    top_w = np.random.randint(0, 160)
+    return angle, (top_h, top_w)
+
+
+def _prepare_rgb_history_frames(frames, camera_names, image_size, photometric_aug=False, spatial_aug=False):
+    jitter_params = _sample_shared_color_jitter_params() if photometric_aug else None
+    spatial_params = _sample_spatial_aug_params() if spatial_aug else None
+
+    processed_frames = []
+    for frame in frames:
+        pil_img = transforms.functional.to_pil_image(frame)
+        if jitter_params is not None:
+            pil_img = _apply_shared_color_jitter(pil_img, jitter_params)
+        if spatial_params is not None:
+            angle, top = spatial_params
+            pil_img = rotate_n_crop_transform(pil_img, [480, 640], angle, top)
+        processed_frame = _prepare_camera_image(
+            np.asarray(pil_img),
+            'rgb',
+            camera_names,
+            image_size,
+            event_channel_indices=None,
+        )
+        processed_frames.append(processed_frame)
+
+    return processed_frames
+
+
 def _natural_episode_sort_key(dataset_path):
     basename = os.path.basename(dataset_path)
     match = re.match(r'^episode_(\d+)\.hdf5$', basename)
@@ -527,7 +575,7 @@ def _choose_balanced_episode_split(
 
 
 class EpisodicJointDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', command_flag_key=None, photometric_aug=False, spatial_aug=False, image_size=None, event_channel_indices=None):
+    def __init__(self, episode_paths, camera_names, chunk_size, norm_stats, qpos_indices=None, action_indices=None, action_key='/action', command_flag_key=None, photometric_aug=False, spatial_aug=False, image_size=None, event_channel_indices=None, rgb_history_frames=1):
         super(EpisodicJointDataset).__init__()
         self.qpos_indices = qpos_indices
         self.action_indices = action_indices
@@ -541,8 +589,21 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         self.spatial_aug = spatial_aug
         self.is_sim = None
         self._printed_image_debug = False
+        self._printed_temporal_debug = False
         self.image_size = canonical_image_size(image_size)
         self.event_channel_indices = event_channel_indices
+        self.rgb_history_frames = int(rgb_history_frames)
+        if self.rgb_history_frames not in (1, 2, 3):
+            raise ValueError(f"rgb_history_frames must be one of 1, 2, or 3, got {self.rgb_history_frames}")
+        if self.rgb_history_frames > 1:
+            if self.camera_names != ['rgb']:
+                raise ValueError(
+                    f"rgb_history_frames={self.rgb_history_frames} currently requires camera_names=['rgb'], got {self.camera_names}"
+                )
+            if self.event_channel_indices is not None:
+                raise ValueError(
+                    'rgb_history_frames > 1 does not support event_channel_selection or event_channel_indices.'
+                )
         _print_image_pipeline_info(
             self.camera_names,
             target_size=self.image_size,
@@ -555,7 +616,7 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         sample_full_episode = False # hardcode
-        
+
         dataset_path = self.episode_paths[index]
         with h5py.File(dataset_path, 'r') as root:
             is_sim = bool(root.attrs.get('sim', False))
@@ -565,66 +626,90 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
                 command_flag_key=self.command_flag_key,
             )
             episode_len = action_full.shape[0]
-            if sample_full_episode:
-                start_ts = 0
+            temporal_indices = None
+            if self.rgb_history_frames > 1:
+                if episode_len < self.rgb_history_frames:
+                    raise ValueError(
+                        f"RGB temporal history requires at least {self.rgb_history_frames} frames in {dataset_path}, found episode length {episode_len}"
+                    )
+                history_start = self.rgb_history_frames - 1
+                if sample_full_episode:
+                    start_ts = history_start
+                else:
+                    start_ts = np.random.randint(history_start, episode_len)
+                temporal_indices = list(range(start_ts - self.rgb_history_frames + 1, start_ts + 1))
             else:
-                start_ts = np.random.choice(episode_len)
+                if sample_full_episode:
+                    start_ts = 0
+                else:
+                    start_ts = np.random.choice(episode_len)
             # get observation at start_ts only
             qpos = root['/observations/qpos'][start_ts]
             if self.qpos_indices is not None:
                 qpos = qpos[self.qpos_indices]
             image_dict = dict()
-            for cam_name in self.camera_names:
-                if cam_name.endswith('stereo'):
-                    left_img = root[f'/observations/images/{cam_name[:-6]}left'][start_ts]
-                    right_img = root[f'/observations/images/{cam_name[:-6]}right'][start_ts]
-                    left_is_event = _is_event_frame(cam_name, left_img)
-                    right_is_event = _is_event_frame(cam_name, right_img)
-                    left_img = transforms.functional.to_pil_image(left_img)
-                    right_img = transforms.functional.to_pil_image(right_img)
-                    if self.spatial_aug:
-                        angle = np.random.random() * 10 - 5
-                        top_h = np.random.randint(0, 120)
-                        top_w = np.random.randint(0, 160)
-                    if self.photometric_aug and not left_is_event:
-                        left_img = color_transform(left_img)
-                    if self.spatial_aug:
-                        left_img = rotate_n_crop_transform(left_img, [480, 640], angle, (top_h, top_w))
-                    if self.photometric_aug and not right_is_event:
-                        right_img = color_transform(right_img)
-                    if self.spatial_aug:
-                        right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
-                    left_img = np.asarray(left_img)
-                    right_img = np.asarray(right_img)
-                    left_img = ensure_hwc3(left_img, f'{cam_name}_left')
-                    right_img = ensure_hwc3(right_img, f'{cam_name}_right')
-                    left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names, target_size=self.image_size)
-                    right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names, target_size=self.image_size)
-                    stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
-                    if self.camera_names != ["rgb", "event"]:
-                        stereo_img = cv2.resize(
-                            stereo_img,
-                            (self.image_size[1], self.image_size[0]),
-                            interpolation=cv2.INTER_AREA,
+            if self.rgb_history_frames > 1:
+                frames = [root['/observations/images/rgb'][ts] for ts in temporal_indices]
+                processed_frames = _prepare_rgb_history_frames(
+                    frames,
+                    self.camera_names,
+                    self.image_size,
+                    photometric_aug=self.photometric_aug,
+                    spatial_aug=self.spatial_aug,
+                )
+                image_dict['rgb'] = np.concatenate(processed_frames, axis=-1)
+            else:
+                for cam_name in self.camera_names:
+                    if cam_name.endswith('stereo'):
+                        left_img = root[f'/observations/images/{cam_name[:-6]}left'][start_ts]
+                        right_img = root[f'/observations/images/{cam_name[:-6]}right'][start_ts]
+                        left_is_event = _is_event_frame(cam_name, left_img)
+                        right_is_event = _is_event_frame(cam_name, right_img)
+                        left_img = transforms.functional.to_pil_image(left_img)
+                        right_img = transforms.functional.to_pil_image(right_img)
+                        if self.spatial_aug:
+                            angle = np.random.random() * 10 - 5
+                            top_h = np.random.randint(0, 120)
+                            top_w = np.random.randint(0, 160)
+                        if self.photometric_aug and not left_is_event:
+                            left_img = color_transform(left_img)
+                        if self.spatial_aug:
+                            left_img = rotate_n_crop_transform(left_img, [480, 640], angle, (top_h, top_w))
+                        if self.photometric_aug and not right_is_event:
+                            right_img = color_transform(right_img)
+                        if self.spatial_aug:
+                            right_img = rotate_n_crop_transform(right_img, [480, 640], angle, (top_h, top_w))
+                        left_img = np.asarray(left_img)
+                        right_img = np.asarray(right_img)
+                        left_img = ensure_hwc3(left_img, f'{cam_name}_left')
+                        right_img = ensure_hwc3(right_img, f'{cam_name}_right')
+                        left_img = maybe_resize_for_rgb_event(left_img, f'{cam_name}_left', self.camera_names, target_size=self.image_size)
+                        right_img = maybe_resize_for_rgb_event(right_img, f'{cam_name}_right', self.camera_names, target_size=self.image_size)
+                        stereo_img = np.concatenate([left_img, right_img], axis=1) # width dimension
+                        if self.camera_names != ["rgb", "event"]:
+                            stereo_img = cv2.resize(
+                                stereo_img,
+                                (self.image_size[1], self.image_size[0]),
+                                interpolation=cv2.INTER_AREA,
+                            )
+                        image_dict[cam_name] = ensure_hwc3(stereo_img, cam_name)
+                    else:
+                        img = root[f'/observations/images/{cam_name}'][start_ts]
+                        is_event = _is_event_frame(cam_name, img)
+                        img = transforms.functional.to_pil_image(img)
+                        if self.photometric_aug and not is_event:
+                            img = color_transform(img)
+                        if self.spatial_aug:
+                            img = rotate_n_crop_transform(img)
+                        img = np.asarray(img)
+                        img = _prepare_camera_image(
+                            img,
+                            cam_name,
+                            self.camera_names,
+                            self.image_size,
+                            event_channel_indices=self.event_channel_indices,
                         )
-                    image_dict[cam_name] = ensure_hwc3(stereo_img, cam_name)
-                else:
-                    img = root[f'/observations/images/{cam_name}'][start_ts]
-                    is_event = _is_event_frame(cam_name, img)
-                    img = transforms.functional.to_pil_image(img)
-                    if self.photometric_aug and not is_event:
-                        img = color_transform(img)
-                    if self.spatial_aug:
-                        img = rotate_n_crop_transform(img)
-                    img = np.asarray(img)
-                    img = _prepare_camera_image(
-                        img,
-                        cam_name,
-                        self.camera_names,
-                        self.image_size,
-                        event_channel_indices=self.event_channel_indices,
-                    )
-                    image_dict[cam_name] = img
+                        image_dict[cam_name] = img
             # get all actions after and including start_ts
             action = action_full[start_ts:min(start_ts+self.chunk_size, episode_len)]
             if self.action_indices is not None:
@@ -652,14 +737,25 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
 
         assert image_data.ndim == 4, image_data.shape
         assert image_data.shape[0] == len(self.camera_names), image_data.shape
-        if self.event_channel_indices is None:
+        if self.rgb_history_frames > 1:
+            assert self.camera_names == ['rgb'], self.camera_names
+            assert image_data.shape == (1, 3 * self.rgb_history_frames, self.image_size[0], self.image_size[1]), image_data.shape
+        elif self.event_channel_indices is None:
             assert image_data.shape[1] == 3, image_data.shape
         else:
             assert self.camera_names == ['event'], self.camera_names
             assert image_data.shape[1] == len(self.event_channel_indices), image_data.shape
         if self.camera_names == ["rgb", "event"]:
             assert image_data.shape == (2, 3, self.image_size[0], self.image_size[1]), image_data.shape
-        if not self._printed_image_debug:
+        if self.rgb_history_frames > 1:
+            if not self._printed_temporal_debug:
+                print(
+                    f"[DEBUG] rgb_history_frames={self.rgb_history_frames}, "
+                    f"temporal_indices={temporal_indices}, final_image_data.shape={tuple(image_data.shape)}"
+                )
+                self._printed_temporal_debug = True
+                self._printed_image_debug = True
+        elif not self._printed_image_debug:
             print(f"[DEBUG] camera_names={self.camera_names}, image_data.shape={tuple(image_data.shape)}")
             self._printed_image_debug = True
 
@@ -730,11 +826,20 @@ def load_joint_data(
     command_flag_key=None,
     image_size=None,
     event_channel_indices=None,
+    rgb_history_frames=1,
 ):
+    rgb_history_frames = int(rgb_history_frames)
     if event_channel_indices is not None and camera_names != ['event']:
         raise NotImplementedError(
             '--event_channel_selection is currently only implemented for --camera_names event'
         )
+    if rgb_history_frames > 1:
+        if camera_names != ['rgb']:
+            raise ValueError(
+                f"rgb_history_frames={rgb_history_frames} currently requires camera_names=['rgb'], got {camera_names}"
+            )
+        if event_channel_indices is not None:
+            raise ValueError('rgb_history_frames > 1 does not support event_channel_selection.')
 
     # Backward-compatible default: model_dof applies to both if explicit dims are not provided.
     if qpos_dim is None and model_dof is not None:
@@ -773,7 +878,7 @@ def load_joint_data(
 
     for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
-            _validate_joint_episode_structure(
+            _, action = _validate_joint_episode_structure(
                 root,
                 dataset_path,
                 camera_names,
@@ -782,6 +887,10 @@ def load_joint_data(
                 action_key=joint_data_cfg['action_key'],
                 command_flag_key=joint_data_cfg['command_flag_key'],
             )
+            if rgb_history_frames > 1 and action.shape[0] < rgb_history_frames:
+                raise ValueError(
+                    f"RGB temporal history requires at least {rgb_history_frames} frames in {dataset_path}, found episode length {action.shape[0]}"
+                )
 
     # obtain train/val split using balanced random search
     # train_ratio = 0.8
@@ -835,6 +944,7 @@ def load_joint_data(
         spatial_aug=spatial_aug,
         image_size=image_size,
         event_channel_indices=event_channel_indices,
+        rgb_history_frames=rgb_history_frames,
     )
     val_dataset = EpisodicJointDataset(
         [episode_paths[index] for index in val_indices],
@@ -849,6 +959,7 @@ def load_joint_data(
         spatial_aug=False,
         image_size=image_size,
         event_channel_indices=event_channel_indices,
+        rgb_history_frames=rgb_history_frames,
     )
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
@@ -872,6 +983,7 @@ def load_intercept_data(
     action_indices=None,
     image_size=None,
     event_channel_indices=None,
+    rgb_history_frames=1,
 ):
     return load_joint_data(
         dataset_dirs=dataset_dirs,
@@ -892,6 +1004,7 @@ def load_intercept_data(
         command_flag_key='/action_is_commanded',
         image_size=image_size,
         event_channel_indices=event_channel_indices,
+        rgb_history_frames=rgb_history_frames,
     )
 
 
