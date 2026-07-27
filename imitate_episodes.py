@@ -22,6 +22,7 @@ from constants import PUPPET_GRIPPER_JOINT_OPEN
 from utils import load_intercept_data, load_joint_data, load_pose_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
+from utils import INTERCEPT_HISTORY_OFFSETS_DEFAULT
 from policy import ACTPolicy, ACTTaskPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
@@ -68,7 +69,13 @@ def validate_camera_names(camera_names):
 
 
 def validate_rgb_history_settings(camera_names, data_mode, rgb_history_frames, event_channel_selection):
+    if rgb_history_frames is None:
+        rgb_history_frames = 3 if data_mode == 'intercept' else 1
     rgb_history_frames = int(rgb_history_frames)
+    if data_mode == 'intercept' and rgb_history_frames != 3:
+        raise ValueError(
+            f"Interception mode requires rgb_history_frames=3 with offsets {list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)}, got {rgb_history_frames}"
+        )
     if rgb_history_frames == 1:
         return rgb_history_frames
     if camera_names != ['rgb']:
@@ -125,6 +132,45 @@ def _validate_eval_image_config(config, stats):
 
     policy_config['rgb_history_frames'] = configured_rgb_history_frames
     policy_config['image_channels'] = configured_image_channels
+
+
+def _validate_intercept_checkpoint_metadata(config, stats):
+    required_equal = {
+        'data_mode': 'intercept',
+        'raw_qpos_dim': 7,
+        'state_dim': 21,
+        'action_dim': 1,
+        'rgb_history_frames': 3,
+        'rgb_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
+        'qpos_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
+        'rgb_frame_order': 'oldest_to_newest',
+        'qpos_flatten_order': 'oldest_to_newest',
+        'image_channels': 9,
+        'action_type': 'measured_tcp_s_delta',
+        'action_representation': 'future_delta_relative_to_anchor',
+        'action_anchor_offset': 0,
+        'action_first_target_offset': 1,
+        'action_positive_direction': 'robot_base_positive_x',
+        'action_units': 'm',
+    }
+
+    for key, expected in required_equal.items():
+        if key not in stats:
+            raise ValueError(f"Missing interception checkpoint metadata in dataset_stats.pkl: {key}")
+        if stats[key] != expected:
+            raise ValueError(
+                f"Interception checkpoint metadata mismatch for {key}: expected {expected!r}, found {stats[key]!r}"
+            )
+
+    policy_config = config['policy_config']
+    if int(policy_config.get('state_dim')) != 21:
+        raise ValueError(f"Interception policy state_dim must be 21, got {policy_config.get('state_dim')}")
+    if int(policy_config.get('action_dim')) != 1:
+        raise ValueError(f"Interception policy action_dim must be 1, got {policy_config.get('action_dim')}")
+    if int(policy_config.get('image_channels')) != 9:
+        raise ValueError(f"Interception policy image_channels must be 9, got {policy_config.get('image_channels')}")
+    if bool(policy_config.get('use_bce_last_action_dim')):
+        raise ValueError('Interception checkpoints must not enable use_bce_last_action_dim.')
 
 def main(args):
     set_seed(args['seed'])
@@ -201,12 +247,27 @@ def main(args):
         state_dim = args['state_dim']
     elif data_mode == 'intercept':
         if args['state_dim'] is None:
-            raise ValueError("--state_dim is required when --data_mode intercept")
-        state_dim = args['state_dim']
+            state_dim = 21
+        else:
+            state_dim = int(args['state_dim'])
+            if state_dim != 21:
+                raise ValueError(f"--state_dim must be 21 when --data_mode intercept, got {state_dim}")
+
         if action_dim is None:
-            action_dim = 2
-        elif action_dim != 2:
-            raise ValueError(f"--action_dim must be 2 when --data_mode intercept, got {action_dim}")
+            action_dim = 1
+        else:
+            action_dim = int(action_dim)
+            if action_dim != 1:
+                raise ValueError(f"--action_dim must be 1 when --data_mode intercept, got {action_dim}")
+
+        if rgb_history_frames != 3:
+            raise ValueError(
+                f"--rgb_history_frames must resolve to 3 when --data_mode intercept, got {rgb_history_frames}"
+            )
+        if camera_names != ['rgb']:
+            raise ValueError(f"--data_mode intercept requires --camera_names rgb, got {camera_names}")
+        if image_channels != 9:
+            raise ValueError(f"Interception image_channels must be 9, got {image_channels}")
     elif data_mode == 'pose':
         # Keep existing ACTTask pose default while allowing override.
         state_dim = args['state_dim'] if args['state_dim'] is not None else 10
@@ -229,9 +290,10 @@ def main(args):
         args['use_bce_last_action_dim']
         and (
             (data_mode == 'joint' and action_dim == 7)
-            or data_mode == 'intercept'
         )
     )
+    if data_mode == 'intercept' and args['use_bce_last_action_dim']:
+        print('[INFO] Interception mode ignores BCE-on-last-dim; use_bce_last_action_dim is forced to False.')
     if policy_class.startswith('ACT'):
         enc_layers = 4
         dec_layers = 7
@@ -255,6 +317,7 @@ def main(args):
                          'event_channel_selection': event_channel_selection,
                          'event_channel_indices': event_channel_indices,
                          'rgb_history_frames': rgb_history_frames,
+                         'rgb_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
                          'image_channels': image_channels,
                          }
     elif policy_class == 'CNNMLP':
@@ -264,6 +327,7 @@ def main(args):
                          'event_channel_selection': event_channel_selection,
                          'event_channel_indices': event_channel_indices,
                          'rgb_history_frames': rgb_history_frames,
+                         'rgb_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
                          'image_channels': image_channels}
     else:
         raise NotImplementedError
@@ -298,6 +362,7 @@ def main(args):
         'event_channel_selection': event_channel_selection,
         'event_channel_indices': event_channel_indices,
         'rgb_history_frames': rgb_history_frames,
+        'rgb_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
         'image_channels': image_channels,
         'profile_memory': args['profile_memory'],
         'memory_profile_num_epochs': args['memory_profile_num_epochs'],
@@ -376,6 +441,8 @@ def main(args):
             val_dataloader.dataset.norm_stats['action_std'][-1] = 1.0
             print('[INFO] Using BCE on last action dim; forcing action_mean[-1]=0 and action_std[-1]=1')
     elif args['data_mode'] == 'intercept':
+        if event_channel_indices is not None:
+            raise ValueError('--event_channel_selection is not supported for interception mode.')
         train_dataloader, val_dataloader, stats, _ = load_intercept_data(
             dataset_source,
             camera_names,
@@ -384,14 +451,41 @@ def main(args):
             batch_size_val,
             photometric_aug=photometric_aug,
             spatial_aug=spatial_aug,
-            qpos_dim=state_dim,
+            raw_qpos_dim=7,
+            state_dim=state_dim,
             action_dim=action_dim,
             image_size=image_size,
-            event_channel_indices=event_channel_indices,
             rgb_history_frames=rgb_history_frames,
+            history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
         )
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
+
+    # Interception shape and config checks before the first optimization step.
+    if args['data_mode'] == 'intercept':
+        batch_image, batch_qpos, batch_action, batch_is_pad = next(iter(train_dataloader))
+        print(
+            '[DEBUG] intercept batch shapes: '
+            f'image={tuple(batch_image.shape)}, '
+            f'qpos={tuple(batch_qpos.shape)}, '
+            f'action={tuple(batch_action.shape)}, '
+            f'is_pad={tuple(batch_is_pad.shape)}'
+        )
+        assert batch_image.ndim == 5 and batch_image.shape[1] == 1 and batch_image.shape[2] == 9, batch_image.shape
+        assert batch_qpos.ndim == 2 and batch_qpos.shape[1] == 21, batch_qpos.shape
+        assert batch_action.ndim == 3 and batch_action.shape[2] == 1, batch_action.shape
+        assert batch_action.shape[1] == args['chunk_size'], batch_action.shape
+        assert batch_is_pad.shape == (batch_action.shape[0], args['chunk_size']), batch_is_pad.shape
+
+        assert tuple(stats['action_mean'].shape) == (1,), stats['action_mean'].shape
+        assert tuple(stats['action_std'].shape) == (1,), stats['action_std'].shape
+        assert tuple(stats['qpos_mean'].shape) == (21,), stats['qpos_mean'].shape
+        assert tuple(stats['qpos_std'].shape) == (21,), stats['qpos_std'].shape
+
+        assert int(policy_config['state_dim']) == 21, policy_config['state_dim']
+        assert int(policy_config['action_dim']) == 1, policy_config['action_dim']
+        assert int(policy_config['image_channels']) == 9, policy_config['image_channels']
+        assert bool(policy_config['use_bce_last_action_dim']) is False, policy_config['use_bce_last_action_dim']
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -400,9 +494,23 @@ def main(args):
     stats['event_channel_selection'] = event_channel_selection
     stats['event_channel_indices'] = event_channel_indices
     stats['rgb_history_frames'] = rgb_history_frames
+    stats['rgb_history_offsets'] = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)
     stats['rgb_frame_order'] = 'oldest_to_newest'
     stats['image_channels'] = image_channels
     stats['camera_names'] = camera_names
+    stats['data_mode'] = data_mode
+    if data_mode == 'intercept':
+        stats['raw_qpos_dim'] = 7
+        stats['state_dim'] = 21
+        stats['action_dim'] = 1
+        stats['qpos_history_offsets'] = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)
+        stats['qpos_flatten_order'] = 'oldest_to_newest'
+        stats['action_type'] = 'measured_tcp_s_delta'
+        stats['action_representation'] = 'future_delta_relative_to_anchor'
+        stats['action_anchor_offset'] = 0
+        stats['action_first_target_offset'] = 1
+        stats['action_positive_direction'] = 'robot_base_positive_x'
+        stats['action_units'] = 'm'
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
@@ -630,6 +738,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
     with open(stats_path, 'rb') as f:
         stats = pickle.load(f)
     _validate_eval_image_config(config, stats)
+    if stats.get('data_mode') == 'intercept' or config.get('data_mode') == 'intercept':
+        _validate_intercept_checkpoint_metadata(config, stats)
+        raise RuntimeError(
+            'Interception evaluation is disabled in this legacy eval_bc path. '
+            'This evaluator cannot reconstruct absolute cont_tracker targets from measured current_tcp_s, '
+            'and predicted delta-s tokens must not be interpreted as joint targets.'
+        )
 
     # load policy and checkpoint
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
@@ -1176,12 +1291,12 @@ if __name__ == '__main__':
         '--rgb_history_frames',
         type=int,
         choices=[1, 2, 3],
-        default=1,
-        help='Number of consecutive RGB frames fused along channels; values >1 currently support RGB-only joint/intercept mode.'
+        default=None,
+        help='RGB history frame count. Defaults by mode: intercept=3 using spaced offsets [-6,-3,0], other modes=1.'
     )
     parser.add_argument('--data_mode', choices=['joint', 'intercept', 'pose'], required=True, help='dataset mode')
-    parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (required for joint/intercept mode; optional override for pose mode)')
-    parser.add_argument('--action_dim', action='store', type=int, required=False, default=None, help='action dimension (required for joint mode; intercept mode uses 2; optional override for pose mode)')
+    parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (joint requires explicit value; intercept defaults to 21 and rejects other values; optional override for pose mode)')
+    parser.add_argument('--action_dim', action='store', type=int, required=False, default=None, help='action dimension (joint requires explicit value; intercept defaults to 1 and rejects other values; optional override for pose mode)')
     parser.add_argument('--photometric_aug', action='store_true', help='enable photometric augmentation (ColorJitter on non-event images only)')
     parser.add_argument('--spatial_aug', action='store_true', help='enable spatial augmentation (rotate/crop transform)')
     parser.add_argument('--img_aug', action='store_true', help='[DEPRECATED] enable both --photometric_aug and --spatial_aug')

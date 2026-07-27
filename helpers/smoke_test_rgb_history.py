@@ -18,7 +18,14 @@ from detr.models.backbone import adapt_resnet_input_channels
 import detr.models.backbone as backbone_mod
 from imitate_episodes import get_image
 from policy import ACTPolicy, _build_image_normalizer
-from utils import EpisodicJointDataset, _prepare_rgb_history_frames
+from utils import (
+    EpisodicJointDataset,
+    EpisodicInterceptDataset,
+    _prepare_rgb_history_frames,
+    compute_history_indices,
+    get_intercept_norm_stats,
+    load_intercept_data,
+)
 
 
 def make_episode(path, episode_len=3, image_shape=(12, 12, 3)):
@@ -39,6 +46,42 @@ def make_episode(path, episode_len=3, image_shape=(12, 12, 3)):
         root.create_dataset('/action', data=action)
         root.create_dataset('/observations/images/rgb', data=rgb)
         root.create_dataset('/observations/images/event', data=event)
+
+
+def make_intercept_episode(
+    path,
+    qpos,
+    action_abs_s,
+    rgb_values,
+    action_positive_direction='robot_base_positive_x',
+    include_metadata=True,
+):
+    qpos = np.asarray(qpos, dtype=np.float32)
+    action_abs_s = np.asarray(action_abs_s, dtype=np.float32).reshape(-1, 1)
+    rgb_values = np.asarray(rgb_values, dtype=np.uint8)
+
+    if qpos.ndim != 2 or qpos.shape[1] != 7:
+        raise ValueError(f'qpos must be (T,7), got {qpos.shape}')
+    if action_abs_s.ndim != 2 or action_abs_s.shape[1] != 1:
+        raise ValueError(f'action must be (T,1), got {action_abs_s.shape}')
+    if rgb_values.ndim != 1 or rgb_values.shape[0] != qpos.shape[0]:
+        raise ValueError('rgb_values must be length T')
+
+    T = qpos.shape[0]
+    rgb = np.stack([
+        np.full((12, 12, 3), fill_value=int(value), dtype=np.uint8)
+        for value in rgb_values
+    ], axis=0)
+
+    with h5py.File(path, 'w') as root:
+        root.attrs['sim'] = False
+        if include_metadata:
+            root.attrs['action_type'] = 'measured_tcp_s_absolute'
+            root.attrs['action_representation'] = 'absolute'
+            root.attrs['action_positive_direction'] = action_positive_direction
+        root.create_dataset('/observations/qpos', data=qpos)
+        root.create_dataset('/action', data=action_abs_s)
+        root.create_dataset('/observations/images/rgb', data=rgb)
 
 
 def make_norm_stats(qpos_dim=2, action_dim=2):
@@ -240,10 +283,271 @@ def test_invalid_combinations(tmpdir):
         raise AssertionError('Temporal RGB should reject event-only mode.')
 
 
+def test_intercept_history_indices():
+    assert_equal(compute_history_indices(0, (-6, -3, 0)), [0, 0, 0], 't=0 history indices')
+    assert_equal(compute_history_indices(3, (-6, -3, 0)), [0, 0, 3], 't=3 history indices')
+    assert_equal(compute_history_indices(8, (-6, -3, 0)), [2, 5, 8], 't>=6 history indices')
+
+
+def test_intercept_qpos_rgb_alignment_and_order(tmpdir):
+    T = 10
+    qpos = np.stack([
+        np.array([step + d * 100 for d in range(7)], dtype=np.float32)
+        for step in range(T)
+    ], axis=0)
+    action_abs = np.linspace(0.0, -0.09, T, dtype=np.float32)
+    rgb_values = np.arange(T, dtype=np.uint8) * 10
+
+    episode_path = os.path.join(tmpdir, 'episode_intercept_align.hdf5')
+    make_intercept_episode(episode_path, qpos, action_abs, rgb_values)
+
+    stats = {
+        'action_mean': np.zeros(1, dtype=np.float32),
+        'action_std': np.ones(1, dtype=np.float32),
+        'qpos_mean': np.zeros(21, dtype=np.float32),
+        'qpos_std': np.ones(21, dtype=np.float32),
+    }
+    dataset = EpisodicInterceptDataset(
+        [episode_path],
+        ['rgb'],
+        chunk_size=4,
+        norm_stats=stats,
+        history_offsets=(-6, -3, 0),
+        photometric_aug=False,
+        spatial_aug=False,
+        image_size=16,
+    )
+
+    original_randint = np.random.randint
+    try:
+        np.random.randint = lambda low, high=None, size=None, dtype=None: 8
+        image_data, qpos_data, action_data, is_pad = dataset[0]
+    finally:
+        np.random.randint = original_randint
+
+    assert_tensor_shape(image_data, (1, 9, 16, 16), 'Interception RGB history shape')
+    assert_tensor_shape(qpos_data, (21,), 'Interception qpos flattened history shape')
+    assert_tensor_shape(action_data, (4, 1), 'Interception action chunk shape')
+    assert_tensor_shape(is_pad, (4,), 'Interception is_pad shape')
+
+    expected_indices = [2, 5, 8]
+    expected_qpos_flat = qpos[expected_indices].reshape(-1)
+    assert_allclose(qpos_data.numpy(), expected_qpos_flat, 'Qpos history uses same indices and oldest-to-newest flattening')
+
+    grouped_means = image_data[0].reshape(3, 3, 16, 16).mean(dim=(1, 2, 3)).numpy() * 255.0
+    expected_rgb = rgb_values[expected_indices].astype(np.float32)
+    assert_allclose(grouped_means, expected_rgb, 'RGB history uses same indices and oldest-to-newest stacking', atol=0.5)
+
+
+def test_intercept_first_token_and_delta_chunk(tmpdir):
+    # Known absolute sequence: [0.0, -0.01, -0.03, -0.03, -0.07]
+    # At anchor t=1, expected deltas are:
+    # k=0: s(2)-s(1) = -0.02
+    # k=1: s(3)-s(1) = -0.02
+    # k=2: s(4)-s(1) = -0.06
+    qpos = np.stack([
+        np.array([step + d for d in range(7)], dtype=np.float32)
+        for step in range(5)
+    ], axis=0)
+    action_abs = np.array([0.0, -0.01, -0.03, -0.03, -0.07], dtype=np.float32)
+    rgb_values = np.array([10, 20, 30, 40, 50], dtype=np.uint8)
+    episode_path = os.path.join(tmpdir, 'episode_intercept_delta.hdf5')
+    make_intercept_episode(episode_path, qpos, action_abs, rgb_values)
+
+    stats = {
+        'action_mean': np.zeros(1, dtype=np.float32),
+        'action_std': np.ones(1, dtype=np.float32),
+        'qpos_mean': np.zeros(21, dtype=np.float32),
+        'qpos_std': np.ones(21, dtype=np.float32),
+    }
+    dataset = EpisodicInterceptDataset(
+        [episode_path],
+        ['rgb'],
+        chunk_size=4,
+        norm_stats=stats,
+        history_offsets=(-6, -3, 0),
+        photometric_aug=False,
+        spatial_aug=False,
+        image_size=16,
+    )
+
+    original_randint = np.random.randint
+    try:
+        np.random.randint = lambda low, high=None, size=None, dtype=None: 1
+        _, _, action_data, is_pad = dataset[0]
+    finally:
+        np.random.randint = original_randint
+
+    expected = np.array([[-0.02], [-0.02], [-0.06], [0.0]], dtype=np.float32)
+    assert_allclose(action_data.numpy(), expected, 'Delta chunk must use s(t+k+1)-s(t) and zero-pad tail')
+    assert_allclose(is_pad.numpy().astype(np.float32), np.array([0, 0, 0, 1], dtype=np.float32), 'Tail padding mask')
+    if abs(float(action_data[0, 0].item())) < 1e-8:
+        raise AssertionError('First action token must not be zero by construction.')
+
+
+def test_intercept_stats_exclude_padding_and_not_absolute(tmpdir):
+    qpos_a = np.stack([
+        np.array([step + d for d in range(7)], dtype=np.float32)
+        for step in range(4)
+    ], axis=0)
+    qpos_b = np.stack([
+        np.array([10 + step + d for d in range(7)], dtype=np.float32)
+        for step in range(5)
+    ], axis=0)
+
+    # Include both stationary and moving segments.
+    action_a = np.array([0.0, 0.0, -0.01, -0.03], dtype=np.float32)
+    action_b = np.array([-0.10, -0.10, -0.10, -0.12, -0.12], dtype=np.float32)
+
+    ep_a = os.path.join(tmpdir, 'episode_0.hdf5')
+    ep_b = os.path.join(tmpdir, 'episode_1.hdf5')
+    make_intercept_episode(ep_a, qpos_a, action_a, np.array([5, 6, 7, 8], dtype=np.uint8))
+    make_intercept_episode(ep_b, qpos_b, action_b, np.array([9, 10, 11, 12, 13], dtype=np.uint8))
+
+    stats = get_intercept_norm_stats([ep_a, ep_b], chunk_size=3, history_offsets=(-6, -3, 0))
+    assert_tensor_shape(torch.from_numpy(stats['action_mean']), (1,), 'Interception action_mean shape')
+    assert_tensor_shape(torch.from_numpy(stats['action_std']), (1,), 'Interception action_std shape')
+    assert_tensor_shape(torch.from_numpy(stats['qpos_mean']), (21,), 'Interception qpos_mean shape')
+    assert_tensor_shape(torch.from_numpy(stats['qpos_std']), (21,), 'Interception qpos_std shape')
+
+    abs_mean = np.mean(np.concatenate([action_a, action_b]))
+    if np.isclose(float(stats['action_mean'][0]), float(abs_mean)):
+        raise AssertionError('Interception action stats must be computed from derived deltas, not absolute s values.')
+
+
+def test_intercept_no_action_is_commanded_requirement_and_metadata_rejection(tmpdir):
+    dataset_dir = os.path.join(tmpdir, 'dataset')
+    os.makedirs(dataset_dir, exist_ok=True)
+
+    qpos = np.stack([
+        np.array([step + d for d in range(7)], dtype=np.float32)
+        for step in range(6)
+    ], axis=0)
+    action_abs = np.array([0.0, -0.01, -0.02, -0.02, -0.03, -0.04], dtype=np.float32)
+    rgb_values = np.array([1, 2, 3, 4, 5, 6], dtype=np.uint8)
+
+    make_intercept_episode(
+        os.path.join(dataset_dir, 'episode_0.hdf5'),
+        qpos,
+        action_abs,
+        rgb_values,
+        action_positive_direction='robot_base_positive_x',
+        include_metadata=True,
+    )
+    make_intercept_episode(
+        os.path.join(dataset_dir, 'episode_1.hdf5'),
+        qpos,
+        action_abs,
+        rgb_values,
+        action_positive_direction='robot_base_positive_x',
+        include_metadata=True,
+    )
+
+    # Should load without /action_is_commanded.
+    train_loader, val_loader, stats, _ = load_intercept_data(
+        dataset_dirs=dataset_dir,
+        camera_names=['rgb'],
+        chunk_size=3,
+        batch_size_train=1,
+        batch_size_val=1,
+        raw_qpos_dim=7,
+        state_dim=21,
+        action_dim=1,
+        rgb_history_frames=3,
+        history_offsets=(-6, -3, 0),
+        image_size=16,
+    )
+    _ = next(iter(train_loader))
+    _ = next(iter(val_loader))
+    if stats['action_dim'] != 1:
+        raise AssertionError('Interception action_dim in stats must be 1.')
+
+    # Reject table-frame-positive metadata.
+    bad_dir = os.path.join(tmpdir, 'dataset_bad')
+    os.makedirs(bad_dir, exist_ok=True)
+    make_intercept_episode(
+        os.path.join(bad_dir, 'episode_0.hdf5'),
+        qpos,
+        action_abs,
+        rgb_values,
+        action_positive_direction='table_frame_positive_s',
+        include_metadata=True,
+    )
+    make_intercept_episode(
+        os.path.join(bad_dir, 'episode_1.hdf5'),
+        qpos,
+        action_abs,
+        rgb_values,
+        action_positive_direction='table_frame_positive_s',
+        include_metadata=True,
+    )
+    try:
+        load_intercept_data(
+            dataset_dirs=bad_dir,
+            camera_names=['rgb'],
+            chunk_size=3,
+            batch_size_train=1,
+            batch_size_val=1,
+            raw_qpos_dim=7,
+            state_dim=21,
+            action_dim=1,
+            rgb_history_frames=3,
+            history_offsets=(-6, -3, 0),
+            image_size=16,
+        )
+    except ValueError as exc:
+        if 'table_frame_positive_s' not in str(exc):
+            raise AssertionError(f'Expected table-frame metadata rejection, got: {exc}')
+    else:
+        raise AssertionError('Expected table-frame-positive metadata to be rejected.')
+
+    # Reject missing converter metadata.
+    missing_meta_dir = os.path.join(tmpdir, 'dataset_missing_meta')
+    os.makedirs(missing_meta_dir, exist_ok=True)
+    make_intercept_episode(
+        os.path.join(missing_meta_dir, 'episode_0.hdf5'),
+        qpos,
+        action_abs,
+        rgb_values,
+        include_metadata=False,
+    )
+    make_intercept_episode(
+        os.path.join(missing_meta_dir, 'episode_1.hdf5'),
+        qpos,
+        action_abs,
+        rgb_values,
+        include_metadata=False,
+    )
+    try:
+        load_intercept_data(
+            dataset_dirs=missing_meta_dir,
+            camera_names=['rgb'],
+            chunk_size=3,
+            batch_size_train=1,
+            batch_size_val=1,
+            raw_qpos_dim=7,
+            state_dim=21,
+            action_dim=1,
+            rgb_history_frames=3,
+            history_offsets=(-6, -3, 0),
+            image_size=16,
+        )
+    except ValueError as exc:
+        if 'Missing interception metadata' not in str(exc):
+            raise AssertionError(f'Expected missing-metadata rejection, got: {exc}')
+    else:
+        raise AssertionError('Expected missing interception metadata to be rejected.')
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         test_dataset_shapes_and_order(tmpdir)
         test_invalid_combinations(tmpdir)
+        test_intercept_qpos_rgb_alignment_and_order(tmpdir)
+        test_intercept_first_token_and_delta_chunk(tmpdir)
+        test_intercept_stats_exclude_padding_and_not_absolute(tmpdir)
+        test_intercept_no_action_is_commanded_requirement_and_metadata_rejection(tmpdir)
+    test_intercept_history_indices()
     test_shared_augmentation()
     test_normalizer_lengths()
     test_backbone_channel_adaptation()

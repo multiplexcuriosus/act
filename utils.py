@@ -47,6 +47,69 @@ DEFAULT_JOINT_DATA_CONFIG = {
 }
 
 
+INTERCEPT_HISTORY_OFFSETS_DEFAULT = (-6, -3, 0)
+INTERCEPT_REQUIRED_ROOT_METADATA = {
+    'action_type': 'measured_tcp_s_absolute',
+    'action_representation': 'absolute',
+    'action_positive_direction': 'robot_base_positive_x',
+}
+
+
+def _decode_h5_attr(value):
+    if isinstance(value, bytes):
+        return value.decode('utf-8')
+    return value
+
+
+def _read_h5_root_attr(root, key):
+    if key not in root.attrs:
+        return None
+    return _decode_h5_attr(root.attrs[key])
+
+
+def _validate_intercept_root_metadata(root, dataset_path):
+    missing_keys = [
+        key for key in INTERCEPT_REQUIRED_ROOT_METADATA
+        if key not in root.attrs
+    ]
+    if missing_keys:
+        raise ValueError(
+            f"Missing interception metadata at HDF5 root in {dataset_path}: {missing_keys}. "
+            "This dataset requires episodes converted with the new interception converter that sets root attrs "
+            "action_type, action_representation, and action_positive_direction."
+        )
+
+    action_type = str(_read_h5_root_attr(root, 'action_type'))
+    action_representation = str(_read_h5_root_attr(root, 'action_representation'))
+    action_positive_direction = str(_read_h5_root_attr(root, 'action_positive_direction'))
+
+    if action_positive_direction == 'table_frame_positive_s':
+        raise ValueError(
+            f"Rejected {dataset_path}: action_positive_direction=table_frame_positive_s is unsupported for interception training. "
+            "Expected robot_base_positive_x from the converter metadata."
+        )
+
+    if action_type != INTERCEPT_REQUIRED_ROOT_METADATA['action_type']:
+        raise ValueError(
+            f"Rejected {dataset_path}: action_type={action_type!r}. "
+            f"Expected {INTERCEPT_REQUIRED_ROOT_METADATA['action_type']!r}."
+        )
+    if action_representation != INTERCEPT_REQUIRED_ROOT_METADATA['action_representation']:
+        raise ValueError(
+            f"Rejected {dataset_path}: action_representation={action_representation!r}. "
+            f"Expected {INTERCEPT_REQUIRED_ROOT_METADATA['action_representation']!r}."
+        )
+    if action_positive_direction != INTERCEPT_REQUIRED_ROOT_METADATA['action_positive_direction']:
+        raise ValueError(
+            f"Rejected {dataset_path}: action_positive_direction={action_positive_direction!r}. "
+            f"Expected {INTERCEPT_REQUIRED_ROOT_METADATA['action_positive_direction']!r}."
+        )
+
+
+def compute_history_indices(anchor_t, history_offsets):
+    return [max(0, int(anchor_t) + int(offset)) for offset in history_offsets]
+
+
 def _build_joint_data_config(
     qpos_dim=None,
     action_dim=None,
@@ -167,6 +230,49 @@ def _validate_joint_episode_structure(
         raise ValueError(
             f"action_dim mismatch for {dataset_path}: expected {action_dim}, found action width {action.shape[1]}"
         )
+
+    return qpos, action
+
+
+def _validate_intercept_episode_structure(root, dataset_path):
+    _validate_intercept_root_metadata(root, dataset_path)
+
+    if '/action' not in root:
+        raise ValueError(f"Missing required dataset: /action in {dataset_path}")
+    if '/observations/qpos' not in root:
+        raise ValueError(f"Missing required dataset: /observations/qpos in {dataset_path}")
+    if '/observations/images/rgb' not in root:
+        raise ValueError(f"Missing required dataset: /observations/images/rgb in {dataset_path}")
+
+    action = np.asarray(root['/action'][()], dtype=np.float32)
+    qpos = np.asarray(root['/observations/qpos'][()], dtype=np.float32)
+    rgb_ds = root['/observations/images/rgb']
+
+    if action.ndim != 2 or action.shape[1] != 1:
+        raise ValueError(
+            f"Interception /action must have shape (T,1) in {dataset_path}, got {action.shape}"
+        )
+    if qpos.ndim != 2 or qpos.shape[1] != 7:
+        raise ValueError(
+            f"Interception /observations/qpos must have shape (T,7) in {dataset_path}, got {qpos.shape}"
+        )
+
+    T = action.shape[0]
+    if T < 2:
+        raise ValueError(f"Interception episode must have T>=2 in {dataset_path}, got T={T}")
+    if qpos.shape[0] != T:
+        raise ValueError(
+            f"Unequal numbers of qpos and action steps in {dataset_path}: {qpos.shape[0]} != {T}"
+        )
+    if rgb_ds.shape[0] != T:
+        raise ValueError(
+            f"Unequal numbers of rgb and action steps in {dataset_path}: {rgb_ds.shape[0]} != {T}"
+        )
+
+    if not np.isfinite(action).all():
+        raise ValueError(f"Non-finite values found in /action for {dataset_path}")
+    if not np.isfinite(qpos).all():
+        raise ValueError(f"Non-finite values found in /observations/qpos for {dataset_path}")
 
     return qpos, action
 
@@ -767,6 +873,116 @@ class EpisodicJointDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
+class EpisodicInterceptDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        episode_paths,
+        camera_names,
+        chunk_size,
+        norm_stats,
+        history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
+        photometric_aug=False,
+        spatial_aug=False,
+        image_size=None,
+    ):
+        super(EpisodicInterceptDataset).__init__()
+        self.episode_paths = list(episode_paths)
+        self.camera_names = list(camera_names)
+        self.chunk_size = int(chunk_size)
+        self.norm_stats = norm_stats
+        self.history_offsets = tuple(int(offset) for offset in history_offsets)
+        self.photometric_aug = bool(photometric_aug)
+        self.spatial_aug = bool(spatial_aug)
+        self.image_size = canonical_image_size(image_size)
+        self.is_sim = None
+        self._printed_image_debug = False
+        self._printed_intercept_debug = False
+
+        if self.camera_names != ['rgb']:
+            raise ValueError(
+                f"Interception dataset requires camera_names=['rgb'], got {self.camera_names}"
+            )
+        if len(self.history_offsets) != 3:
+            raise ValueError(
+                f"Interception requires exactly 3 history offsets, got {self.history_offsets}"
+            )
+
+        _print_image_pipeline_info(self.camera_names, target_size=self.image_size)
+        self.__getitem__(0)
+
+    def __len__(self):
+        return len(self.episode_paths)
+
+    def __getitem__(self, index):
+        dataset_path = self.episode_paths[index]
+        with h5py.File(dataset_path, 'r') as root:
+            is_sim = bool(root.attrs.get('sim', False))
+            qpos_full, action_full = _validate_intercept_episode_structure(root, dataset_path)
+            T = action_full.shape[0]
+
+            # Valid anchors are 0..T-2 so token-0 always has a true future s(t+1)-s(t).
+            anchor_t = np.random.randint(0, T - 1)
+            history_indices = compute_history_indices(anchor_t, self.history_offsets)
+
+            qpos_history = qpos_full[history_indices]
+            qpos = qpos_history.reshape(-1).astype(np.float32)
+
+            rgb_frames = [root['/observations/images/rgb'][ts] for ts in history_indices]
+            processed_frames = _prepare_rgb_history_frames(
+                rgb_frames,
+                self.camera_names,
+                self.image_size,
+                photometric_aug=self.photometric_aug,
+                spatial_aug=self.spatial_aug,
+            )
+            image_rgb = np.concatenate(processed_frames, axis=-1)
+
+            anchor_s = float(action_full[anchor_t, 0])
+            future_end = min(T, anchor_t + 1 + self.chunk_size)
+            future_abs = action_full[anchor_t + 1:future_end, 0:1]
+            action = future_abs - anchor_s
+            action_len = action.shape[0]
+
+        self.is_sim = is_sim
+
+        padded_action = np.zeros((self.chunk_size, 1), dtype=np.float32)
+        padded_action[:action_len] = action
+        is_pad = np.zeros(self.chunk_size, dtype=np.float32)
+        is_pad[action_len:] = 1.0
+
+        image_data = torch.from_numpy(np.transpose(image_rgb, (2, 0, 1))[None, ...])
+        qpos_data = torch.from_numpy(qpos).float()
+        action_data = torch.from_numpy(padded_action).float()
+        is_pad = torch.from_numpy(is_pad).bool()
+
+        assert image_data.shape == (1, 9, self.image_size[0], self.image_size[1]), image_data.shape
+        assert qpos_data.shape == (21,), qpos_data.shape
+        assert action_data.shape == (self.chunk_size, 1), action_data.shape
+        assert is_pad.shape == (self.chunk_size,), is_pad.shape
+
+        if not self._printed_intercept_debug:
+            first_future_count = min(5, action_len)
+            print(
+                f"[DEBUG] intercept sample anchor_t={anchor_t}, history_indices={history_indices}, "
+                f"anchor_abs_s={anchor_s:+.6f}, "
+                f"future_abs_s[:{first_future_count}]={future_abs[:first_future_count, 0].tolist()}, "
+                f"delta_s[:{first_future_count}]={action[:first_future_count, 0].tolist()}, "
+                f"image_shape={tuple(image_data.shape)}, qpos_shape={tuple(qpos_data.shape)}, "
+                f"action_shape={tuple(action_data.shape)}"
+            )
+            self._printed_intercept_debug = True
+            self._printed_image_debug = True
+
+        image_data = image_data / 255.0
+        action_data = (action_data - self.norm_stats['action_mean']) / self.norm_stats['action_std']
+        qpos_data = (qpos_data - self.norm_stats['qpos_mean']) / self.norm_stats['qpos_std']
+
+        # Keep padded tokens neutral even after normalization.
+        action_data[is_pad] = 0.0
+
+        return image_data, qpos_data, action_data, is_pad
+
+
 def get_joint_norm_stats(episode_paths, qpos_indices=None, action_indices=None, action_key='/action', command_flag_key=None):
     all_qpos_data = []
     all_action_data = []
@@ -805,6 +1021,68 @@ def get_joint_norm_stats(episode_paths, qpos_indices=None, action_indices=None, 
     }
 
     return stats
+
+
+def get_intercept_norm_stats(
+    episode_paths,
+    chunk_size,
+    history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
+):
+    qpos_histories = []
+    delta_tokens = []
+
+    for dataset_path in episode_paths:
+        with h5py.File(dataset_path, 'r') as root:
+            qpos_full, action_full = _validate_intercept_episode_structure(root, dataset_path)
+
+        T = action_full.shape[0]
+        for anchor_t in range(T - 1):
+            history_indices = compute_history_indices(anchor_t, history_offsets)
+            qpos_histories.append(qpos_full[history_indices].reshape(-1))
+
+            future_end = min(T, anchor_t + 1 + chunk_size)
+            future_abs = action_full[anchor_t + 1:future_end, 0]
+            delta_values = future_abs - action_full[anchor_t, 0]
+            if delta_values.size > 0:
+                delta_tokens.append(delta_values)
+
+    if len(qpos_histories) == 0:
+        raise ValueError('No valid interception anchors found while computing normalization stats.')
+    if len(delta_tokens) == 0:
+        raise ValueError('No valid interception future-delta tokens found while computing normalization stats.')
+
+    qpos_histories = np.asarray(qpos_histories, dtype=np.float32)
+    all_delta_values = np.concatenate(delta_tokens, axis=0).astype(np.float32)
+
+    qpos_mean = qpos_histories.mean(axis=0)
+    qpos_std = qpos_histories.std(axis=0).clip(1e-2, np.inf)
+
+    action_mean = np.asarray([all_delta_values.mean()], dtype=np.float32)
+    action_std = np.asarray([all_delta_values.std()], dtype=np.float32).clip(1e-2, np.inf)
+
+    return {
+        'action_mean': action_mean,
+        'action_std': action_std,
+        'qpos_mean': qpos_mean,
+        'qpos_std': qpos_std,
+        'example_qpos': qpos_histories[0],
+        'data_mode': 'intercept',
+        'raw_qpos_dim': 7,
+        'state_dim': 21,
+        'action_dim': 1,
+        'rgb_history_frames': 3,
+        'rgb_history_offsets': list(history_offsets),
+        'rgb_frame_order': 'oldest_to_newest',
+        'qpos_history_offsets': list(history_offsets),
+        'qpos_flatten_order': 'oldest_to_newest',
+        'image_channels': 9,
+        'action_type': 'measured_tcp_s_delta',
+        'action_representation': 'future_delta_relative_to_anchor',
+        'action_anchor_offset': 0,
+        'action_first_target_offset': 1,
+        'action_positive_direction': 'robot_base_positive_x',
+        'action_units': 'm',
+    }
 
 
 def load_joint_data(
@@ -977,35 +1255,108 @@ def load_intercept_data(
     spatial_aug=False,
     split_num_trials=500,
     split_seed=0,
-    qpos_dim=None,
-    action_dim=2,
-    qpos_indices=None,
-    action_indices=None,
+    raw_qpos_dim=7,
+    state_dim=21,
+    action_dim=1,
     image_size=None,
-    event_channel_indices=None,
-    rgb_history_frames=1,
+    rgb_history_frames=3,
+    history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
 ):
-    return load_joint_data(
-        dataset_dirs=dataset_dirs,
-        camera_names=camera_names,
+    del split_num_trials  # currently unused in interception loader
+
+    if camera_names != ['rgb']:
+        raise ValueError(f"Interception requires camera_names=['rgb'], got {camera_names}")
+    if int(raw_qpos_dim) != 7:
+        raise ValueError(f"Interception raw_qpos_dim must be 7, got {raw_qpos_dim}")
+    if int(state_dim) != 21:
+        raise ValueError(f"Interception state_dim must be 21, got {state_dim}")
+    if int(action_dim) != 1:
+        raise ValueError(f"Interception action_dim must be 1, got {action_dim}")
+    if int(rgb_history_frames) != 3:
+        raise ValueError(f"Interception rgb_history_frames must be 3, got {rgb_history_frames}")
+
+    history_offsets = tuple(int(offset) for offset in history_offsets)
+    if history_offsets != INTERCEPT_HISTORY_OFFSETS_DEFAULT:
+        raise ValueError(
+            f"Interception history_offsets must be {INTERCEPT_HISTORY_OFFSETS_DEFAULT}, got {history_offsets}"
+        )
+
+    episode_paths = collect_episode_paths(dataset_dirs)
+    total_episode_count = len(episode_paths)
+    if total_episode_count < 2:
+        raise ValueError('Need at least 2 episodes for train/val split')
+
+    if isinstance(dataset_dirs, str):
+        source_dataset_dirs = [dataset_dirs]
+    else:
+        source_dataset_dirs = list(dataset_dirs)
+
+    print('\nSource dataset dirs:')
+    for source_dataset_dir in source_dataset_dirs:
+        print(source_dataset_dir)
+    print(f'Total discovered episodes: {total_episode_count}')
+    print('First few episode paths:')
+    for dataset_path in episode_paths[:min(5, total_episode_count)]:
+        print(dataset_path)
+    print('')
+    _warn_if_episode_indices_noncontiguous(episode_paths)
+
+    for dataset_path in episode_paths:
+        with h5py.File(dataset_path, 'r') as root:
+            _validate_intercept_episode_structure(root, dataset_path)
+
+    episode_indices = list(range(total_episode_count))
+    rng = np.random.RandomState(split_seed)
+    rng.shuffle(episode_indices)
+
+    split_idx = int(0.8 * total_episode_count)
+    split_idx = max(1, min(split_idx, total_episode_count - 1))
+
+    train_indices = episode_indices[:split_idx]
+    val_indices = episode_indices[split_idx:]
+
+    print(f'Train episode count: {len(train_indices)}')
+    print(f'Val episode count: {len(val_indices)}')
+    print(f'[INFO] Augmentation (train): photometric_aug={photometric_aug}, spatial_aug={spatial_aug}')
+    print('[INFO] Augmentation (val): photometric_aug=False, spatial_aug=False')
+
+    train_episode_paths = [episode_paths[index] for index in train_indices]
+    val_episode_paths = [episode_paths[index] for index in val_indices]
+
+    # Interception normalization is derived from train split only:
+    # - qpos: flattened 3x7 histories at valid anchors
+    # - action: non-padded future delta tokens s(t+k+1)-s(t)
+    norm_stats = get_intercept_norm_stats(
+        train_episode_paths,
         chunk_size=chunk_size,
-        batch_size_train=batch_size_train,
-        batch_size_val=batch_size_val,
-        model_dof=None,
+        history_offsets=history_offsets,
+    )
+
+    train_dataset = EpisodicInterceptDataset(
+        train_episode_paths,
+        camera_names,
+        chunk_size,
+        norm_stats,
+        history_offsets=history_offsets,
         photometric_aug=photometric_aug,
         spatial_aug=spatial_aug,
-        split_num_trials=split_num_trials,
-        split_seed=split_seed,
-        qpos_dim=qpos_dim,
-        action_dim=action_dim,
-        qpos_indices=qpos_indices,
-        action_indices=action_indices,
-        action_key='/action',
-        command_flag_key='/action_is_commanded',
         image_size=image_size,
-        event_channel_indices=event_channel_indices,
-        rgb_history_frames=rgb_history_frames,
     )
+    val_dataset = EpisodicInterceptDataset(
+        val_episode_paths,
+        camera_names,
+        chunk_size,
+        norm_stats,
+        history_offsets=history_offsets,
+        photometric_aug=False,
+        spatial_aug=False,
+        image_size=image_size,
+    )
+
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
+
+    return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 
 
 class EpisodicPoseDataset(torch.utils.data.Dataset):
