@@ -25,9 +25,9 @@ fi
 CAMERA_MODES=(rgb)
 
 for IMAGE_SIZE in 320; do
-  for LR in 1e-5; do
-    for BS in 4; do
-      for KL in 1; do
+  for LR in 2e-5 1e-5; do
+    for BS in 32 16 8; do
+      for KL in 1 10; do
         for CAM_MODE in "${CAMERA_MODES[@]}"; do
 
           case "$CAM_MODE" in
