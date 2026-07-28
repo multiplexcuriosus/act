@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Convert ROS 2 ball-interception bags into per-episode IL HDF5 files.
 
-The learned action is a two-dimensional dense representation:
+The learned action is the continuously measured middle-line TCP coordinate
+published on /middle_line/current_tcp_s (std_msgs/msg/Float64):
 
-    action[:, 0] = executed episode GOTO_S target at every timestep
-    action[:, 1] = 0 before the executed command timestamp, 1 at/after it
+    action[t, 0] = measured current_tcp_s at sample t
 
-Images and joint states are sampled causally: every 30 Hz sample uses the most
-recent message whose bag timestamp is less than or equal to the sample time.
-Temporal RGB stacking (for example rgb[t-1] + rgb[t]) is intentionally left to
-the training data loader.
+Images, joint states, and current_tcp_s are sampled causally: every sample on
+an evenly spaced grid uses the most recent source message whose bag timestamp
+is less than or equal to the sample time. Temporal RGB stacking and delta
+construction are intentionally deferred to the training loader.
 """
 
 from __future__ import annotations
@@ -28,13 +28,20 @@ from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
 
-DEFAULT_RGB_TOPIC = "/top_cam/camera/color/image_raw"
+DEFAULT_RGB_TOPIC = "auto"
+DEFAULT_RGB_TOPIC_RAW = "/top_cam/camera/color/image_raw"
+DEFAULT_RGB_TOPIC_COMPRESSED = "/top_cam/camera/color/image_raw/compressed"
 DEFAULT_JOINT_TOPIC = "/joint_states"
 DEFAULT_EPISODE_TOPIC = "/episode/control"
+DEFAULT_CURRENT_TCP_S_TOPIC = "/middle_line/current_tcp_s"
 DEFAULT_GOTO_S_TOPIC = "/trajectory_executor/executed_goto_s"
 DEFAULT_GOTO_S_TARGET_BASE_TOPIC = (
     "/trajectory_executor/executed_goto_s_target_base"
 )
+
+RAW_IMAGE_TYPE = "sensor_msgs/msg/Image"
+COMPRESSED_IMAGE_TYPE = "sensor_msgs/msg/CompressedImage"
+FLOAT64_TYPE = "std_msgs/msg/Float64"
 
 ARM_JOINT_NAMES = (
     "right_fr3_joint1",
@@ -52,6 +59,7 @@ class Topics:
     rgb: str
     joint: str
     episode: str
+    current_tcp_s: str
     goto_s: str
     goto_s_target_base: str
 
@@ -102,24 +110,72 @@ def message_classes(
     }
 
 
+def resolve_rgb_topic(types: Dict[str, str], requested_rgb_topic: str) -> str:
+    if requested_rgb_topic != "auto":
+        if requested_rgb_topic not in types:
+            raise RuntimeError(
+                f"Requested RGB topic is missing: {requested_rgb_topic}"
+            )
+        return requested_rgb_topic
+
+    if DEFAULT_RGB_TOPIC_COMPRESSED in types:
+        return DEFAULT_RGB_TOPIC_COMPRESSED
+    if DEFAULT_RGB_TOPIC_RAW in types:
+        return DEFAULT_RGB_TOPIC_RAW
+
+    raise RuntimeError(
+        "RGB topic auto-selection failed: neither "
+        f"{DEFAULT_RGB_TOPIC_COMPRESSED} nor {DEFAULT_RGB_TOPIC_RAW} is present"
+    )
+
+
 def validate_topics(
-    types: Dict[str, str], topics: Topics, collect_target_base: bool
-) -> bool:
-    required = {topics.rgb, topics.joint, topics.episode, topics.goto_s}
+    types: Dict[str, str],
+    topics: Topics,
+    collect_goto_s_debug: bool,
+    collect_target_base_debug: bool,
+) -> Tuple[bool, bool]:
+    required = {topics.rgb, topics.joint, topics.episode, topics.current_tcp_s}
     missing = sorted(required - set(types))
     if missing:
         raise RuntimeError(f"Missing required topics: {missing}")
 
+    rgb_type = types[topics.rgb]
+    if rgb_type not in (RAW_IMAGE_TYPE, COMPRESSED_IMAGE_TYPE):
+        raise RuntimeError(
+            f"RGB topic {topics.rgb} has unsupported type {rgb_type}. "
+            f"Expected {RAW_IMAGE_TYPE} or {COMPRESSED_IMAGE_TYPE}."
+        )
+
+    tcp_s_type = types[topics.current_tcp_s]
+    if tcp_s_type != FLOAT64_TYPE:
+        raise RuntimeError(
+            f"Topic {topics.current_tcp_s} must be {FLOAT64_TYPE}, got {tcp_s_type}"
+        )
+
     for topic in sorted(required):
         log(f"[INFO] {topic} :: {types[topic]}")
 
+    log(f"[INFO] selected RGB topic: {topics.rgb} ({rgb_type})")
+
+    goto_s_available = topics.goto_s in types
     target_base_available = topics.goto_s_target_base in types
-    if collect_target_base and not target_base_available:
+
+    if collect_goto_s_debug and not goto_s_available:
         log(
-            "[WARNING] optional GOTO_S target-base topic is absent; "
-            "no target-base debug data will be written"
+            "[INFO] optional GOTO_S debug topic is absent; "
+            "commands/goto_s datasets will be empty"
         )
-    return collect_target_base and target_base_available
+    if collect_target_base_debug and not target_base_available:
+        log(
+            "[INFO] optional GOTO_S target-base debug topic is absent; "
+            "commands/goto_s_target_base datasets will be empty"
+        )
+
+    return (
+        collect_goto_s_debug and goto_s_available,
+        collect_target_base_debug and target_base_available,
+    )
 
 
 def extract_episode_windows(
@@ -217,8 +273,8 @@ def extract_episode_windows(
     return windows
 
 
-def image_msg_to_rgb(msg: Any) -> np.ndarray:
-    """Decode common sensor_msgs/Image encodings and return RGB uint8."""
+def decode_raw_image_to_rgb(msg: Any) -> np.ndarray:
+    """Decode sensor_msgs/msg/Image into contiguous RGB uint8 (H, W, 3)."""
     height = int(msg.height)
     width = int(msg.width)
     encoding = str(msg.encoding).lower()
@@ -247,16 +303,51 @@ def image_msg_to_rgb(msg: Any) -> np.ndarray:
     packed = raw[:expected].reshape(height, step)[:, :row_bytes]
     if channels == 1:
         mono = packed.reshape(height, width)
-        return cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
+        rgb = cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
+        return np.ascontiguousarray(rgb, dtype=np.uint8)
 
     image = packed.reshape(height, width, channels)
     if encoding == "rgb8":
-        return image.copy()
+        return np.ascontiguousarray(image, dtype=np.uint8)
     if encoding == "bgr8":
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return np.ascontiguousarray(rgb, dtype=np.uint8)
     if encoding == "rgba8":
-        return cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
-    return cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+        rgb = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+        return np.ascontiguousarray(rgb, dtype=np.uint8)
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+    return np.ascontiguousarray(rgb, dtype=np.uint8)
+
+
+def decode_compressed_image_to_rgb(msg: Any) -> np.ndarray:
+    """Decode sensor_msgs/msg/CompressedImage into contiguous RGB uint8."""
+    encoded = np.frombuffer(msg.data, dtype=np.uint8)
+    decoded = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    if decoded is None or decoded.size == 0:
+        raise RuntimeError("CompressedImage decode failed or produced empty output")
+
+    if decoded.ndim == 2:
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_GRAY2RGB)
+    elif decoded.ndim == 3 and decoded.shape[2] == 3:
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+    elif decoded.ndim == 3 and decoded.shape[2] == 4:
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGB)
+    else:
+        raise RuntimeError(
+            f"Unsupported decoded CompressedImage shape: {decoded.shape}"
+        )
+
+    return np.ascontiguousarray(rgb, dtype=np.uint8)
+
+
+def image_msg_to_rgb(msg: Any) -> np.ndarray:
+    """Decode sensor_msgs/Image or sensor_msgs/CompressedImage into RGB uint8."""
+    if hasattr(msg, "encoding") and hasattr(msg, "height") and hasattr(msg, "step"):
+        return decode_raw_image_to_rgb(msg)
+    if hasattr(msg, "format") and hasattr(msg, "data"):
+        return decode_compressed_image_to_rgb(msg)
+    raise TypeError(f"Unsupported RGB message object type: {type(msg)}")
 
 
 def arm_qpos(joint_names: Sequence[str], positions: Sequence[float]) -> np.ndarray:
@@ -275,9 +366,10 @@ def collect_episode(
     storage_id: str,
     episode: EpisodeWindow,
     topics: Topics,
-    collect_target_base: bool,
+    collect_goto_s_debug: bool,
+    collect_target_base_debug: bool,
 ) -> Dict[str, Any]:
-    """Read only sensor and command messages inside one episode window."""
+    """Read only sensor and optional debug messages inside one episode window."""
     log(
         f"[INFO] Pass 2: collecting output episode {episode.output_idx} "
         f"[{episode.start:.6f}, {episode.end:.6f}]"
@@ -285,8 +377,10 @@ def collect_episode(
     reader = open_reader(bag_path, storage_id)
     types = topic_type_map(reader)
 
-    tracked = {topics.rgb, topics.joint, topics.goto_s}
-    if collect_target_base:
+    tracked = {topics.rgb, topics.joint, topics.current_tcp_s}
+    if collect_goto_s_debug:
+        tracked.add(topics.goto_s)
+    if collect_target_base_debug:
         tracked.add(topics.goto_s_target_base)
     classes = message_classes(types, tracked)
 
@@ -295,6 +389,8 @@ def collect_episode(
         "rgb_msg": [],
         "joint_t": [],
         "qpos": [],
+        "current_tcp_s_t": [],
+        "current_tcp_s": [],
         "goto_s_t": [],
         "goto_s": [],
         "target_base_t": [],
@@ -320,6 +416,9 @@ def collect_episode(
         elif topic == topics.joint:
             data["joint_t"].append(timestamp)
             data["qpos"].append(arm_qpos(msg.name, msg.position))
+        elif topic == topics.current_tcp_s:
+            data["current_tcp_s_t"].append(timestamp)
+            data["current_tcp_s"].append(float(msg.data))
         elif topic == topics.goto_s:
             data["goto_s_t"].append(timestamp)
             data["goto_s"].append(float(msg.data))
@@ -332,57 +431,65 @@ def collect_episode(
     log(
         f"[INFO] episode {episode.output_idx}: "
         f"rgb={len(data['rgb_t'])}, joints={len(data['joint_t'])}, "
-        f"goto_s={len(data['goto_s_t'])}, "
-        f"target_base={len(data['target_base_t'])}"
+        f"current_tcp_s={len(data['current_tcp_s_t'])}, "
+        f"goto_s_debug={len(data['goto_s_t'])}, "
+        f"target_base_debug={len(data['target_base_t'])}"
     )
 
     if not data["rgb_t"]:
         raise RuntimeError(f"Episode {episode.output_idx}: no RGB frames")
     if not data["joint_t"]:
         raise RuntimeError(f"Episode {episode.output_idx}: no joint states")
-    if not data["goto_s_t"]:
+    if not data["current_tcp_s_t"]:
         raise RuntimeError(
-            f"Episode {episode.output_idx}: no executed GOTO_S command; "
-            "cancel the episode or inspect command-topic timing"
+            f"Episode {episode.output_idx}: no current_tcp_s measurements"
         )
+
     return data
+
+
+def _validate_monotonic_non_decreasing(name: str, values: np.ndarray) -> None:
+    if values.ndim != 1:
+        raise RuntimeError(f"{name} timestamps must be 1-D")
+    if values.size == 0:
+        raise RuntimeError(f"{name} timestamps must be non-empty")
+    diffs = np.diff(values)
+    if np.any(diffs < 0.0):
+        raise RuntimeError(f"{name} timestamps are not monotonic non-decreasing")
 
 
 def sample_episode(
     data: Dict[str, Any],
     episode: EpisodeWindow,
     fps: float,
+    max_current_tcp_s_age_sec: float,
 ) -> Dict[str, np.ndarray]:
-    """Causally sample observations and build dense (intercept_s, execute_flag)."""
-    command_count = len(data["goto_s_t"])
-    if command_count == 0:
-        raise RuntimeError(
-            f"Episode {episode.output_idx}: expected exactly one GOTO_S command, "
-            f"found {command_count}"
-        )
-    if command_count > 1:
-        raise RuntimeError(
-            f"Episode {episode.output_idx}: expected exactly one GOTO_S command, "
-            f"found {command_count}. Dense episode-target action schema is "
-            "incompatible with multiple commands per episode."
-        )
+    """Causally sample observations and measured current_tcp_s action."""
+    rgb_times = np.asarray(data["rgb_t"], dtype=np.float64)
+    joint_times = np.asarray(data["joint_t"], dtype=np.float64)
+    tcp_s_times = np.asarray(data["current_tcp_s_t"], dtype=np.float64)
+    tcp_s_values = np.asarray(data["current_tcp_s"], dtype=np.float32)
 
-    # Starting at the first available RGB and joint message avoids using a future
-    # observation for the first grid sample. Ending at the last available messages
-    # likewise ensures every sample has causal data from both observation streams.
+    _validate_monotonic_non_decreasing("RGB", rgb_times)
+    _validate_monotonic_non_decreasing("joint", joint_times)
+    _validate_monotonic_non_decreasing("current_tcp_s", tcp_s_times)
+
     effective_start = max(
         episode.start,
-        float(data["rgb_t"][0]),
-        float(data["joint_t"][0]),
+        float(rgb_times[0]),
+        float(joint_times[0]),
+        float(tcp_s_times[0]),
     )
     effective_end = min(
         episode.end,
-        float(data["rgb_t"][-1]),
-        float(data["joint_t"][-1]),
+        float(rgb_times[-1]),
+        float(joint_times[-1]),
+        float(tcp_s_times[-1]),
     )
     if effective_end <= effective_start:
         raise RuntimeError(
-            f"Episode {episode.output_idx}: RGB/joint streams have no overlapping interval"
+            f"Episode {episode.output_idx}: RGB/joint/current_tcp_s streams have "
+            "no overlapping interval"
         )
 
     dt = 1.0 / fps
@@ -390,25 +497,11 @@ def sample_episode(
     if grid.size == 0:
         raise RuntimeError(f"Episode {episode.output_idx}: empty sampling grid")
 
-    rgb_times = np.asarray(data["rgb_t"], dtype=np.float64)
-    joint_times = np.asarray(data["joint_t"], dtype=np.float64)
-    command_times = np.asarray(data["goto_s_t"], dtype=np.float64)
-    command_values = np.asarray(data["goto_s"], dtype=np.float32)
-    command_time = float(command_times[0])
-    target_s = np.float32(command_values[0])
-    if not np.isfinite(command_time):
-        raise RuntimeError(
-            f"Episode {episode.output_idx}: non-finite GOTO_S command timestamp"
-        )
-    if not np.isfinite(target_s):
-        raise RuntimeError(
-            f"Episode {episode.output_idx}: non-finite GOTO_S target value"
-        )
-
     rgb_indices = np.searchsorted(rgb_times, grid, side="right") - 1
     joint_indices = np.searchsorted(joint_times, grid, side="right") - 1
-    if np.any(rgb_indices < 0) or np.any(joint_indices < 0):
-        raise AssertionError("Internal error: non-causal observation index")
+    tcp_s_indices = np.searchsorted(tcp_s_times, grid, side="right") - 1
+    if np.any(rgb_indices < 0) or np.any(joint_indices < 0) or np.any(tcp_s_indices < 0):
+        raise AssertionError("Internal error: non-causal source index")
 
     rgb = np.stack(
         [image_msg_to_rgb(data["rgb_msg"][index]) for index in rgb_indices],
@@ -418,48 +511,57 @@ def sample_episode(
         [data["qpos"][index] for index in joint_indices], axis=0
     ).astype(np.float32, copy=False)
 
-    commanded = grid >= command_time
-    commanded_indices = np.flatnonzero(commanded)
-    if commanded_indices.size == 0:
+    action_values = tcp_s_values[tcp_s_indices]
+    if not np.all(np.isfinite(action_values)):
         raise RuntimeError(
-            f"Episode {episode.output_idx}: GOTO_S command at {command_time:.6f} occurs "
-            "after the causally usable RGB/joint interval"
-        )
-    first_grid_command_index = int(commanded_indices[0])
-    if first_grid_command_index == 0:
-        raise RuntimeError(
-            f"Episode {episode.output_idx}: no causally usable pre-command samples "
-            "remain in the effective RGB/joint interval"
+            f"Episode {episode.output_idx}: sampled current_tcp_s contains non-finite values"
         )
 
-    action = np.empty((grid.size, 2), dtype=np.float32)
-    action[:, 0] = target_s
-    action[:, 1] = commanded.astype(np.float32)
+    action = action_values.reshape(-1, 1).astype(np.float32, copy=False)
+    action_source_timestamps = tcp_s_times[tcp_s_indices]
+    action_source_age_sec = (grid - action_source_timestamps).astype(np.float32)
 
-    if action.shape != (grid.size, 2):
-        raise AssertionError("Internal error: action shape mismatch")
-    if not np.isfinite(action).all():
-        raise RuntimeError(f"Episode {episode.output_idx}: non-finite dense action")
-    execute_values = action[:, 1]
-    if not np.all(np.logical_or(execute_values == 0.0, execute_values == 1.0)):
+    if np.any(action_source_age_sec < 0.0):
+        min_age = float(np.min(action_source_age_sec))
         raise RuntimeError(
-            f"Episode {episode.output_idx}: execute_flag must be binary 0/1"
+            f"Episode {episode.output_idx}: negative current_tcp_s source age detected "
+            f"(min={min_age:.6e}s)"
         )
-    if not np.all(np.diff(execute_values) >= 0.0):
+
+    if max_current_tcp_s_age_sec > 0.0:
+        too_old = action_source_age_sec > float(max_current_tcp_s_age_sec)
+        if np.any(too_old):
+            max_age = float(np.max(action_source_age_sec))
+            raise RuntimeError(
+                f"Episode {episode.output_idx}: stale current_tcp_s source sample "
+                f"detected (max age={max_age:.6f}s > "
+                f"{max_current_tcp_s_age_sec:.6f}s)."
+            )
+
+    if action.shape != (grid.size, 1):
         raise RuntimeError(
-            f"Episode {episode.output_idx}: execute_flag must be monotonically nondecreasing"
+            f"Episode {episode.output_idx}: action shape mismatch {action.shape}, "
+            f"expected {(grid.size, 1)}"
         )
-    if not np.any(execute_values == 0.0) or not np.any(execute_values == 1.0):
+    if rgb.shape[0] != grid.size or qpos.shape[0] != grid.size:
         raise RuntimeError(
-            f"Episode {episode.output_idx}: expected both pre-command and post-command samples"
+            f"Episode {episode.output_idx}: sampled array length mismatch "
+            f"(T={grid.size}, rgb={rgb.shape[0]}, qpos={qpos.shape[0]})"
         )
 
     log(
         f"[INFO] episode {episode.output_idx}: sampled {grid.size} steps at "
-        f"{fps:.3f} Hz; first commanded sample index {first_grid_command_index}, "
-        f"command timestamp={command_time:.6f}, dense target s={target_s:+.6f} m"
+        f"{fps:.3f} Hz; current_tcp_s age sec min/mean/max="
+        f"{float(np.min(action_source_age_sec)):.6f}/"
+        f"{float(np.mean(action_source_age_sec)):.6f}/"
+        f"{float(np.max(action_source_age_sec)):.6f}; s min/mean/max="
+        f"{float(np.min(action[:, 0])):+.6f}/"
+        f"{float(np.mean(action[:, 0])):+.6f}/"
+        f"{float(np.max(action[:, 0])):+.6f}"
     )
 
+    command_timestamps = np.asarray(data["goto_s_t"], dtype=np.float64)
+    command_values = np.asarray(data["goto_s"], dtype=np.float32).reshape(-1, 1)
     target_base_t = np.asarray(data["target_base_t"], dtype=np.float64)
     if data["target_base"]:
         target_base = np.asarray(data["target_base"], dtype=np.float32).reshape(-1, 3)
@@ -471,8 +573,10 @@ def sample_episode(
         "rgb": rgb,
         "qpos": qpos,
         "action": action,
-        "command_timestamps": command_times,
-        "command_values": command_values.reshape(-1, 1),
+        "action_source_timestamps": action_source_timestamps,
+        "action_source_age_sec": action_source_age_sec,
+        "command_timestamps": command_timestamps,
+        "command_values": command_values,
         "target_base_timestamps": target_base_t,
         "target_base_points": target_base,
     }
@@ -521,24 +625,19 @@ def write_episode(
             h5.attrs["joint_names"] = np.asarray(
                 ARM_JOINT_NAMES, dtype=h5py.string_dtype("utf-8")
             )
-            h5.attrs["action_type"] = "dense_intercept_target_with_execute_flag"
+            h5.attrs["action_type"] = "measured_tcp_s_absolute"
+            h5.attrs["action_representation"] = "absolute"
             h5.attrs["action_coordinate"] = "captured_interception_line"
             h5.attrs["action_origin"] = "captured_line_center"
-            h5.attrs["intercept_s_units"] = "m"
-            h5.attrs[
-                "intercept_s_semantics"
-            ] = "episode target repeated at every effective timestep"
-            h5.attrs[
-                "execute_flag_semantics"
-            ] = "0 before executed GOTO_S timestamp, 1 at/after timestamp"
-            h5.attrs["action_layout"] = np.asarray(
-                ["intercept_s", "execute_flag"],
-                dtype=h5py.string_dtype("utf-8"),
+            h5.attrs["action_positive_direction"] = "robot_base_positive_x"
+            h5.attrs["action_units"] = "m"
+            h5.attrs["action_source_topic"] = topics.current_tcp_s
+            h5.attrs["action_sampling_policy"] = (
+                "latest_message_at_or_before_grid_time"
             )
-            h5.attrs["action_source_topic"] = topics.goto_s
+            h5.attrs["delta_action_construction"] = "deferred_to_training_loader"
             h5.attrs["rgb_source_topic"] = topics.rgb
             h5.attrs["joint_source_topic"] = topics.joint
-            h5.attrs["sampling_policy"] = "latest_message_at_or_before_grid_time"
             h5.attrs["rgb_temporal_stacking"] = "deferred_to_training_loader"
             h5.attrs["command_count"] = int(arrays["command_timestamps"].size)
 
@@ -558,12 +657,16 @@ def write_episode(
                 **compression_kwargs,
             )
 
-            action_ds = h5.create_dataset(
-                "action", data=arrays["action"], dtype=np.float32
+            h5.create_dataset("action", data=arrays["action"], dtype=np.float32)
+            h5.create_dataset(
+                "action_source_timestamps",
+                data=arrays["action_source_timestamps"],
+                dtype=np.float64,
             )
-            action_ds.attrs["columns"] = np.asarray(
-                ["intercept_s", "execute_flag"],
-                dtype=h5py.string_dtype("utf-8"),
+            h5.create_dataset(
+                "action_source_age_sec",
+                data=arrays["action_source_age_sec"],
+                dtype=np.float32,
             )
 
             commands = h5.create_group("commands")
@@ -602,11 +705,60 @@ def recording_name(bag_path: str) -> str:
     return os.path.splitext(basename)[0]
 
 
+def output_dir_name(args: argparse.Namespace, bag_path: str) -> str:
+    if args.rec_dir is not None:
+        rec_dir = os.path.abspath(os.path.expanduser(args.rec_dir))
+        rec_name = os.path.basename(os.path.normpath(rec_dir))
+        if rec_name.startswith("recording_"):
+            return "hdf5_" + rec_name[len("recording_") :]
+        return rec_name
+    return recording_name(bag_path)
+
+
+def resolve_bag_path(args: argparse.Namespace) -> str:
+    if args.bag is not None:
+        return os.path.abspath(os.path.expanduser(args.bag))
+
+    rec_dir = os.path.abspath(os.path.expanduser(args.rec_dir))
+    if not os.path.isdir(rec_dir):
+        raise RuntimeError(f"Recording directory does not exist: {rec_dir}")
+
+    bag_candidates: List[str] = []
+    for entry in os.scandir(rec_dir):
+        if entry.is_dir() and entry.name.endswith("_bag"):
+            bag_candidates.append(entry.path)
+
+    if not bag_candidates:
+        log(
+            f"[WARNING] no subdirectory ending in '_bag' was found under: {rec_dir}"
+        )
+        raise RuntimeError(
+            "Could not resolve bag directory from recording directory "
+            f"{rec_dir}; expected a child folder ending with '_bag'"
+        )
+
+    bag_candidates.sort()
+    if len(bag_candidates) > 1:
+        log(
+            "[WARNING] multiple '_bag' directories found under "
+            f"{rec_dir}; using first in sorted order: {bag_candidates[0]}"
+        )
+
+    return bag_candidates[0]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a ROS 2 ball-interception bag to per-episode IL HDF5"
     )
-    parser.add_argument("--bag", required=True, help="ROS 2 bag directory")
+    bag_input_group = parser.add_mutually_exclusive_group(required=True)
+    bag_input_group.add_argument("--bag", help="ROS 2 bag directory")
+    bag_input_group.add_argument(
+        "--rec_dir",
+        help=(
+            "Recording directory containing a bag subdirectory ending in '_bag'"
+        ),
+    )
     parser.add_argument(
         "--out_dir",
         required=True,
@@ -624,6 +776,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max_episodes", type=int, default=None)
     parser.add_argument(
+        "--max_current_tcp_s_age_sec",
+        type=float,
+        default=0.10,
+        help=(
+            "Maximum allowed age for causally selected current_tcp_s source "
+            "samples. Non-positive disables rejection but age stats are still logged."
+        ),
+    )
+    parser.add_argument(
         "--no_target_base",
         action="store_true",
         help="Do not collect optional executed_goto_s_target_base debug messages",
@@ -639,6 +800,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb_topic", default=DEFAULT_RGB_TOPIC)
     parser.add_argument("--joint_topic", default=DEFAULT_JOINT_TOPIC)
     parser.add_argument("--episode_topic", default=DEFAULT_EPISODE_TOPIC)
+    parser.add_argument(
+        "--current_tcp_s_topic", default=DEFAULT_CURRENT_TCP_S_TOPIC
+    )
     parser.add_argument("--goto_s_topic", default=DEFAULT_GOTO_S_TOPIC)
     parser.add_argument(
         "--goto_s_target_base_topic", default=DEFAULT_GOTO_S_TARGET_BASE_TOPIC
@@ -656,25 +820,32 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    bag_path = os.path.abspath(os.path.expanduser(args.bag))
+    bag_path = resolve_bag_path(args)
     output_parent = os.path.abspath(os.path.expanduser(args.out_dir))
     if not os.path.exists(bag_path):
         raise RuntimeError(f"Bag path does not exist: {bag_path}")
 
+    log(f"[INFO] bag: {bag_path}")
+    log(f"[INFO] storage: {args.storage_id}")
+
+    reader = open_reader(bag_path, args.storage_id)
+    types = topic_type_map(reader)
+    selected_rgb_topic = resolve_rgb_topic(types, args.rgb_topic)
+
     topics = Topics(
-        rgb=args.rgb_topic,
+        rgb=selected_rgb_topic,
         joint=args.joint_topic,
         episode=args.episode_topic,
+        current_tcp_s=args.current_tcp_s_topic,
         goto_s=args.goto_s_topic,
         goto_s_target_base=args.goto_s_target_base_topic,
     )
 
-    log(f"[INFO] bag: {bag_path}")
-    log(f"[INFO] storage: {args.storage_id}")
-    reader = open_reader(bag_path, args.storage_id)
-    types = topic_type_map(reader)
-    collect_target_base = validate_topics(
-        types, topics, collect_target_base=not args.no_target_base
+    collect_goto_s_debug, collect_target_base_debug = validate_topics(
+        types,
+        topics,
+        collect_goto_s_debug=True,
+        collect_target_base_debug=not args.no_target_base,
     )
 
     episodes = extract_episode_windows(
@@ -686,7 +857,7 @@ def main() -> None:
     if args.max_episodes is not None:
         episodes = episodes[: args.max_episodes]
 
-    output_dir = os.path.join(output_parent, recording_name(bag_path))
+    output_dir = os.path.join(output_parent, output_dir_name(args, bag_path))
     os.makedirs(output_dir, exist_ok=True)
     log(f"[INFO] output directory: {output_dir}")
 
@@ -697,12 +868,14 @@ def main() -> None:
             storage_id=args.storage_id,
             episode=episode,
             topics=topics,
-            collect_target_base=collect_target_base,
+            collect_goto_s_debug=collect_goto_s_debug,
+            collect_target_base_debug=collect_target_base_debug,
         )
         arrays = sample_episode(
             data=data,
             episode=episode,
             fps=args.fps,
+            max_current_tcp_s_age_sec=args.max_current_tcp_s_age_sec,
         )
         output_path = os.path.join(
             output_dir, f"episode_{episode.output_idx}.hdf5"

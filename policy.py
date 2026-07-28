@@ -11,15 +11,27 @@ from roma.mappings import special_gramschmidt
 
 
 def _build_image_normalizer(image_channels):
+    base_mean = [0.485, 0.456, 0.406]
+    base_std = [0.229, 0.224, 0.225]
+
     if image_channels == 1:
         # Collapse ImageNet RGB stats to one channel for event-only mode.
-        mean = [sum([0.485, 0.456, 0.406]) / 3.0]
-        std = [sum([0.229, 0.224, 0.225]) / 3.0]
+        mean = [sum(base_mean) / 3.0]
+        std = [sum(base_std) / 3.0]
     elif image_channels == 3:
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
+        mean = base_mean
+        std = base_std
+    elif image_channels in (6, 9):
+        # Independently normalize every concatenated RGB history frame.
+        repeats = image_channels // 3
+        mean = base_mean * repeats
+        std = base_std * repeats
     else:
-        raise ValueError(f"Unsupported image_channels={image_channels}")
+        raise ValueError(
+            f"Unsupported image_channels={image_channels}; "
+            "expected one of 1, 3, 6, or 9"
+        )
+
     return transforms.Normalize(mean=mean, std=std)
 
 
