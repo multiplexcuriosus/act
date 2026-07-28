@@ -50,7 +50,7 @@ for IMAGE_SIZE in 320; do
           echo "Datasets: ${DATASETS[*]}"
           echo "Cameras: ${CAM_NAMES[*]}"
           echo "Raw qpos dim: ${RAW_QPOS_DIM}"
-          echo "Model state dim: ${STATE_DIM}"§§
+          echo "Model state dim: ${STATE_DIM}"
           echo "Action dim: ${ACTION_DIM}"
           echo "RGB/qpos history offsets: [-6, -3, 0]"
           echo "Action: delta_s[k] = tcp_s(t+k+1) - tcp_s(t)"
