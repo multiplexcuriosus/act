@@ -13,12 +13,14 @@ if ACT_ROOT not in sys.path:
 
 from intercept_rollout_contract import (  # noqa: E402
     EXPECTED_INTERCEPT_METADATA,
+    AggregationSelection,
     TemporalAbsoluteAggregator,
     absolute_s_from_anchor,
     build_qpos_history,
     build_rgb_history_tensor,
     compute_history_indices,
     denormalize_delta_chunk,
+    resolve_temporal_agg_mode,
     select_sync_observation,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
@@ -132,12 +134,227 @@ class InterceptRolloutContractTests(unittest.TestCase):
             validate_intercept_stats_and_config(stats, self.make_policy_config(), expected_chunk_size=30)
 
     def test_temporal_aggregation_in_absolute_coordinates(self):
-        agg = TemporalAbsoluteAggregator(chunk_size=4, decay=0.0)
-        agg.add_prediction(0, np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
-        agg.add_prediction(1, np.asarray([10.0, 11.0, 12.0, 13.0], dtype=np.float32))
+        agg = TemporalAbsoluteAggregator(chunk_size=5, decay=0.0)
+        agg.add_prediction(0, np.asarray([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32))
+        agg.add_prediction(1, np.asarray([10.0, 11.0, 12.0, 13.0, 14.0], dtype=np.float32))
 
         self.assertAlmostEqual(agg.value_for_step(1), (2.0 + 10.0) / 2.0)
         self.assertAlmostEqual(agg.value_for_step(2), (3.0 + 11.0) / 2.0)
+
+    def test_default_constructor_selects_full_mode(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=5)
+        self.assertEqual(agg.mode, "full")
+
+    def test_full_mode_matches_legacy_weighted_result_exactly(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=8, mode="full", decay=0.25)
+        chunk0 = np.asarray([10, 11, 12, 13, 14, 15, 16, 17], dtype=np.float32)
+        chunk1 = np.asarray([20, 21, 22, 23, 24, 25, 26, 27], dtype=np.float32)
+        chunk2 = np.asarray([30, 31, 32, 33, 34, 35, 36, 37], dtype=np.float32)
+        agg.add_prediction(0, chunk0)
+        agg.add_prediction(1, chunk1)
+        agg.add_prediction(2, chunk2)
+
+        current_step = 3
+        values_oldest_to_newest = np.asarray([13.0, 22.0, 31.0], dtype=np.float64)
+        legacy_weights = np.exp(-0.25 * np.arange(3, dtype=np.float64))
+        legacy_weights = legacy_weights / np.sum(legacy_weights)
+        expected = float(np.sum(values_oldest_to_newest * legacy_weights))
+
+        selection = agg.selection_for_step(current_step)
+        self.assertIsInstance(selection, AggregationSelection)
+        self.assertIsNotNone(selection)
+        self.assertAlmostEqual(selection.value, expected, places=12)
+        self.assertAlmostEqual(agg.value_for_step(current_step), expected, places=12)
+
+    def test_full_mode_retains_oldest_first_weight_ordering(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=6, mode="full", decay=2.0)
+        agg.add_prediction(0, np.asarray([1000, 1001, 1002, 1003, 1004, 1005], dtype=np.float32))
+        agg.add_prediction(1, np.asarray([100, 101, 102, 103, 104, 105], dtype=np.float32))
+        agg.add_prediction(2, np.asarray([1, 2, 3, 4, 5, 6], dtype=np.float32))
+
+        selection = agg.selection_for_step(3)
+        self.assertIsNotNone(selection)
+        weights = np.exp(-2.0 * np.arange(3, dtype=np.float64))
+        weights = weights / np.sum(weights)
+        expected = float(np.sum(np.asarray([1003.0, 102.0, 2.0], dtype=np.float64) * weights))
+        self.assertAlmostEqual(selection.value, expected, places=12)
+        self.assertGreater(selection.value, 800.0)
+
+    def test_latest_returns_only_newest_step_aligned_contribution(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=8, mode="latest")
+        agg.add_prediction(5, np.asarray([50, 51, 52, 53, 54, 55, 56, 57], dtype=np.float32))
+        agg.add_prediction(6, np.asarray([60, 61, 62, 63, 64, 65, 66, 67], dtype=np.float32))
+        agg.add_prediction(7, np.asarray([70, 71, 72, 73, 74, 75, 76, 77], dtype=np.float32))
+
+        selection = agg.selection_for_step(7)
+        self.assertIsNotNone(selection)
+        self.assertAlmostEqual(selection.value, 70.0)
+        self.assertEqual(selection.contributor_count, 1)
+        self.assertAlmostEqual(selection.effective_age_frames, 0.0)
+
+    def test_all_modes_use_step_aligned_token_index(self):
+        chunks = {
+            10: np.asarray([1000, 1010, 1020, 1030, 1040, 1050], dtype=np.float32),
+            11: np.asarray([2000, 2010, 2020, 2030, 2040, 2050], dtype=np.float32),
+            12: np.asarray([3000, 3010, 3020, 3030, 3040, 3050], dtype=np.float32),
+        }
+        current_step = 13
+
+        full = TemporalAbsoluteAggregator(chunk_size=6, mode="full", decay=0.0)
+        latest = TemporalAbsoluteAggregator(chunk_size=6, mode="latest")
+        recent = TemporalAbsoluteAggregator(chunk_size=6, mode="recent", recent_window=3, recent_half_life=1.0)
+        for source_step, chunk in chunks.items():
+            full.add_prediction(source_step, chunk)
+            latest.add_prediction(source_step, chunk)
+            recent.add_prediction(source_step, chunk)
+
+        self.assertAlmostEqual(latest.selection_for_step(current_step).value, 3010.0)
+
+        full_expected = (1030.0 + 2020.0 + 3010.0) / 3.0
+        self.assertAlmostEqual(full.selection_for_step(current_step).value, full_expected)
+
+        weights = np.asarray([0.5 ** 3, 0.5 ** 2, 0.5 ** 1], dtype=np.float64)
+        weights = weights / np.sum(weights)
+        recent_expected = float(np.sum(np.asarray([1030.0, 2020.0, 3010.0]) * weights))
+        self.assertAlmostEqual(recent.selection_for_step(current_step).value, recent_expected)
+
+    def test_recent_window_three_half_life_one_has_relative_weights_1_2_4(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=10, mode="recent", recent_window=3, recent_half_life=1.0)
+        agg.add_prediction(0, np.asarray([0, 0, 0, 3, 0, 0, 0, 0, 0, 0], dtype=np.float32))
+        agg.add_prediction(1, np.asarray([0, 0, 4, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32))
+        agg.add_prediction(2, np.asarray([0, 5, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32))
+
+        selection = agg.selection_for_step(3)
+        self.assertIsNotNone(selection)
+        expected = (3.0 * 1.0 + 4.0 * 2.0 + 5.0 * 4.0) / 7.0
+        self.assertAlmostEqual(selection.value, expected, places=12)
+
+    def test_recent_window_five_half_life_one_has_relative_weights_1_2_4_8_16(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=12, mode="recent", recent_window=5, recent_half_life=1.0)
+        for source_step, value in enumerate([10, 20, 30, 40, 50]):
+            chunk = np.zeros((12,), dtype=np.float32)
+            chunk[5 - source_step] = float(value)
+            agg.add_prediction(source_step, chunk)
+
+        selection = agg.selection_for_step(5)
+        self.assertIsNotNone(selection)
+        expected = (10 * 1 + 20 * 2 + 30 * 4 + 40 * 8 + 50 * 16) / 31.0
+        self.assertAlmostEqual(selection.value, expected, places=12)
+
+    def test_recent_uses_available_contributors_during_startup(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=8, mode="recent", recent_window=5, recent_half_life=1.0)
+        agg.add_prediction(0, np.asarray([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.float32))
+        agg.add_prediction(1, np.asarray([10, 11, 12, 13, 14, 15, 16, 17], dtype=np.float32))
+
+        selection = agg.selection_for_step(1)
+        self.assertIsNotNone(selection)
+        self.assertEqual(selection.contributor_count, 2)
+        expected = (2.0 * 0.5 + 10.0 * 1.0) / 1.5
+        self.assertAlmostEqual(selection.value, expected, places=12)
+
+    def test_recent_ignores_contributions_older_than_recent_window(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=20, mode="recent", recent_window=3, recent_half_life=1.0)
+        for source_step in range(0, 7):
+            chunk = np.full((20,), fill_value=float(source_step), dtype=np.float32)
+            agg.add_prediction(source_step, chunk)
+
+        selection = agg.selection_for_step(6)
+        self.assertIsNotNone(selection)
+        weights = np.asarray([0.25, 0.5, 1.0], dtype=np.float64)
+        weights = weights / np.sum(weights)
+        expected = float(np.sum(np.asarray([4.0, 5.0, 6.0], dtype=np.float64) * weights))
+        self.assertEqual(selection.contributor_count, 3)
+        self.assertAlmostEqual(selection.value, expected, places=12)
+
+    def test_contributor_count_and_effective_age_for_all_modes(self):
+        chunk_size = 10
+        current_step = 5
+        source_steps = [2, 3, 4]
+
+        full = TemporalAbsoluteAggregator(chunk_size=chunk_size, mode="full", decay=0.2)
+        latest = TemporalAbsoluteAggregator(chunk_size=chunk_size, mode="latest")
+        recent = TemporalAbsoluteAggregator(
+            chunk_size=chunk_size,
+            mode="recent",
+            recent_window=3,
+            recent_half_life=1.0,
+        )
+
+        for source_step in source_steps:
+            chunk = np.zeros((chunk_size,), dtype=np.float32)
+            chunk[current_step - source_step] = float(100 + source_step)
+            full.add_prediction(source_step, chunk)
+            latest.add_prediction(source_step, chunk)
+            recent.add_prediction(source_step, chunk)
+
+        full_sel = full.selection_for_step(current_step)
+        latest_sel = latest.selection_for_step(current_step)
+        recent_sel = recent.selection_for_step(current_step)
+
+        self.assertEqual(full_sel.contributor_count, 3)
+        self.assertEqual(latest_sel.contributor_count, 1)
+        self.assertEqual(recent_sel.contributor_count, 3)
+
+        ages = np.asarray([3.0, 2.0, 1.0], dtype=np.float64)
+        full_weights = np.exp(-0.2 * np.arange(3, dtype=np.float64))
+        full_weights /= np.sum(full_weights)
+        self.assertAlmostEqual(full_sel.effective_age_frames, float(np.sum(ages * full_weights)), places=12)
+        self.assertAlmostEqual(latest_sel.effective_age_frames, 1.0, places=12)
+
+        recent_weights = np.asarray([0.125, 0.25, 0.5], dtype=np.float64)
+        recent_weights /= np.sum(recent_weights)
+        self.assertAlmostEqual(
+            recent_sel.effective_age_frames,
+            float(np.sum(ages * recent_weights)),
+            places=12,
+        )
+
+    def test_reset_removes_all_contributors(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=5, mode="recent", recent_window=3, recent_half_life=1.0)
+        agg.add_prediction(0, np.asarray([1, 2, 3, 4, 5], dtype=np.float32))
+        self.assertIsNotNone(agg.selection_for_step(0))
+        agg.reset()
+        self.assertIsNone(agg.selection_for_step(0))
+        self.assertIsNone(agg.value_for_step(0))
+
+    def test_invalid_constructor_values_raise_value_error(self):
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=0)
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, mode="unknown")
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, decay=-0.01)
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, decay=float("inf"))
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, recent_window=0)
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, recent_window=6)
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, recent_half_life=0.0)
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, recent_half_life=float("nan"))
+
+    def test_value_for_step_wrapper_remains_available(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=5, mode="latest")
+        agg.add_prediction(10, np.asarray([1, 2, 3, 4, 5], dtype=np.float32))
+        wrapped = agg.value_for_step(10)
+        selected = agg.selection_for_step(10)
+        self.assertIsNotNone(wrapped)
+        self.assertIsNotNone(selected)
+        self.assertAlmostEqual(wrapped, selected.value)
+
+    def test_cli_mode_resolution_rules(self):
+        self.assertEqual(resolve_temporal_agg_mode(None, None), "full")
+        self.assertEqual(resolve_temporal_agg_mode(None, True), "full")
+        self.assertEqual(resolve_temporal_agg_mode(None, False), "latest")
+        self.assertEqual(resolve_temporal_agg_mode("full", None), "full")
+        self.assertEqual(resolve_temporal_agg_mode("latest", None), "latest")
+        self.assertEqual(resolve_temporal_agg_mode("recent", None), "recent")
+        with self.assertRaises(ValueError):
+            resolve_temporal_agg_mode("full", True)
+        with self.assertRaises(ValueError):
+            resolve_temporal_agg_mode("latest", False)
 
 
 if __name__ == "__main__":

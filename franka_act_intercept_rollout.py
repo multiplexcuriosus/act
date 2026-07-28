@@ -24,6 +24,7 @@ from intercept_rollout_contract import (
     build_rgb_history_tensor,
     denormalize_delta_chunk,
     extract_arm_qpos,
+    resolve_temporal_agg_mode,
     select_sync_observation,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
@@ -63,7 +64,9 @@ class FrankaActRolloutNode(Node):
         self.fps = args.fps
         if self.fps <= 0.0:
             raise ValueError(f"fps must be > 0, got {self.fps}")
-        self.temporal_agg = args.temporal_agg
+        self.temporal_agg_mode = str(args.temporal_agg_mode)
+        self.recent_agg_window = int(args.recent_agg_window)
+        self.recent_agg_half_life = float(args.recent_agg_half_life)
         self.state_dim = args.state_dim
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
@@ -148,7 +151,12 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(f"Loaded checkpoint: {ckpt_path}")
 
         self.pre_process = lambda s: (s - self.qpos_mean) / self.qpos_std
-        self.aggregator = TemporalAbsoluteAggregator(self.chunk_size)
+        self.aggregator = TemporalAbsoluteAggregator(
+            chunk_size=self.chunk_size,
+            mode=self.temporal_agg_mode,
+            recent_window=self.recent_agg_window,
+            recent_half_life=self.recent_agg_half_life,
+        )
 
         self.prediction_pub = self.create_publisher(Float64MultiArray, self.prediction_topic, 10)
         self.prediction_current_pub = None
@@ -180,7 +188,9 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(f"joint_topic={self.joint_topic}")
         self.get_logger().info(f"current_tcp_s_topic={self.current_tcp_s_topic}")
         self.get_logger().info(f"temporal_agg_reset_service={self.temporal_agg_reset_service}")
-        self.get_logger().info(f"temporal_agg_enabled={self.temporal_agg}")
+        self.get_logger().info(f"temporal_agg_mode={self.temporal_agg_mode}")
+        self.get_logger().info(f"recent_agg_window={self.recent_agg_window}")
+        self.get_logger().info(f"recent_agg_half_life={self.recent_agg_half_life}")
         self.get_logger().info(f"prediction_chunk_topic={self.prediction_topic}")
         self.get_logger().info("prediction_chunk_msg_type=std_msgs/msg/Float64MultiArray")
         self.get_logger().info(f"prediction_current_topic={self.prediction_current_topic}")
@@ -496,15 +506,17 @@ class FrankaActRolloutNode(Node):
                 raise RuntimeError("Absolute-s chunk contains non-finite values")
 
             with self._aggregation_lock:
-                if not self.temporal_agg:
-                    self.aggregator.reset()
                 self.aggregator.add_prediction(self.step_index, absolute_s)
-                aggregated = self.aggregator.value_for_step(self.step_index)
-            if aggregated is None:
+                selection = self.aggregator.selection_for_step(self.step_index)
+            if selection is None:
                 raise RuntimeError("Temporal aggregator produced no current value")
-            if not np.isfinite(aggregated):
+            if not np.isfinite(selection.value):
                 raise ValueError("Temporal aggregator produced non-finite current absolute-s")
-            current_value = float(aggregated)
+            if not np.isfinite(selection.effective_age_frames):
+                raise ValueError("Temporal aggregator produced non-finite effective age")
+            current_value = float(selection.value)
+            agg_contributors = int(selection.contributor_count)
+            agg_effective_age_frames = float(selection.effective_age_frames)
         except Exception:
             with self._aggregation_lock:
                 self.failed_or_stale_inference_gap_count += 1
@@ -529,6 +541,7 @@ class FrankaActRolloutNode(Node):
 
         now_wall = time.time()
         if (now_wall - self._last_diag_log_sec) >= self.diag_log_period_sec:
+            agg_effective_age_ms = 1000.0 * agg_effective_age_frames / self.fps
             self.get_logger().info(
                 "Inference diagnostics: "
                 f"step={self.step_index} "
@@ -538,7 +551,11 @@ class FrankaActRolloutNode(Node):
                 f"agg_resets_gap={self.aggregation_reset_gap_count} "
                 f"backward_timestamps={self.backward_anchor_count} "
                 f"failed_or_stale_gaps={self.failed_or_stale_inference_gap_count} "
-            f"rollout_epoch={self.rollout_epoch} "
+                f"rollout_epoch={self.rollout_epoch} "
+                f"agg_mode={self.temporal_agg_mode} "
+                f"agg_contributors={agg_contributors} "
+                f"agg_effective_age_frames={agg_effective_age_frames:.4f} "
+                f"agg_effective_age_ms={agg_effective_age_ms:.2f} "
                 f"history_indices={list(sync.history_indices)} "
                 f"rgb_ts={[round(ts, 6) for ts in sync.rgb_timestamps]} "
                 f"qpos_ts={[round(ts, 6) for ts in sync.qpos_timestamps]} "
@@ -616,9 +633,37 @@ def main():
     parser.add_argument("--kl_weight", type=int, default=10)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--dim_feedforward", type=int, default=3200)
-    parser.add_argument("--temporal_agg", "--temporal-agg", dest="temporal_agg", action="store_true")
-    parser.add_argument("--no-temporal-agg", dest="temporal_agg", action="store_false")
-    parser.set_defaults(temporal_agg=True)
+    parser.add_argument(
+        "--temporal-agg-mode",
+        choices=["full", "latest", "recent"],
+        default=None,
+    )
+    parser.add_argument(
+        "--recent-agg-window",
+        type=int,
+        choices=[3, 4, 5],
+        default=5,
+    )
+    parser.add_argument(
+        "--recent-agg-half-life",
+        type=float,
+        default=1.0,
+    )
+    legacy_temporal_agg_group = parser.add_mutually_exclusive_group()
+    legacy_temporal_agg_group.add_argument(
+        "--temporal_agg",
+        "--temporal-agg",
+        dest="temporal_agg_legacy",
+        action="store_const",
+        const=True,
+    )
+    legacy_temporal_agg_group.add_argument(
+        "--no-temporal-agg",
+        dest="temporal_agg_legacy",
+        action="store_const",
+        const=False,
+    )
+    parser.set_defaults(temporal_agg_legacy=None)
 
     parser.add_argument("--enc_layers", type=int, default=4)
     parser.add_argument("--dec_layers", type=int, default=7)
@@ -634,6 +679,13 @@ def main():
     parser.set_defaults(use_bce_last_action_dim=False)
 
     args = parser.parse_args()
+    try:
+        args.temporal_agg_mode = resolve_temporal_agg_mode(
+            temporal_agg_mode=args.temporal_agg_mode,
+            temporal_agg_legacy=args.temporal_agg_legacy,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if int(args.state_dim) != 21:
         raise ValueError(f"Interception rollout requires --state_dim 21, got {args.state_dim}")

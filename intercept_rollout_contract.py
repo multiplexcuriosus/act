@@ -48,12 +48,47 @@ class SyncSelection:
     qpos_history: np.ndarray
 
 
+@dataclass(frozen=True)
+class AggregationSelection:
+    value: float
+    contributor_count: int
+    effective_age_frames: float
+
+
 class TemporalAbsoluteAggregator:
     """Aggregate per-step absolute predictions from chunked receding-horizon outputs."""
 
-    def __init__(self, chunk_size: int, decay: float = 0.01) -> None:
+    def __init__(
+        self,
+        chunk_size: int,
+        mode: str = "full",
+        decay: float = 0.01,
+        recent_window: int = 5,
+        recent_half_life: float = 1.0,
+    ) -> None:
         self.chunk_size = int(chunk_size)
+        self.mode = str(mode)
         self.decay = float(decay)
+        self.recent_window = int(recent_window)
+        self.recent_half_life = float(recent_half_life)
+
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {self.chunk_size}")
+        if self.mode not in {"full", "latest", "recent"}:
+            raise ValueError(f"mode must be one of full/latest/recent, got {self.mode!r}")
+        if not math.isfinite(self.decay) or self.decay < 0.0:
+            raise ValueError(f"decay must be finite and >= 0, got {self.decay}")
+        if self.recent_window <= 0 or self.recent_window > self.chunk_size:
+            raise ValueError(
+                "recent_window must be a positive integer not exceeding chunk_size, "
+                f"got recent_window={self.recent_window}, chunk_size={self.chunk_size}"
+            )
+        if not math.isfinite(self.recent_half_life) or self.recent_half_life <= 0.0:
+            raise ValueError(
+                "recent_half_life must be finite and > 0, "
+                f"got {self.recent_half_life}"
+            )
+
         self._history: List[Tuple[int, np.ndarray]] = []
 
     def reset(self) -> None:
@@ -70,19 +105,89 @@ class TemporalAbsoluteAggregator:
         min_step = int(step_index) - self.chunk_size
         self._history = [item for item in self._history if item[0] >= min_step]
 
-    def value_for_step(self, current_step: int) -> Optional[float]:
-        values: List[float] = []
+    def _valid_contributions_for_step(self, current_step: int) -> List[Tuple[int, float, int]]:
+        contributions: List[Tuple[int, float, int]] = []
         for source_step, chunk in self._history:
             token_index = int(current_step) - int(source_step)
             if 0 <= token_index < self.chunk_size:
-                values.append(float(chunk[token_index]))
+                contributions.append((int(source_step), float(chunk[token_index]), int(token_index)))
+        return contributions
 
-        if not values:
+    def selection_for_step(self, current_step: int) -> Optional[AggregationSelection]:
+        contributions = self._valid_contributions_for_step(current_step)
+        if not contributions:
             return None
 
+        current_step_i = int(current_step)
+
+        if self.mode == "latest":
+            source_step, value, _token_index = max(contributions, key=lambda item: item[0])
+            age = float(current_step_i - source_step)
+            return AggregationSelection(
+                value=float(value),
+                contributor_count=1,
+                effective_age_frames=age,
+            )
+
+        if self.mode == "recent":
+            newest = sorted(contributions, key=lambda item: item[0], reverse=True)[: self.recent_window]
+            newest_sorted = sorted(newest, key=lambda item: item[0])
+            values = np.asarray([item[1] for item in newest_sorted], dtype=np.float64)
+            ages = np.asarray(
+                [float(current_step_i - item[0]) for item in newest_sorted],
+                dtype=np.float64,
+            )
+            weights = np.power(0.5, ages / self.recent_half_life)
+            weights = weights / np.sum(weights)
+            return AggregationSelection(
+                value=float(np.sum(values * weights)),
+                contributor_count=int(values.shape[0]),
+                effective_age_frames=float(np.sum(ages * weights)),
+            )
+
+        # Legacy full mode behavior: keep oldest-first values and exp(-decay * arange)
+        values = np.asarray([item[1] for item in contributions], dtype=np.float64)
+        ages = np.asarray(
+            [float(current_step_i - item[0]) for item in contributions],
+            dtype=np.float64,
+        )
         weights = np.exp(-self.decay * np.arange(len(values), dtype=np.float64))
         weights = weights / np.sum(weights)
-        return float(np.sum(np.asarray(values, dtype=np.float64) * weights))
+        return AggregationSelection(
+            value=float(np.sum(values * weights)),
+            contributor_count=int(values.shape[0]),
+            effective_age_frames=float(np.sum(ages * weights)),
+        )
+
+    def value_for_step(self, current_step: int) -> Optional[float]:
+        selection = self.selection_for_step(current_step)
+        if selection is None:
+            return None
+        return float(selection.value)
+
+
+def resolve_temporal_agg_mode(
+    temporal_agg_mode: Optional[str],
+    temporal_agg_legacy: Optional[bool],
+) -> str:
+    if temporal_agg_mode is not None and temporal_agg_legacy is not None:
+        raise ValueError(
+            "Cannot combine legacy temporal-aggregation flags with --temporal-agg-mode"
+        )
+
+    if temporal_agg_mode is not None:
+        if temporal_agg_mode not in {"full", "latest", "recent"}:
+            raise ValueError(
+                f"Invalid temporal aggregation mode {temporal_agg_mode!r}; "
+                "expected one of full/latest/recent"
+            )
+        return temporal_agg_mode
+
+    if temporal_agg_legacy is None:
+        return "full"
+    if temporal_agg_legacy:
+        return "full"
+    return "latest"
 
 
 def compute_history_indices(anchor_index: int, history_offsets: Sequence[int]) -> List[int]:
