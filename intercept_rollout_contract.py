@@ -65,12 +65,14 @@ class TemporalAbsoluteAggregator:
         decay: float = 0.01,
         recent_window: int = 5,
         recent_half_life: float = 1.0,
+        lookahead_steps: int = 0,
     ) -> None:
         self.chunk_size = int(chunk_size)
         self.mode = str(mode)
         self.decay = float(decay)
         self.recent_window = int(recent_window)
         self.recent_half_life = float(recent_half_life)
+        self.lookahead_steps = int(lookahead_steps)
 
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0, got {self.chunk_size}")
@@ -87,6 +89,21 @@ class TemporalAbsoluteAggregator:
             raise ValueError(
                 "recent_half_life must be finite and > 0, "
                 f"got {self.recent_half_life}"
+            )
+        if self.lookahead_steps < 0:
+            raise ValueError(
+                f"lookahead_steps must be >= 0, got {self.lookahead_steps}"
+            )
+        if self.lookahead_steps >= self.chunk_size:
+            raise ValueError(
+                f"lookahead_steps must be < chunk_size, got lookahead_steps={self.lookahead_steps}, "
+                f"chunk_size={self.chunk_size}"
+            )
+        if self.mode == "recent" and self.recent_window > (self.chunk_size - self.lookahead_steps):
+            raise ValueError(
+                "recent_window must be <= chunk_size - lookahead_steps for mode=recent, "
+                f"got recent_window={self.recent_window}, chunk_size={self.chunk_size}, "
+                f"lookahead_steps={self.lookahead_steps}"
             )
 
         self._history: List[Tuple[int, np.ndarray]] = []
@@ -108,8 +125,11 @@ class TemporalAbsoluteAggregator:
     def _valid_contributions_for_step(self, current_step: int) -> List[Tuple[int, float, int]]:
         contributions: List[Tuple[int, float, int]] = []
         for source_step, chunk in self._history:
-            token_index = int(current_step) - int(source_step)
-            if 0 <= token_index < self.chunk_size:
+            source_age = int(current_step) - int(source_step)
+            if source_age < 0:
+                continue
+            token_index = source_age + self.lookahead_steps
+            if token_index < self.chunk_size:
                 contributions.append((int(source_step), float(chunk[token_index]), int(token_index)))
         return contributions
 

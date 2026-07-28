@@ -144,6 +144,35 @@ class InterceptRolloutContractTests(unittest.TestCase):
     def test_default_constructor_selects_full_mode(self):
         agg = TemporalAbsoluteAggregator(chunk_size=5)
         self.assertEqual(agg.mode, "full")
+        self.assertEqual(agg.lookahead_steps, 0)
+
+    def test_lookahead_zero_preserves_existing_behavior_for_all_modes(self):
+        chunk_old = np.asarray([100, 101, 102, 103, 104, 105], dtype=np.float32)
+        chunk_new = np.asarray([200, 201, 202, 203, 204, 205], dtype=np.float32)
+        current_step = 4
+
+        full = TemporalAbsoluteAggregator(chunk_size=6, mode="full", decay=0.0, lookahead_steps=0)
+        latest = TemporalAbsoluteAggregator(chunk_size=6, mode="latest", lookahead_steps=0)
+        recent = TemporalAbsoluteAggregator(
+            chunk_size=6,
+            mode="recent",
+            recent_window=2,
+            recent_half_life=1.0,
+            lookahead_steps=0,
+        )
+
+        full.add_prediction(3, chunk_old)
+        full.add_prediction(4, chunk_new)
+        latest.add_prediction(3, chunk_old)
+        latest.add_prediction(4, chunk_new)
+        recent.add_prediction(3, chunk_old)
+        recent.add_prediction(4, chunk_new)
+
+        # L=0 uses token index = current_step - source_step.
+        self.assertAlmostEqual(latest.selection_for_step(current_step).value, 200.0)
+        self.assertAlmostEqual(full.selection_for_step(current_step).value, (101.0 + 200.0) / 2.0)
+        recent_expected = (101.0 * 0.5 + 200.0 * 1.0) / 1.5
+        self.assertAlmostEqual(recent.selection_for_step(current_step).value, recent_expected)
 
     def test_full_mode_matches_legacy_weighted_result_exactly(self):
         agg = TemporalAbsoluteAggregator(chunk_size=8, mode="full", decay=0.25)
@@ -191,6 +220,38 @@ class InterceptRolloutContractTests(unittest.TestCase):
         self.assertAlmostEqual(selection.value, 70.0)
         self.assertEqual(selection.contributor_count, 1)
         self.assertAlmostEqual(selection.effective_age_frames, 0.0)
+
+    def test_latest_with_lookahead_five_uses_token_five_from_newest_chunk(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=12, mode="latest", lookahead_steps=5)
+        agg.add_prediction(9, np.asarray([900, 901, 902, 903, 904, 905, 906, 907, 908, 909, 910, 911], dtype=np.float32))
+        agg.add_prediction(10, np.asarray([1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011], dtype=np.float32))
+
+        selection = agg.selection_for_step(10)
+        self.assertIsNotNone(selection)
+        self.assertAlmostEqual(selection.value, 1005.0)
+        self.assertEqual(selection.contributor_count, 1)
+        self.assertAlmostEqual(selection.effective_age_frames, 0.0)
+
+    def test_recent_with_lookahead_uses_step_shifted_tokens_and_weights_1_2_4(self):
+        agg = TemporalAbsoluteAggregator(
+            chunk_size=12,
+            mode="recent",
+            recent_window=3,
+            recent_half_life=1.0,
+            lookahead_steps=5,
+        )
+        # At current_step=10 and L=5, expected tokens are oldest->newest: 7, 6, 5.
+        old_chunk = np.asarray([0, 0, 0, 0, 0, 0, 0, 307, 0, 0, 0, 0], dtype=np.float32)   # source 8 -> token 7
+        mid_chunk = np.asarray([0, 0, 0, 0, 0, 0, 406, 0, 0, 0, 0, 0], dtype=np.float32)   # source 9 -> token 6
+        new_chunk = np.asarray([0, 0, 0, 0, 0, 505, 0, 0, 0, 0, 0, 0], dtype=np.float32)   # source 10 -> token 5
+        agg.add_prediction(8, old_chunk)
+        agg.add_prediction(9, mid_chunk)
+        agg.add_prediction(10, new_chunk)
+
+        selection = agg.selection_for_step(10)
+        self.assertIsNotNone(selection)
+        expected = (307.0 * 1.0 + 406.0 * 2.0 + 505.0 * 4.0) / 7.0
+        self.assertAlmostEqual(selection.value, expected, places=12)
 
     def test_all_modes_use_step_aligned_token_index(self):
         chunks = {
@@ -266,6 +327,72 @@ class InterceptRolloutContractTests(unittest.TestCase):
         self.assertEqual(selection.contributor_count, 3)
         self.assertAlmostEqual(selection.value, expected, places=12)
 
+    def test_full_with_lookahead_uses_source_age_plus_lookahead_and_legacy_order(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=12, mode="full", decay=0.3, lookahead_steps=5)
+        agg.add_prediction(8, np.asarray([800, 801, 802, 803, 804, 805, 806, 807, 808, 809, 810, 811], dtype=np.float32))
+        agg.add_prediction(9, np.asarray([900, 901, 902, 903, 904, 905, 906, 907, 908, 909, 910, 911], dtype=np.float32))
+        agg.add_prediction(10, np.asarray([1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011], dtype=np.float32))
+
+        # current_step=10, L=5 => tokens oldest->newest: 7, 6, 5 => values 807, 906, 1005
+        selection = agg.selection_for_step(10)
+        self.assertIsNotNone(selection)
+        values = np.asarray([807.0, 906.0, 1005.0], dtype=np.float64)
+        weights = np.exp(-0.3 * np.arange(3, dtype=np.float64))
+        weights = weights / np.sum(weights)
+        expected = float(np.sum(values * weights))
+        self.assertAlmostEqual(selection.value, expected, places=12)
+
+    def test_all_contributions_align_to_same_future_timestep(self):
+        chunk_size = 20
+        current_step = 10
+        lookahead = 5
+        agg = TemporalAbsoluteAggregator(
+            chunk_size=chunk_size,
+            mode="full",
+            decay=0.0,
+            lookahead_steps=lookahead,
+        )
+
+        # chunk[k] = source_step + k + 1 => selected value should be current_step + L + 1 for all contributors.
+        for source_step in (8, 9, 10):
+            chunk = np.asarray([source_step + k + 1 for k in range(chunk_size)], dtype=np.float32)
+            agg.add_prediction(source_step, chunk)
+
+        expected_value = float(current_step + lookahead + 1)
+        contributions = agg._valid_contributions_for_step(current_step)
+        self.assertEqual(len(contributions), 3)
+        for _source_step, value, _token_index in contributions:
+            self.assertAlmostEqual(value, expected_value)
+
+    def test_future_source_step_is_rejected_even_with_positive_lookahead(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=12, mode="full", lookahead_steps=5)
+        agg.add_prediction(11, np.asarray([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], dtype=np.float32))
+        self.assertIsNone(agg.selection_for_step(10))
+
+    def test_contributions_exceeding_chunk_after_lookahead_are_excluded(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=12, mode="full", lookahead_steps=5, decay=0.0)
+        agg.add_prediction(0, np.asarray([10 + k for k in range(12)], dtype=np.float32))
+        agg.add_prediction(8, np.asarray([80 + k for k in range(12)], dtype=np.float32))
+
+        # current_step=10: source 0 => token 15 invalid; source 8 => token 7 valid
+        selection = agg.selection_for_step(10)
+        self.assertIsNotNone(selection)
+        self.assertEqual(selection.contributor_count, 1)
+        self.assertAlmostEqual(selection.value, 87.0)
+
+    def test_latest_allows_maximum_valid_lookahead(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=30, mode="latest", lookahead_steps=29)
+        newest = np.asarray([1000 + k for k in range(30)], dtype=np.float32)
+        agg.add_prediction(42, newest)
+        selection = agg.selection_for_step(42)
+        self.assertIsNotNone(selection)
+        self.assertAlmostEqual(selection.value, 1029.0)
+
+    def test_large_lookahead_is_valid_for_latest_even_if_recent_default_window_would_not_fit(self):
+        agg = TemporalAbsoluteAggregator(chunk_size=6, mode="latest", lookahead_steps=5)
+        agg.add_prediction(3, np.asarray([30, 31, 32, 33, 34, 35], dtype=np.float32))
+        self.assertAlmostEqual(agg.selection_for_step(3).value, 35.0)
+
     def test_contributor_count_and_effective_age_for_all_modes(self):
         chunk_size = 10
         current_step = 5
@@ -334,6 +461,17 @@ class InterceptRolloutContractTests(unittest.TestCase):
             TemporalAbsoluteAggregator(chunk_size=5, recent_half_life=0.0)
         with self.assertRaises(ValueError):
             TemporalAbsoluteAggregator(chunk_size=5, recent_half_life=float("nan"))
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, lookahead_steps=-1)
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(chunk_size=5, lookahead_steps=5)
+        with self.assertRaises(ValueError):
+            TemporalAbsoluteAggregator(
+                chunk_size=10,
+                mode="recent",
+                recent_window=6,
+                lookahead_steps=5,
+            )
 
     def test_value_for_step_wrapper_remains_available(self):
         agg = TemporalAbsoluteAggregator(chunk_size=5, mode="latest")
@@ -355,6 +493,27 @@ class InterceptRolloutContractTests(unittest.TestCase):
             resolve_temporal_agg_mode("full", True)
         with self.assertRaises(ValueError):
             resolve_temporal_agg_mode("latest", False)
+
+    def test_effective_age_frames_does_not_include_lookahead(self):
+        agg = TemporalAbsoluteAggregator(
+            chunk_size=12,
+            mode="recent",
+            recent_window=3,
+            recent_half_life=1.0,
+            lookahead_steps=5,
+        )
+        for source_step in (8, 9, 10):
+            chunk = np.zeros((12,), dtype=np.float32)
+            chunk[(10 - source_step) + 5] = float(100 + source_step)
+            agg.add_prediction(source_step, chunk)
+
+        selection = agg.selection_for_step(10)
+        self.assertIsNotNone(selection)
+        ages = np.asarray([2.0, 1.0, 0.0], dtype=np.float64)
+        weights = np.asarray([0.25, 0.5, 1.0], dtype=np.float64)
+        weights /= np.sum(weights)
+        expected_age = float(np.sum(ages * weights))
+        self.assertAlmostEqual(selection.effective_age_frames, expected_age, places=12)
 
 
 if __name__ == "__main__":

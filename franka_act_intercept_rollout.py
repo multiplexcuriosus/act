@@ -67,6 +67,9 @@ class FrankaActRolloutNode(Node):
         self.temporal_agg_mode = str(args.temporal_agg_mode)
         self.recent_agg_window = int(args.recent_agg_window)
         self.recent_agg_half_life = float(args.recent_agg_half_life)
+        self.action_lookahead_steps = int(args.action_lookahead_steps)
+        self.selected_target_offset_frames = int(self.action_lookahead_steps + 1)
+        self.selected_target_offset_ms = 1000.0 * float(self.selected_target_offset_frames) / float(self.fps)
         self.state_dim = args.state_dim
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
@@ -156,6 +159,7 @@ class FrankaActRolloutNode(Node):
             mode=self.temporal_agg_mode,
             recent_window=self.recent_agg_window,
             recent_half_life=self.recent_agg_half_life,
+            lookahead_steps=self.action_lookahead_steps,
         )
 
         self.prediction_pub = self.create_publisher(Float64MultiArray, self.prediction_topic, 10)
@@ -191,6 +195,9 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(f"temporal_agg_mode={self.temporal_agg_mode}")
         self.get_logger().info(f"recent_agg_window={self.recent_agg_window}")
         self.get_logger().info(f"recent_agg_half_life={self.recent_agg_half_life}")
+        self.get_logger().info(f"action_lookahead_steps={self.action_lookahead_steps}")
+        self.get_logger().info(f"selected_target_offset_frames={self.selected_target_offset_frames}")
+        self.get_logger().info(f"selected_target_offset_ms={self.selected_target_offset_ms:.2f}")
         self.get_logger().info(f"prediction_chunk_topic={self.prediction_topic}")
         self.get_logger().info("prediction_chunk_msg_type=std_msgs/msg/Float64MultiArray")
         self.get_logger().info(f"prediction_current_topic={self.prediction_current_topic}")
@@ -556,6 +563,9 @@ class FrankaActRolloutNode(Node):
                 f"agg_contributors={agg_contributors} "
                 f"agg_effective_age_frames={agg_effective_age_frames:.4f} "
                 f"agg_effective_age_ms={agg_effective_age_ms:.2f} "
+                f"action_lookahead_steps={self.action_lookahead_steps} "
+                f"selected_target_offset_frames={self.selected_target_offset_frames} "
+                f"selected_target_offset_ms={self.selected_target_offset_ms:.2f} "
                 f"history_indices={list(sync.history_indices)} "
                 f"rgb_ts={[round(ts, 6) for ts in sync.rgb_timestamps]} "
                 f"qpos_ts={[round(ts, 6) for ts in sync.qpos_timestamps]} "
@@ -649,6 +659,11 @@ def main():
         type=float,
         default=1.0,
     )
+    parser.add_argument(
+        "--action-lookahead-steps",
+        type=int,
+        default=0,
+    )
     legacy_temporal_agg_group = parser.add_mutually_exclusive_group()
     legacy_temporal_agg_group.add_argument(
         "--temporal_agg",
@@ -701,6 +716,21 @@ def main():
         raise ValueError(f"Interception rollout requires --image_size 320, got {args.image_size}")
     if args.use_bce_last_action_dim:
         raise ValueError("Interception rollout forbids --use_bce_last_action_dim")
+    if int(args.action_lookahead_steps) < 0 or int(args.action_lookahead_steps) >= int(args.chunk_size):
+        parser.error(
+            "--action-lookahead-steps must satisfy 0 <= value < chunk_size; "
+            f"got value={args.action_lookahead_steps}, chunk_size={args.chunk_size}"
+        )
+    if (
+        str(args.temporal_agg_mode) == "recent"
+        and int(args.recent_agg_window) > int(args.chunk_size) - int(args.action_lookahead_steps)
+    ):
+        parser.error(
+            "For --temporal-agg-mode recent, --recent-agg-window must be <= chunk_size - "
+            "action_lookahead_steps; "
+            f"got recent_agg_window={args.recent_agg_window}, "
+            f"chunk_size={args.chunk_size}, action_lookahead_steps={args.action_lookahead_steps}"
+        )
 
     rclpy.init()
     node = FrankaActRolloutNode(args)
