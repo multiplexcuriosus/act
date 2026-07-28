@@ -25,6 +25,7 @@ from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from utils import INTERCEPT_HISTORY_OFFSETS_DEFAULT
 from policy import ACTPolicy, ACTTaskPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
+from utils import INTERCEPT_STATS_METADATA_BY_TARGET
 
 from sim_env import BOX_POSE
 
@@ -135,6 +136,12 @@ def _validate_eval_image_config(config, stats):
 
 
 def _validate_intercept_checkpoint_metadata(config, stats):
+    intercept_target = stats.get('intercept_target')
+    if intercept_target not in INTERCEPT_STATS_METADATA_BY_TARGET:
+        raise ValueError(
+            f"Missing or unsupported interception checkpoint metadata in dataset_stats.pkl: intercept_target={intercept_target!r}"
+        )
+
     required_equal = {
         'data_mode': 'intercept',
         'raw_qpos_dim': 7,
@@ -146,13 +153,9 @@ def _validate_intercept_checkpoint_metadata(config, stats):
         'rgb_frame_order': 'oldest_to_newest',
         'qpos_flatten_order': 'oldest_to_newest',
         'image_channels': 9,
-        'action_type': 'measured_tcp_s_delta',
-        'action_representation': 'future_delta_relative_to_anchor',
-        'action_anchor_offset': 0,
-        'action_first_target_offset': 1,
-        'action_positive_direction': 'robot_base_positive_x',
-        'action_units': 'm',
     }
+
+    required_equal.update(INTERCEPT_STATS_METADATA_BY_TARGET[intercept_target])
 
     for key, expected in required_equal.items():
         if key not in stats:
@@ -454,6 +457,7 @@ def main(args):
             raw_qpos_dim=7,
             state_dim=state_dim,
             action_dim=action_dim,
+            intercept_target=args['intercept_target'],
             image_size=image_size,
             rgb_history_frames=rgb_history_frames,
             history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
@@ -505,12 +509,6 @@ def main(args):
         stats['action_dim'] = 1
         stats['qpos_history_offsets'] = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)
         stats['qpos_flatten_order'] = 'oldest_to_newest'
-        stats['action_type'] = 'measured_tcp_s_delta'
-        stats['action_representation'] = 'future_delta_relative_to_anchor'
-        stats['action_anchor_offset'] = 0
-        stats['action_first_target_offset'] = 1
-        stats['action_positive_direction'] = 'robot_base_positive_x'
-        stats['action_units'] = 'm'
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
@@ -1295,6 +1293,7 @@ if __name__ == '__main__':
         help='RGB history frame count. Defaults by mode: intercept=3 using spaced offsets [-6,-3,0], other modes=1.'
     )
     parser.add_argument('--data_mode', choices=['joint', 'intercept', 'pose'], required=True, help='dataset mode')
+    parser.add_argument('--intercept_target', choices=['measured_tcp_trajectory', 'desired_goal'], default='measured_tcp_trajectory', help='interception target mode')
     parser.add_argument('--state_dim', action='store', type=int, required=False, default=None, help='state dimension (joint requires explicit value; intercept defaults to 21 and rejects other values; optional override for pose mode)')
     parser.add_argument('--action_dim', action='store', type=int, required=False, default=None, help='action dimension (joint requires explicit value; intercept defaults to 1 and rejects other values; optional override for pose mode)')
     parser.add_argument('--photometric_aug', action='store_true', help='enable photometric augmentation (ColorJitter on non-event images only)')

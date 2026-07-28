@@ -2,8 +2,13 @@
 set -euo pipefail
 
 DATASETS=(
-  "/home/dyros/Data/jg_data/hdf5/hdf5_20260727_133739_pipeline_test"
+  "/home/dyros/Data/jg_data/hdf5/hdf5_20260728_225008"
+  "/home/dyros/Data/jg_data/hdf5/hdf5_20260727_215525"
+
 )
+
+
+
 
 # HDF5 qpos remains (T, 7), but the loader concatenates:
 # qpos[t-6], qpos[t-3], qpos[t] -> model state dimension 21.
@@ -15,7 +20,7 @@ RGB_HISTORY_FRAMES=3
 CHUNK_SIZE=30
 
 DATASET_NAME="$(basename "${DATASETS[0]}")"
-BASE_CKPT="/home/dyros/Data/jg_data/ckpts/${DATASET_NAME}_$(date +%Y%m%d_%H%M%S)"
+BASE_CKPT="/home/dyros/Data/jg_data/ckpts/${DATASET_NAME}_$(date +%Y%m%d_%H%M%S)_"
 mkdir -p "$BASE_CKPT"
 
 if [[ -f "$0" ]]; then
@@ -25,9 +30,9 @@ fi
 CAMERA_MODES=(rgb)
 
 for IMAGE_SIZE in 320; do
-  for LR in 2e-5 1e-5; do
-    for BS in 32 16 8; do
-      for KL in 1 10; do
+  for LR in 1e-5 2e-5; do
+    for BS in 4 8 16; do
+      for KL in 1 5; do
         for CAM_MODE in "${CAMERA_MODES[@]}"; do
 
           case "$CAM_MODE" in

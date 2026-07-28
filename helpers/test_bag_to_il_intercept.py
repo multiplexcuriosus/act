@@ -95,6 +95,7 @@ class BagToIlInterceptTests(unittest.TestCase):
             joint="/joint_states",
             episode="/episode/control",
             current_tcp_s="/middle_line/current_tcp_s",
+            selected_goto_s="/interception_controller/selected_goto_s",
             goto_s="/trajectory_executor/executed_goto_s",
             goto_s_target_base="/trajectory_executor/executed_goto_s_target_base",
         )
@@ -102,7 +103,7 @@ class BagToIlInterceptTests(unittest.TestCase):
     def make_episode(self):
         return self.mod.EpisodeWindow(source_idx=0, output_idx=0, start=0.0, end=0.4)
 
-    def make_sampling_data(self, tcp_times, tcp_values, goto_values=None):
+    def make_sampling_data(self, tcp_times, tcp_values, goto_values=None, selected_goal_values=(0.10,)):
         rgb0 = np.array([[[0, 0, 255]]], dtype=np.uint8)
         rgb1 = np.array([[[0, 255, 0]]], dtype=np.uint8)
         rgb2 = np.array([[[255, 0, 0]]], dtype=np.uint8)
@@ -122,6 +123,8 @@ class BagToIlInterceptTests(unittest.TestCase):
             ],
             "current_tcp_s_t": list(tcp_times),
             "current_tcp_s": list(tcp_values),
+            "selected_goto_s_t": [0.15 + 0.1 * i for i in range(len(selected_goal_values))],
+            "selected_goto_s": list(selected_goal_values),
             "goto_s_t": [],
             "goto_s": [],
             "target_base_t": [],
@@ -321,8 +324,43 @@ class BagToIlInterceptTests(unittest.TestCase):
             )
             with h5py.File(out_path, "r") as h5:
                 self.assertIn("commands", h5)
+                self.assertIn("selected_goto_s", h5["commands"])
+                self.assertIn("targets", h5)
+                self.assertIn("desired_intercept_s", h5["targets"])
                 self.assertIn("goto_s", h5["commands"])
                 self.assertEqual(int(h5.attrs["command_count"]), 0)
+                self.assertEqual(h5["targets/desired_intercept_s"].shape, (1,))
+                self.assertTrue(np.isfinite(h5["targets/desired_intercept_s"][0]))
+                self.assertEqual(int(h5["commands/selected_goto_s/values"].shape[0]), 1)
+
+    def test_selected_goal_event_count_must_be_exactly_one(self):
+        for selected_goal_values in ((), (0.1, 0.2)):
+            data = self.make_sampling_data(
+                tcp_times=[0.0, 0.1, 0.2],
+                tcp_values=[-1.0, 0.5, 2.0],
+                selected_goal_values=selected_goal_values,
+            )
+            with self.assertRaises(RuntimeError):
+                self.mod.sample_episode(
+                    data=data,
+                    episode=self.make_episode(),
+                    fps=10.0,
+                    max_current_tcp_s_age_sec=0.2,
+                )
+
+    def test_non_finite_selected_goal_rejected(self):
+        data = self.make_sampling_data(
+            tcp_times=[0.0, 0.1, 0.2],
+            tcp_values=[-1.0, 0.5, 2.0],
+            selected_goal_values=(np.nan,),
+        )
+        with self.assertRaises(RuntimeError):
+            self.mod.sample_episode(
+                data=data,
+                episode=self.make_episode(),
+                fps=10.0,
+                max_current_tcp_s_age_sec=0.2,
+            )
 
     def test_written_action_shape_and_metadata_and_legacy_absence(self):
         data = self.make_sampling_data(
@@ -360,6 +398,14 @@ class BagToIlInterceptTests(unittest.TestCase):
                 self.assertEqual(
                     h5.attrs["action_positive_direction"],
                     "robot_base_positive_x",
+                )
+                self.assertEqual(
+                    h5.attrs["desired_goal_source_topic"],
+                    "/interception_controller/selected_goto_s",
+                )
+                self.assertEqual(
+                    h5.attrs["desired_goal_resolution"],
+                    "single_selected_goto_s_event",
                 )
 
                 self.assertEqual(h5["action"].shape[0], h5["observations/timestamps"].shape[0])

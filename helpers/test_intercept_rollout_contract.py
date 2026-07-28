@@ -12,9 +12,10 @@ if ACT_ROOT not in sys.path:
     sys.path.insert(0, ACT_ROOT)
 
 from intercept_rollout_contract import (  # noqa: E402
-    EXPECTED_INTERCEPT_METADATA,
+    EXPECTED_INTERCEPT_METADATA_BY_TARGET,
     TemporalAbsoluteAggregator,
     absolute_s_from_anchor,
+    build_absolute_prediction_chunk,
     build_qpos_history,
     build_rgb_history_tensor,
     compute_history_indices,
@@ -26,8 +27,8 @@ from intercept_rollout_contract import (  # noqa: E402
 
 
 class InterceptRolloutContractTests(unittest.TestCase):
-    def make_stats(self):
-        stats = dict(EXPECTED_INTERCEPT_METADATA)
+    def make_stats(self, intercept_target="measured_tcp_trajectory"):
+        stats = dict(EXPECTED_INTERCEPT_METADATA_BY_TARGET[intercept_target])
         stats.update(
             {
                 "qpos_mean": np.zeros(21, dtype=np.float32),
@@ -108,12 +109,46 @@ class InterceptRolloutContractTests(unittest.TestCase):
         absolute = absolute_s_from_anchor(1.5, delta)
         np.testing.assert_allclose(absolute, np.asarray([1.3, 1.5, 1.8], dtype=np.float32), atol=1e-6)
 
+    def test_desired_goal_reconstruction(self):
+        delta = np.asarray([0.11, 0.12, 0.13], dtype=np.float32)
+        chunk, predicted_delta_goal, predicted_goal_abs_s = build_absolute_prediction_chunk(
+            anchor_tcp_s=-0.02,
+            delta_chunk=delta,
+            intercept_target="desired_goal",
+            chunk_size=30,
+        )
+
+        self.assertAlmostEqual(predicted_delta_goal, 0.12)
+        self.assertAlmostEqual(predicted_goal_abs_s, 0.10)
+        self.assertEqual(chunk.shape, (30,))
+        self.assertTrue(np.allclose(chunk, np.full(30, 0.10, dtype=np.float32)))
+
+    def test_measured_mode_reconstruction_remains_relative(self):
+        delta = np.asarray([0.11, 0.12, 0.13], dtype=np.float32)
+        chunk, predicted_delta_goal, predicted_goal_abs_s = build_absolute_prediction_chunk(
+            anchor_tcp_s=-0.02,
+            delta_chunk=delta,
+            intercept_target="measured_tcp_trajectory",
+            chunk_size=30,
+        )
+
+        self.assertAlmostEqual(predicted_delta_goal, 0.12)
+        self.assertAlmostEqual(predicted_goal_abs_s, 0.10)
+        np.testing.assert_allclose(chunk, np.asarray([0.09, 0.10, 0.11], dtype=np.float32), atol=1e-6)
+
     def test_no_bce_contract(self):
         stats = self.make_stats()
         config = self.make_policy_config()
         config["use_bce_last_action_dim"] = True
         with self.assertRaises(ValueError):
             validate_intercept_stats_and_config(stats, config, expected_chunk_size=30)
+
+    def test_desired_goal_contract(self):
+        stats = self.make_stats(intercept_target="desired_goal")
+        config = self.make_policy_config()
+        arrays = validate_intercept_stats_and_config(stats, config, expected_chunk_size=30)
+        self.assertEqual(arrays["action_mean"].shape, (1,))
+        self.assertEqual(arrays["action_std"].shape, (1,))
 
     def test_stale_anchor_rejected(self):
         with self.assertRaises(ValueError):
@@ -128,6 +163,12 @@ class InterceptRolloutContractTests(unittest.TestCase):
     def test_legacy_stats_fail_fast(self):
         stats = self.make_stats()
         stats["action_dim"] = 2
+        with self.assertRaises(ValueError):
+            validate_intercept_stats_and_config(stats, self.make_policy_config(), expected_chunk_size=30)
+
+    def test_missing_intercept_target_rejected(self):
+        stats = self.make_stats()
+        del stats["intercept_target"]
         with self.assertRaises(ValueError):
             validate_intercept_stats_and_config(stats, self.make_policy_config(), expected_chunk_size=30)
 

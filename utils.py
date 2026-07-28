@@ -48,10 +48,45 @@ DEFAULT_JOINT_DATA_CONFIG = {
 
 
 INTERCEPT_HISTORY_OFFSETS_DEFAULT = (-6, -3, 0)
+INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY = 'measured_tcp_trajectory'
+INTERCEPT_TARGET_DESIRED_GOAL = 'desired_goal'
+
 INTERCEPT_REQUIRED_ROOT_METADATA = {
     'action_type': 'measured_tcp_s_absolute',
     'action_representation': 'absolute',
     'action_positive_direction': 'robot_base_positive_x',
+}
+
+INTERCEPT_DESIRED_GOAL_ROOT_METADATA = {
+    'desired_goal_source_topic': '/interception_controller/selected_goto_s',
+    'desired_goal_resolution': 'single_selected_goto_s_event',
+    'desired_goal_coordinate': 'captured_interception_line',
+    'desired_goal_positive_direction': 'robot_base_positive_x',
+    'desired_goal_units': 'm',
+}
+
+INTERCEPT_STATS_METADATA_BY_TARGET = {
+    INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY: {
+        'intercept_target': INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY,
+        'action_type': 'measured_tcp_s_delta',
+        'action_representation': 'future_delta_relative_to_anchor',
+        'action_anchor_offset': 0,
+        'action_first_target_offset': 1,
+        'action_query_semantics': 'future_measured_tcp_trajectory',
+        'action_positive_direction': 'robot_base_positive_x',
+        'action_units': 'm',
+    },
+    INTERCEPT_TARGET_DESIRED_GOAL: {
+        'intercept_target': INTERCEPT_TARGET_DESIRED_GOAL,
+        'action_type': 'desired_intercept_s_delta',
+        'action_representation': 'episode_goal_delta_relative_to_anchor_tcp',
+        'action_anchor_offset': 0,
+        'action_first_target_offset': 0,
+        'action_query_semantics': 'replicated_current_goal',
+        'action_positive_direction': 'robot_base_positive_x',
+        'action_units': 'm',
+        'goal_source_topic': '/interception_controller/selected_goto_s',
+    },
 }
 
 
@@ -67,7 +102,7 @@ def _read_h5_root_attr(root, key):
     return _decode_h5_attr(root.attrs[key])
 
 
-def _validate_intercept_root_metadata(root, dataset_path):
+def _validate_intercept_root_metadata(root, dataset_path, intercept_target):
     missing_keys = [
         key for key in INTERCEPT_REQUIRED_ROOT_METADATA
         if key not in root.attrs
@@ -104,6 +139,24 @@ def _validate_intercept_root_metadata(root, dataset_path):
             f"Rejected {dataset_path}: action_positive_direction={action_positive_direction!r}. "
             f"Expected {INTERCEPT_REQUIRED_ROOT_METADATA['action_positive_direction']!r}."
         )
+
+    if intercept_target == INTERCEPT_TARGET_DESIRED_GOAL:
+        missing_goal_keys = [
+            key for key in INTERCEPT_DESIRED_GOAL_ROOT_METADATA
+            if key not in root.attrs
+        ]
+        if missing_goal_keys:
+            raise ValueError(
+                f"Missing desired-goal metadata at HDF5 root in {dataset_path}: {missing_goal_keys}. "
+                "This dataset must be converted with the interception converter that records the goal source topic and resolution."
+            )
+
+        for key, expected in INTERCEPT_DESIRED_GOAL_ROOT_METADATA.items():
+            actual = str(_read_h5_root_attr(root, key))
+            if actual != expected:
+                raise ValueError(
+                    f"Rejected {dataset_path}: {key}={actual!r}. Expected {expected!r}."
+                )
 
 
 def compute_history_indices(anchor_t, history_offsets):
@@ -234,8 +287,8 @@ def _validate_joint_episode_structure(
     return qpos, action
 
 
-def _validate_intercept_episode_structure(root, dataset_path):
-    _validate_intercept_root_metadata(root, dataset_path)
+def _validate_intercept_episode_structure(root, dataset_path, intercept_target):
+    _validate_intercept_root_metadata(root, dataset_path, intercept_target)
 
     if '/action' not in root:
         raise ValueError(f"Missing required dataset: /action in {dataset_path}")
@@ -273,6 +326,35 @@ def _validate_intercept_episode_structure(root, dataset_path):
         raise ValueError(f"Non-finite values found in /action for {dataset_path}")
     if not np.isfinite(qpos).all():
         raise ValueError(f"Non-finite values found in /observations/qpos for {dataset_path}")
+
+    if intercept_target == INTERCEPT_TARGET_DESIRED_GOAL:
+        if '/targets/desired_intercept_s' not in root:
+            raise ValueError(f"Missing required dataset: /targets/desired_intercept_s in {dataset_path}")
+        if 'commands/selected_goto_s/timestamps' not in root:
+            raise ValueError(f"Missing required dataset: /commands/selected_goto_s/timestamps in {dataset_path}")
+        if 'commands/selected_goto_s/values' not in root:
+            raise ValueError(f"Missing required dataset: /commands/selected_goto_s/values in {dataset_path}")
+
+        desired_intercept_s = np.asarray(root['/targets/desired_intercept_s'][()], dtype=np.float32).reshape(-1)
+        if desired_intercept_s.shape != (1,):
+            raise ValueError(
+                f"/targets/desired_intercept_s must have shape (1,) in {dataset_path}, got {desired_intercept_s.shape}"
+            )
+        if not np.isfinite(desired_intercept_s[0]):
+            raise ValueError(f"Non-finite value found in /targets/desired_intercept_s for {dataset_path}")
+
+        selected_values = np.asarray(root['commands/selected_goto_s/values'][()], dtype=np.float32).reshape(-1)
+        selected_timestamps = np.asarray(root['commands/selected_goto_s/timestamps'][()], dtype=np.float64).reshape(-1)
+        if selected_values.shape[0] != selected_timestamps.shape[0]:
+            raise ValueError(
+                f"Unequal selected_goto_s timestamps/values lengths in {dataset_path}: "
+                f"{selected_timestamps.shape[0]} != {selected_values.shape[0]}"
+            )
+        finite_mask = np.isfinite(selected_values)
+        if int(np.sum(finite_mask)) != 1:
+            raise ValueError(
+                f"expected exactly one finite selected_goto_s event in {dataset_path}, got {int(np.sum(finite_mask))}"
+            )
 
     return qpos, action
 
@@ -880,6 +962,7 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         camera_names,
         chunk_size,
         norm_stats,
+        intercept_target=INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY,
         history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
         photometric_aug=False,
         spatial_aug=False,
@@ -890,6 +973,7 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         self.camera_names = list(camera_names)
         self.chunk_size = int(chunk_size)
         self.norm_stats = norm_stats
+        self.intercept_target = str(intercept_target)
         self.history_offsets = tuple(int(offset) for offset in history_offsets)
         self.photometric_aug = bool(photometric_aug)
         self.spatial_aug = bool(spatial_aug)
@@ -906,6 +990,10 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"Interception requires exactly 3 history offsets, got {self.history_offsets}"
             )
+        if self.intercept_target not in INTERCEPT_STATS_METADATA_BY_TARGET:
+            raise ValueError(
+                f"Unsupported intercept_target={self.intercept_target!r}; expected one of {sorted(INTERCEPT_STATS_METADATA_BY_TARGET)}"
+            )
 
         _print_image_pipeline_info(self.camera_names, target_size=self.image_size)
         self.__getitem__(0)
@@ -917,11 +1005,18 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         dataset_path = self.episode_paths[index]
         with h5py.File(dataset_path, 'r') as root:
             is_sim = bool(root.attrs.get('sim', False))
-            qpos_full, action_full = _validate_intercept_episode_structure(root, dataset_path)
+            qpos_full, action_full = _validate_intercept_episode_structure(
+                root,
+                dataset_path,
+                self.intercept_target,
+            )
             T = action_full.shape[0]
 
-            # Valid anchors are 0..T-2 so token-0 always has a true future s(t+1)-s(t).
-            anchor_t = np.random.randint(0, T - 1)
+            if self.intercept_target == INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY:
+                # Valid anchors are 0..T-2 so token-0 always has a true future s(t+1)-s(t).
+                anchor_t = np.random.randint(0, T - 1)
+            else:
+                anchor_t = np.random.randint(0, T)
             history_indices = compute_history_indices(anchor_t, self.history_offsets)
 
             qpos_history = qpos_full[history_indices]
@@ -938,17 +1033,29 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
             image_rgb = np.concatenate(processed_frames, axis=-1)
 
             anchor_s = float(action_full[anchor_t, 0])
-            future_end = min(T, anchor_t + 1 + self.chunk_size)
-            future_abs = action_full[anchor_t + 1:future_end, 0:1]
-            action = future_abs - anchor_s
-            action_len = action.shape[0]
+            if self.intercept_target == INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY:
+                future_end = min(T, anchor_t + 1 + self.chunk_size)
+                future_abs = action_full[anchor_t + 1:future_end, 0:1]
+                action = future_abs - anchor_s
+                action_len = action.shape[0]
+                is_pad = np.zeros(self.chunk_size, dtype=np.float32)
+                is_pad[action_len:] = 1.0
+            else:
+                desired_intercept_s = np.asarray(root['/targets/desired_intercept_s'][()], dtype=np.float32).reshape(-1)
+                if desired_intercept_s.shape != (1,) or not np.isfinite(desired_intercept_s[0]):
+                    raise ValueError(
+                        f"Invalid /targets/desired_intercept_s in {dataset_path}: shape={desired_intercept_s.shape}, value={desired_intercept_s.tolist()}"
+                    )
+                delta_goal = float(desired_intercept_s[0] - anchor_s)
+                action = np.full((self.chunk_size, 1), delta_goal, dtype=np.float32)
+                action_len = self.chunk_size
+                future_abs = np.asarray([[float(desired_intercept_s[0])]], dtype=np.float32)
+                is_pad = np.zeros(self.chunk_size, dtype=np.float32)
 
         self.is_sim = is_sim
 
         padded_action = np.zeros((self.chunk_size, 1), dtype=np.float32)
         padded_action[:action_len] = action
-        is_pad = np.zeros(self.chunk_size, dtype=np.float32)
-        is_pad[action_len:] = 1.0
 
         image_data = torch.from_numpy(np.transpose(image_rgb, (2, 0, 1))[None, ...])
         qpos_data = torch.from_numpy(qpos).float()
@@ -961,14 +1068,20 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         assert is_pad.shape == (self.chunk_size,), is_pad.shape
 
         if not self._printed_intercept_debug:
-            first_future_count = min(5, action_len)
+            query_values = action.reshape(-1)
+            if self.intercept_target == INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY:
+                target_desc = f"future_abs_s[:{min(5, future_abs.shape[0])}]={future_abs[:min(5, future_abs.shape[0]), 0].tolist()}"
+            else:
+                target_desc = f"goal_abs_s={float(np.asarray(future_abs).reshape(-1)[0]):+.6f}"
             print(
-                f"[DEBUG] intercept sample anchor_t={anchor_t}, history_indices={history_indices}, "
-                f"anchor_abs_s={anchor_s:+.6f}, "
-                f"future_abs_s[:{first_future_count}]={future_abs[:first_future_count, 0].tolist()}, "
-                f"delta_s[:{first_future_count}]={action[:first_future_count, 0].tolist()}, "
+                f"[DEBUG] intercept sample intercept_target={self.intercept_target}, anchor_t={anchor_t}, "
+                f"history_indices={history_indices}, anchor_s={anchor_s:+.6f}, "
+                f"{target_desc}, "
+                f"delta_goal={float(query_values[0]):+.6f}, "
+                f"query_min/median/max={float(np.min(query_values)):+.6f}/{float(np.median(query_values)):+.6f}/{float(np.max(query_values)):+.6f}, "
+                f"unique_queries={np.unique(query_values).tolist()}, "
                 f"image_shape={tuple(image_data.shape)}, qpos_shape={tuple(qpos_data.shape)}, "
-                f"action_shape={tuple(action_data.shape)}"
+                f"action_shape={tuple(action_data.shape)}, is_pad_true={int(is_pad.sum().item())}"
             )
             self._printed_intercept_debug = True
             self._printed_image_debug = True
@@ -1026,30 +1139,49 @@ def get_joint_norm_stats(episode_paths, qpos_indices=None, action_indices=None, 
 def get_intercept_norm_stats(
     episode_paths,
     chunk_size,
+    intercept_target=INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY,
     history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
 ):
     qpos_histories = []
     delta_tokens = []
+    intercept_target = str(intercept_target)
+    if intercept_target not in INTERCEPT_STATS_METADATA_BY_TARGET:
+        raise ValueError(
+            f"Unsupported intercept_target={intercept_target!r}; expected one of {sorted(INTERCEPT_STATS_METADATA_BY_TARGET)}"
+        )
 
     for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
-            qpos_full, action_full = _validate_intercept_episode_structure(root, dataset_path)
+            qpos_full, action_full = _validate_intercept_episode_structure(root, dataset_path, intercept_target)
+            desired_intercept_s = None
+            if intercept_target == INTERCEPT_TARGET_DESIRED_GOAL:
+                desired_intercept_s = np.asarray(root['/targets/desired_intercept_s'][()], dtype=np.float32).reshape(-1)
 
         T = action_full.shape[0]
-        for anchor_t in range(T - 1):
+        anchor_stop = T - 1 if intercept_target == INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY else T
+        for anchor_t in range(anchor_stop):
             history_indices = compute_history_indices(anchor_t, history_offsets)
             qpos_histories.append(qpos_full[history_indices].reshape(-1))
 
-            future_end = min(T, anchor_t + 1 + chunk_size)
-            future_abs = action_full[anchor_t + 1:future_end, 0]
-            delta_values = future_abs - action_full[anchor_t, 0]
-            if delta_values.size > 0:
-                delta_tokens.append(delta_values)
+            if intercept_target == INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY:
+                future_end = min(T, anchor_t + 1 + chunk_size)
+                future_abs = action_full[anchor_t + 1:future_end, 0]
+                delta_values = future_abs - action_full[anchor_t, 0]
+                if delta_values.size > 0:
+                    delta_tokens.append(delta_values)
+            else:
+                assert desired_intercept_s is not None
+                if desired_intercept_s.shape != (1,) or not np.isfinite(desired_intercept_s[0]):
+                    raise ValueError(
+                        f"Invalid /targets/desired_intercept_s in {dataset_path}: shape={desired_intercept_s.shape}, value={desired_intercept_s.tolist()}"
+                    )
+                delta_goal = float(desired_intercept_s[0] - action_full[anchor_t, 0])
+                delta_tokens.append(np.asarray([delta_goal], dtype=np.float32))
 
     if len(qpos_histories) == 0:
         raise ValueError('No valid interception anchors found while computing normalization stats.')
     if len(delta_tokens) == 0:
-        raise ValueError('No valid interception future-delta tokens found while computing normalization stats.')
+        raise ValueError('No valid interception delta tokens found while computing normalization stats.')
 
     qpos_histories = np.asarray(qpos_histories, dtype=np.float32)
     all_delta_values = np.concatenate(delta_tokens, axis=0).astype(np.float32)
@@ -1060,6 +1192,7 @@ def get_intercept_norm_stats(
     action_mean = np.asarray([all_delta_values.mean()], dtype=np.float32)
     action_std = np.asarray([all_delta_values.std()], dtype=np.float32).clip(1e-2, np.inf)
 
+    metadata = dict(INTERCEPT_STATS_METADATA_BY_TARGET[intercept_target])
     return {
         'action_mean': action_mean,
         'action_std': action_std,
@@ -1076,12 +1209,7 @@ def get_intercept_norm_stats(
         'qpos_history_offsets': list(history_offsets),
         'qpos_flatten_order': 'oldest_to_newest',
         'image_channels': 9,
-        'action_type': 'measured_tcp_s_delta',
-        'action_representation': 'future_delta_relative_to_anchor',
-        'action_anchor_offset': 0,
-        'action_first_target_offset': 1,
-        'action_positive_direction': 'robot_base_positive_x',
-        'action_units': 'm',
+        **metadata,
     }
 
 
@@ -1258,6 +1386,7 @@ def load_intercept_data(
     raw_qpos_dim=7,
     state_dim=21,
     action_dim=1,
+    intercept_target=INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY,
     image_size=None,
     rgb_history_frames=3,
     history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
@@ -1274,6 +1403,12 @@ def load_intercept_data(
         raise ValueError(f"Interception action_dim must be 1, got {action_dim}")
     if int(rgb_history_frames) != 3:
         raise ValueError(f"Interception rgb_history_frames must be 3, got {rgb_history_frames}")
+
+    intercept_target = str(intercept_target)
+    if intercept_target not in INTERCEPT_STATS_METADATA_BY_TARGET:
+        raise ValueError(
+            f"Unsupported intercept_target={intercept_target!r}; expected one of {sorted(INTERCEPT_STATS_METADATA_BY_TARGET)}"
+        )
 
     history_offsets = tuple(int(offset) for offset in history_offsets)
     if history_offsets != INTERCEPT_HISTORY_OFFSETS_DEFAULT:
@@ -1303,7 +1438,7 @@ def load_intercept_data(
 
     for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
-            _validate_intercept_episode_structure(root, dataset_path)
+            _validate_intercept_episode_structure(root, dataset_path, intercept_target)
 
     episode_indices = list(range(total_episode_count))
     rng = np.random.RandomState(split_seed)
@@ -1329,14 +1464,17 @@ def load_intercept_data(
     norm_stats = get_intercept_norm_stats(
         train_episode_paths,
         chunk_size=chunk_size,
+        intercept_target=intercept_target,
         history_offsets=history_offsets,
     )
+    norm_stats['intercept_target'] = intercept_target
 
     train_dataset = EpisodicInterceptDataset(
         train_episode_paths,
         camera_names,
         chunk_size,
         norm_stats,
+        intercept_target=intercept_target,
         history_offsets=history_offsets,
         photometric_aug=photometric_aug,
         spatial_aug=spatial_aug,
@@ -1347,6 +1485,7 @@ def load_intercept_data(
         camera_names,
         chunk_size,
         norm_stats,
+        intercept_target=intercept_target,
         history_offsets=history_offsets,
         photometric_aug=False,
         spatial_aug=False,

@@ -20,7 +20,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from intercept_rollout_contract import (
     TemporalAbsoluteAggregator,
-    absolute_s_from_anchor,
+    build_absolute_prediction_chunk,
     build_rgb_history_tensor,
     denormalize_delta_chunk,
     extract_arm_qpos,
@@ -138,6 +138,7 @@ class FrankaActRolloutNode(Node):
         self.qpos_std = stats_arrays["qpos_std"]
         self.action_mean = stats_arrays["action_mean"]
         self.action_std = stats_arrays["action_std"]
+        self.intercept_target = str(stats["intercept_target"])
 
         self.policy = ACTPolicy(policy_config)
         loading_status = self.policy.load_state_dict(torch.load(ckpt_path, map_location=self.device))
@@ -491,8 +492,16 @@ class FrankaActRolloutNode(Node):
         try:
             normalized_delta = raw_output[0, :, 0].detach().cpu().numpy()
             delta_s = denormalize_delta_chunk(normalized_delta, self.action_mean, self.action_std)
-            absolute_s = absolute_s_from_anchor(sync.anchor_tcp_s, delta_s)
-            if not np.all(np.isfinite(absolute_s)):
+            absolute_s, predicted_delta_goal, predicted_goal_abs_s = build_absolute_prediction_chunk(
+                sync.anchor_tcp_s,
+                delta_s,
+                self.intercept_target,
+                self.chunk_size,
+            )
+            if self.intercept_target == "desired_goal":
+                if not np.isfinite(predicted_goal_abs_s):
+                    raise RuntimeError("Predicted absolute desired-goal scalar is non-finite")
+            elif not np.all(np.isfinite(absolute_s)):
                 raise RuntimeError("Absolute-s chunk contains non-finite values")
 
             with self._aggregation_lock:
@@ -529,26 +538,54 @@ class FrankaActRolloutNode(Node):
 
         now_wall = time.time()
         if (now_wall - self._last_diag_log_sec) >= self.diag_log_period_sec:
-            self.get_logger().info(
-                "Inference diagnostics: "
-                f"step={self.step_index} "
-                f"accepted={self.accepted_prediction_count} stale_post_inference={self.post_inference_stale_count} "
-                f"duplicate_tick_skips={self.duplicate_timer_tick_skip_count} "
-                f"accepted_anchors={self.accepted_distinct_anchor_count} "
-                f"agg_resets_gap={self.aggregation_reset_gap_count} "
-                f"backward_timestamps={self.backward_anchor_count} "
-                f"failed_or_stale_gaps={self.failed_or_stale_inference_gap_count} "
-            f"rollout_epoch={self.rollout_epoch} "
-                f"history_indices={list(sync.history_indices)} "
-                f"rgb_ts={[round(ts, 6) for ts in sync.rgb_timestamps]} "
-                f"qpos_ts={[round(ts, 6) for ts in sync.qpos_timestamps]} "
-                f"anchor_s={sync.anchor_tcp_s:+.6f} anchor_ts={sync.anchor_tcp_s_timestamp:.6f} "
-                f"qpos_shape={tuple(sync.qpos_history.shape)} image_shape={tuple(curr_image.shape)} "
-                f"raw_shape={tuple(raw_output.shape)} delta_shape={tuple(delta_s.shape)} abs_shape={tuple(absolute_s.shape)} "
-                f"delta_s={_first_last(delta_s)} abs_s={_first_last(absolute_s)} "
-                f"current_abs={current_value:+.6f} max_input_age={max_input_age:.4f}s "
-                f"max_sync_error={max_sync_error:.4f}s inference_ms={inference_ms:.2f} step_ms={total_step_ms:.2f}"
-            )
+            if self.intercept_target == "desired_goal":
+                self.get_logger().info(
+                    "Inference diagnostics: "
+                    f"step={self.step_index} "
+                    f"intercept_target={self.intercept_target} "
+                    f"accepted={self.accepted_prediction_count} stale_post_inference={self.post_inference_stale_count} "
+                    f"duplicate_tick_skips={self.duplicate_timer_tick_skip_count} "
+                    f"accepted_anchors={self.accepted_distinct_anchor_count} "
+                    f"agg_resets_gap={self.aggregation_reset_gap_count} "
+                    f"backward_timestamps={self.backward_anchor_count} "
+                    f"failed_or_stale_gaps={self.failed_or_stale_inference_gap_count} "
+                    f"rollout_epoch={self.rollout_epoch} "
+                    f"history_indices={list(sync.history_indices)} "
+                    f"rgb_ts={[round(ts, 6) for ts in sync.rgb_timestamps]} "
+                    f"qpos_ts={[round(ts, 6) for ts in sync.qpos_timestamps]} "
+                    f"anchor_s={sync.anchor_tcp_s:+.6f} anchor_ts={sync.anchor_tcp_s_timestamp:.6f} "
+                    f"qpos_shape={tuple(sync.qpos_history.shape)} image_shape={tuple(curr_image.shape)} "
+                    f"raw_shape={tuple(raw_output.shape)} "
+                    f"raw_query_min_median_max={float(np.min(delta_s)):+.6f}/{float(np.median(delta_s)):+.6f}/{float(np.max(delta_s)):+.6f} "
+                    f"predicted_delta_goal={predicted_delta_goal:+.6f} "
+                    f"predicted_goal_abs_s={predicted_goal_abs_s:+.6f} "
+                    f"aggregated_goal_abs_s={current_value:+.6f} "
+                    f"abs_chunk_is_constant={bool(np.allclose(absolute_s, absolute_s[0]))} "
+                    f"max_input_age={max_input_age:.4f}s max_sync_error={max_sync_error:.4f}s "
+                    f"inference_ms={inference_ms:.2f} step_ms={total_step_ms:.2f}"
+                )
+            else:
+                self.get_logger().info(
+                    "Inference diagnostics: "
+                    f"step={self.step_index} "
+                    f"intercept_target={self.intercept_target} "
+                    f"accepted={self.accepted_prediction_count} stale_post_inference={self.post_inference_stale_count} "
+                    f"duplicate_tick_skips={self.duplicate_timer_tick_skip_count} "
+                    f"accepted_anchors={self.accepted_distinct_anchor_count} "
+                    f"agg_resets_gap={self.aggregation_reset_gap_count} "
+                    f"backward_timestamps={self.backward_anchor_count} "
+                    f"failed_or_stale_gaps={self.failed_or_stale_inference_gap_count} "
+                f"rollout_epoch={self.rollout_epoch} "
+                    f"history_indices={list(sync.history_indices)} "
+                    f"rgb_ts={[round(ts, 6) for ts in sync.rgb_timestamps]} "
+                    f"qpos_ts={[round(ts, 6) for ts in sync.qpos_timestamps]} "
+                    f"anchor_s={sync.anchor_tcp_s:+.6f} anchor_ts={sync.anchor_tcp_s_timestamp:.6f} "
+                    f"qpos_shape={tuple(sync.qpos_history.shape)} image_shape={tuple(curr_image.shape)} "
+                    f"raw_shape={tuple(raw_output.shape)} delta_shape={tuple(delta_s.shape)} abs_shape={tuple(absolute_s.shape)} "
+                    f"delta_s={_first_last(delta_s)} abs_s={_first_last(absolute_s)} "
+                    f"current_abs={current_value:+.6f} max_input_age={max_input_age:.4f}s "
+                    f"max_sync_error={max_sync_error:.4f}s inference_ms={inference_ms:.2f} step_ms={total_step_ms:.2f}"
+                )
             self._last_diag_log_sec = now_wall
 
         with self._aggregation_lock:

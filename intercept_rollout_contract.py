@@ -7,6 +7,52 @@ import cv2
 import numpy as np
 
 INTERCEPT_HISTORY_OFFSETS = (-6, -3, 0)
+INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY = "measured_tcp_trajectory"
+INTERCEPT_TARGET_DESIRED_GOAL = "desired_goal"
+
+EXPECTED_INTERCEPT_METADATA_BY_TARGET = {
+    INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY: {
+        "intercept_target": INTERCEPT_TARGET_MEASURED_TCP_TRAJECTORY,
+        "data_mode": "intercept",
+        "raw_qpos_dim": 7,
+        "state_dim": 21,
+        "action_dim": 1,
+        "rgb_history_frames": 3,
+        "rgb_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+        "qpos_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+        "rgb_frame_order": "oldest_to_newest",
+        "qpos_flatten_order": "oldest_to_newest",
+        "image_channels": 9,
+        "action_type": "measured_tcp_s_delta",
+        "action_representation": "future_delta_relative_to_anchor",
+        "action_anchor_offset": 0,
+        "action_first_target_offset": 1,
+        "action_query_semantics": "future_measured_tcp_trajectory",
+        "action_positive_direction": "robot_base_positive_x",
+        "action_units": "m",
+    },
+    INTERCEPT_TARGET_DESIRED_GOAL: {
+        "intercept_target": INTERCEPT_TARGET_DESIRED_GOAL,
+        "data_mode": "intercept",
+        "raw_qpos_dim": 7,
+        "state_dim": 21,
+        "action_dim": 1,
+        "rgb_history_frames": 3,
+        "rgb_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+        "qpos_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+        "rgb_frame_order": "oldest_to_newest",
+        "qpos_flatten_order": "oldest_to_newest",
+        "image_channels": 9,
+        "action_type": "desired_intercept_s_delta",
+        "action_representation": "episode_goal_delta_relative_to_anchor_tcp",
+        "action_anchor_offset": 0,
+        "action_first_target_offset": 0,
+        "action_query_semantics": "replicated_current_goal",
+        "goal_source_topic": "/interception_controller/selected_goto_s",
+        "action_positive_direction": "robot_base_positive_x",
+        "action_units": "m",
+    },
+}
 ARM_JOINT_NAMES = (
     "right_fr3_joint1",
     "right_fr3_joint2",
@@ -16,26 +62,6 @@ ARM_JOINT_NAMES = (
     "right_fr3_joint6",
     "right_fr3_joint7",
 )
-
-
-EXPECTED_INTERCEPT_METADATA = {
-    "data_mode": "intercept",
-    "raw_qpos_dim": 7,
-    "state_dim": 21,
-    "action_dim": 1,
-    "rgb_history_frames": 3,
-    "rgb_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
-    "qpos_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
-    "rgb_frame_order": "oldest_to_newest",
-    "qpos_flatten_order": "oldest_to_newest",
-    "image_channels": 9,
-    "action_type": "measured_tcp_s_delta",
-    "action_representation": "future_delta_relative_to_anchor",
-    "action_anchor_offset": 0,
-    "action_first_target_offset": 1,
-    "action_positive_direction": "robot_base_positive_x",
-    "action_units": "m",
-}
 
 
 @dataclass(frozen=True)
@@ -172,7 +198,13 @@ def validate_intercept_stats_and_config(
     policy_config: Dict[str, object],
     expected_chunk_size: int,
 ) -> Dict[str, np.ndarray]:
-    for key, expected in EXPECTED_INTERCEPT_METADATA.items():
+    intercept_target = stats.get("intercept_target")
+    if intercept_target not in EXPECTED_INTERCEPT_METADATA_BY_TARGET:
+        raise ValueError(
+            f"Missing or unsupported interception checkpoint metadata in dataset_stats.pkl: intercept_target={intercept_target!r}"
+        )
+
+    for key, expected in EXPECTED_INTERCEPT_METADATA_BY_TARGET[intercept_target].items():
         if key not in stats:
             raise ValueError(f"Missing interception checkpoint metadata in dataset_stats.pkl: {key}")
         if stats[key] != expected:
@@ -242,6 +274,24 @@ def denormalize_delta_chunk(
     if not np.all(np.isfinite(delta)):
         raise ValueError("Denormalized delta chunk contains non-finite values")
     return delta.astype(np.float32)
+
+
+def build_absolute_prediction_chunk(
+    anchor_tcp_s: float,
+    delta_chunk: np.ndarray,
+    intercept_target: str,
+    chunk_size: int,
+) -> Tuple[np.ndarray, float, float]:
+    delta = np.asarray(delta_chunk, dtype=np.float32).reshape(-1)
+    predicted_delta_goal = float(np.median(delta))
+    predicted_goal_abs_s = float(anchor_tcp_s + predicted_delta_goal)
+
+    if intercept_target == INTERCEPT_TARGET_DESIRED_GOAL:
+        absolute_chunk = np.full(int(chunk_size), predicted_goal_abs_s, dtype=np.float32)
+    else:
+        absolute_chunk = absolute_s_from_anchor(anchor_tcp_s, delta)
+
+    return absolute_chunk.astype(np.float32), predicted_delta_goal, predicted_goal_abs_s
 
 
 def absolute_s_from_anchor(anchor_s: float, delta_chunk: np.ndarray) -> np.ndarray:

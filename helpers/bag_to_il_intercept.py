@@ -35,6 +35,7 @@ DEFAULT_RGB_TOPIC_COMPRESSED = "/top_cam/camera/color/image_raw/compressed"
 DEFAULT_JOINT_TOPIC = "/joint_states"
 DEFAULT_EPISODE_TOPIC = "/episode/control"
 DEFAULT_CURRENT_TCP_S_TOPIC = "/middle_line/current_tcp_s"
+DEFAULT_SELECTED_GOTO_S_TOPIC = "/interception_controller/selected_goto_s"
 DEFAULT_GOTO_S_TOPIC = "/trajectory_executor/executed_goto_s"
 DEFAULT_GOTO_S_TARGET_BASE_TOPIC = (
     "/trajectory_executor/executed_goto_s_target_base"
@@ -61,6 +62,7 @@ class Topics:
     joint: str
     episode: str
     current_tcp_s: str
+    selected_goto_s: str
     goto_s: str
     goto_s_target_base: str
 
@@ -181,6 +183,11 @@ def validate_topics(
             f"Topic {topics.current_tcp_s} must be {FLOAT64_TYPE}, got {tcp_s_type}"
         )
 
+    if topics.selected_goto_s in types and types[topics.selected_goto_s] != FLOAT64_TYPE:
+        raise RuntimeError(
+            f"Topic {topics.selected_goto_s} must be {FLOAT64_TYPE}, got {types[topics.selected_goto_s]}"
+        )
+
     for topic in sorted(required):
         log(f"[INFO] {topic} :: {types[topic]}")
 
@@ -198,6 +205,12 @@ def validate_topics(
         log(
             "[INFO] optional GOTO_S target-base debug topic is absent; "
             "commands/goto_s_target_base datasets will be empty"
+        )
+
+    if topics.selected_goto_s not in types:
+        log(
+            f"[INFO] goal topic is absent during type scan: {topics.selected_goto_s}; "
+            "desired-goal conversion will reject episodes without exactly one finite event"
         )
 
     return (
@@ -407,7 +420,7 @@ def required_data_topics(
     collect_goto_s_debug: bool,
     collect_target_base_debug: bool,
 ) -> List[str]:
-    tracked = [topics.rgb, topics.joint, topics.current_tcp_s]
+    tracked = [topics.rgb, topics.joint, topics.current_tcp_s, topics.selected_goto_s]
     if collect_goto_s_debug:
         tracked.append(topics.goto_s)
     if collect_target_base_debug:
@@ -423,6 +436,8 @@ def create_episode_buffer() -> Dict[str, Any]:
         "qpos": [],
         "current_tcp_s_t": [],
         "current_tcp_s": [],
+        "selected_goto_s_t": [],
+        "selected_goto_s": [],
         "goto_s_t": [],
         "goto_s": [],
         "target_base_t": [],
@@ -446,6 +461,9 @@ def ingest_episode_message(
     elif topic == topics.current_tcp_s:
         data["current_tcp_s_t"].append(timestamp)
         data["current_tcp_s"].append(float(msg.data))
+    elif topic == topics.selected_goto_s:
+        data["selected_goto_s_t"].append(timestamp)
+        data["selected_goto_s"].append(float(msg.data))
     elif topic == topics.goto_s:
         data["goto_s_t"].append(timestamp)
         data["goto_s"].append(float(msg.data))
@@ -664,11 +682,27 @@ def sample_episode(
 
     command_timestamps = np.asarray(data["goto_s_t"], dtype=np.float64)
     command_values = np.asarray(data["goto_s"], dtype=np.float32).reshape(-1, 1)
+    selected_goto_s_t = np.asarray(data["selected_goto_s_t"], dtype=np.float64)
+    selected_goto_s = np.asarray(data["selected_goto_s"], dtype=np.float32).reshape(-1, 1)
     target_base_t = np.asarray(data["target_base_t"], dtype=np.float64)
     if data["target_base"]:
         target_base = np.asarray(data["target_base"], dtype=np.float32).reshape(-1, 3)
     else:
         target_base = np.empty((0, 3), dtype=np.float32)
+
+    finite_selected_mask = np.isfinite(selected_goto_s.reshape(-1))
+    if selected_goto_s.shape[0] == 0 or not np.any(finite_selected_mask):
+        raise RuntimeError(
+            f"Episode {episode.output_idx}: missing finite selected_goto_s event in [{episode.start:.6f}, {episode.end:.6f}]"
+        )
+    if int(np.sum(finite_selected_mask)) != 1:
+        raise RuntimeError(
+            f"Episode {episode.output_idx}: expected exactly one finite selected_goto_s event, got {int(np.sum(finite_selected_mask))}"
+        )
+    selected_goto_s = selected_goto_s[finite_selected_mask]
+    selected_goto_s_t = selected_goto_s_t[finite_selected_mask]
+
+    desired_intercept_s = selected_goto_s.astype(np.float32, copy=False).reshape(1,)
 
     return {
         "timestamps": grid,
@@ -677,6 +711,9 @@ def sample_episode(
         "action": action,
         "action_source_timestamps": action_source_timestamps,
         "action_source_age_sec": action_source_age_sec,
+        "selected_goto_s_timestamps": selected_goto_s_t,
+        "selected_goto_s_values": selected_goto_s,
+        "desired_intercept_s": desired_intercept_s,
         "command_timestamps": command_timestamps,
         "command_values": command_values,
         "target_base_timestamps": target_base_t,
@@ -738,6 +775,11 @@ def write_episode(
                 "latest_message_at_or_before_grid_time"
             )
             h5.attrs["delta_action_construction"] = "deferred_to_training_loader"
+            h5.attrs["desired_goal_source_topic"] = topics.selected_goto_s
+            h5.attrs["desired_goal_resolution"] = "single_selected_goto_s_event"
+            h5.attrs["desired_goal_coordinate"] = "captured_interception_line"
+            h5.attrs["desired_goal_positive_direction"] = "robot_base_positive_x"
+            h5.attrs["desired_goal_units"] = "m"
             h5.attrs["rgb_source_topic"] = topics.rgb
             h5.attrs["joint_source_topic"] = topics.joint
             h5.attrs["rgb_temporal_stacking"] = "deferred_to_training_loader"
@@ -772,6 +814,19 @@ def write_episode(
             )
 
             commands = h5.create_group("commands")
+            selected_goto_s = commands.create_group("selected_goto_s")
+            selected_goto_s.attrs["source_topic"] = topics.selected_goto_s
+            selected_goto_s.create_dataset(
+                "timestamps",
+                data=arrays["selected_goto_s_timestamps"],
+                dtype=np.float64,
+            )
+            selected_goto_s.create_dataset(
+                "values",
+                data=arrays["selected_goto_s_values"],
+                dtype=np.float32,
+            )
+
             goto_s = commands.create_group("goto_s")
             goto_s.attrs["source_topic"] = topics.goto_s
             goto_s.create_dataset(
@@ -791,6 +846,13 @@ def write_episode(
             )
             target_base.create_dataset(
                 "points", data=arrays["target_base_points"], dtype=np.float32
+            )
+
+            targets = h5.create_group("targets")
+            targets.create_dataset(
+                "desired_intercept_s",
+                data=arrays["desired_intercept_s"],
+                dtype=np.float32,
             )
 
         os.replace(temporary_path, output_path)
@@ -905,6 +967,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--current_tcp_s_topic", default=DEFAULT_CURRENT_TCP_S_TOPIC
     )
+    parser.add_argument("--selected_goto_s_topic", default=DEFAULT_SELECTED_GOTO_S_TOPIC)
     parser.add_argument("--goto_s_topic", default=DEFAULT_GOTO_S_TOPIC)
     parser.add_argument(
         "--goto_s_target_base_topic", default=DEFAULT_GOTO_S_TARGET_BASE_TOPIC
@@ -941,6 +1004,7 @@ def main() -> None:
         joint=args.joint_topic,
         episode=args.episode_topic,
         current_tcp_s=args.current_tcp_s_topic,
+        selected_goto_s=args.selected_goto_s_topic,
         goto_s=args.goto_s_topic,
         goto_s_target_base=args.goto_s_target_base_topic,
     )

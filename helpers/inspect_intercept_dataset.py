@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+<<<<<<< Updated upstream
 """Inspect interception HDF5 datasets and the action chunks seen by ACT.
 
 The current interception schema stores measured absolute TCP ``s`` in
@@ -13,19 +14,28 @@ loader.  This inspector therefore reports both:
 Only NumPy and h5py are required.  The script does not load complete image
 datasets unless ``--image-check-samples`` is explicitly enabled.
 """
+=======
+"""Inspect interception HDF5 datasets and summarize measured and desired-goal targets."""
+>>>>>>> Stashed changes
 
 import argparse
 import csv
 import glob
 import os
+<<<<<<< Updated upstream
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+=======
+from collections import defaultdict
+from typing import Iterable, List, Optional
+>>>>>>> Stashed changes
 
 import h5py
 import numpy as np
 
 
+<<<<<<< Updated upstream
 CONSISTENCY_ATTRIBUTES = (
     "action_coordinate",
     "action_origin",
@@ -45,36 +55,35 @@ CONSISTENCY_ATTRIBUTES = (
 def expand_paths(patterns: Sequence[str]) -> List[str]:
     paths: List[str] = []
 
+=======
+def expand_paths(patterns: List[str]) -> List[str]:
+    paths: List[str] = []
+>>>>>>> Stashed changes
     for pattern in patterns:
         matches = glob.glob(pattern)
         candidates = matches if matches else [pattern]
-
         for candidate in candidates:
             if os.path.isdir(candidate):
                 paths.extend(glob.glob(os.path.join(candidate, "*.hdf5")))
                 paths.extend(glob.glob(os.path.join(candidate, "*.h5")))
             else:
                 paths.append(candidate)
-
     return sorted(set(paths))
 
 
 def format_attribute_value(value) -> str:
+<<<<<<< Updated upstream
     """Produce a readable representation of an HDF5 attribute."""
+=======
+>>>>>>> Stashed changes
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
-
     if isinstance(value, np.ndarray):
-        return np.array2string(
-            value,
-            threshold=20,
-            edgeitems=5,
-            separator=", ",
-        )
-
+        return np.array2string(value, threshold=20, edgeitems=5, separator=", ")
     return repr(value)
 
 
+<<<<<<< Updated upstream
 def normalized_attribute_value(value):
     """Convert an HDF5 attribute to a hashable, comparable value."""
     if isinstance(value, bytes):
@@ -88,17 +97,21 @@ def normalized_attribute_value(value):
     return value
 
 
+=======
+>>>>>>> Stashed changes
 def print_attributes(obj, indent: str) -> None:
     for key, value in obj.attrs.items():
         print(f"{indent}@{key} = {format_attribute_value(value)}")
 
 
 def print_hdf5_structure(path: str, hdf5_file: h5py.File) -> None:
+<<<<<<< Updated upstream
     """Print structure and metadata without loading complete datasets."""
+=======
+>>>>>>> Stashed changes
     print("\n" + "=" * 100)
     print(f"HDF5 STRUCTURE: {path}")
     print("=" * 100)
-
     print("/  [File]")
     print_attributes(hdf5_file, indent="  ")
 
@@ -106,18 +119,12 @@ def print_hdf5_structure(path: str, hdf5_file: h5py.File) -> None:
         depth = name.count("/") + 1
         indent = "  " * depth
         basename = name.rsplit("/", 1)[-1]
-
         if isinstance(obj, h5py.Group):
             print(f"{indent}{basename}/  [Group]")
             print_attributes(obj, indent + "  ")
             return
-
         if isinstance(obj, h5py.Dataset):
-            details = [
-                f"shape={obj.shape}",
-                f"dtype={obj.dtype}",
-            ]
-
+            details = [f"shape={obj.shape}", f"dtype={obj.dtype}"]
             if obj.maxshape != obj.shape:
                 details.append(f"maxshape={obj.maxshape}")
             if obj.chunks is not None:
@@ -130,18 +137,14 @@ def print_hdf5_structure(path: str, hdf5_file: h5py.File) -> None:
                 details.append("shuffle=True")
             if obj.fletcher32:
                 details.append("fletcher32=True")
-
-            print(
-                f"{indent}{basename}  [Dataset: "
-                + ", ".join(details)
-                + "]"
-            )
+            print(f"{indent}{basename}  [Dataset: " + ", ".join(details) + "]")
             print_attributes(obj, indent + "  ")
 
     hdf5_file.visititems(visitor)
     print("=" * 100)
 
 
+<<<<<<< Updated upstream
 class WarningCollector:
     """Collect category-level warnings and print each category once."""
 
@@ -171,16 +174,58 @@ def print_counts(name: str, values: np.ndarray, zero_tol: float) -> None:
     zero = int(np.sum(np.abs(values) <= zero_tol))
     positive = int(np.sum(values > zero_tol))
     total = len(values)
+=======
+def finite_summary(values: Iterable[float]) -> Optional[dict]:
+    array = np.asarray(list(values), dtype=np.float64)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return None
+    return {
+        "count": int(array.size),
+        "min": float(np.min(array)),
+        "p25": float(np.percentile(array, 25)),
+        "median": float(np.median(array)),
+        "mean": float(np.mean(array)),
+        "p75": float(np.percentile(array, 75)),
+        "max": float(np.max(array)),
+    }
 
-    print(f"\n{name}:")
-    print(f"  total: {total}")
 
-    if total == 0:
+def print_metric_summary(label: str, values: Iterable[float], unit: str = "") -> None:
+    summary = finite_summary(values)
+    if summary is None:
+        print(f"{label}: no finite values")
         return
+    suffix = f" {unit}" if unit else ""
+    print(
+        f"{label}: n={summary['count']}, "
+        f"min/p25/median/mean/p75/max="
+        f"{summary['min']:.4f}/"
+        f"{summary['p25']:.4f}/"
+        f"{summary['median']:.4f}/"
+        f"{summary['mean']:.4f}/"
+        f"{summary['p75']:.4f}/"
+        f"{summary['max']:.4f}{suffix}"
+    )
+>>>>>>> Stashed changes
 
-    print(f"  negative:  {negative:6d} ({negative / total:.3%})")
-    print(f"  near zero: {zero:6d} ({zero / total:.3%})")
-    print(f"  positive:  {positive:6d} ({positive / total:.3%})")
+
+def direction_label(direction: int) -> str:
+    if direction > 0:
+        return "+s"
+    if direction < 0:
+        return "-s"
+    return "near-zero"
+
+
+def _direction_from_scalar(value: float, zero_tol: float) -> int:
+    if not np.isfinite(value):
+        return 0
+    if value > zero_tol:
+        return 1
+    if value < -zero_tol:
+        return -1
+    return 0
 
 
 def finite_summary(values: Iterable[float]) -> Optional[Dict[str, float]]:
@@ -1333,29 +1378,35 @@ def run_optional_image_check(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
+<<<<<<< Updated upstream
             "Print HDF5 structure, inspect stored interception actions, "
             "and audit loader-style relative action chunks, direction "
             "symmetry, timing, padding, and integrity."
+=======
+            "Print HDF5 structure and inspect interception-action balance, "
+            "including desired-goal target coverage when present."
+>>>>>>> Stashed changes
         )
     )
-    parser.add_argument(
-        "paths",
-        nargs="+",
-        help="HDF5 files, dataset directories, or glob patterns.",
-    )
+    parser.add_argument("paths", nargs="+", help="HDF5 files, dataset directories, or glob patterns.")
     parser.add_argument(
         "--zero-tol",
         type=float,
         default=1e-6,
+<<<<<<< Updated upstream
         help=(
             "Absolute values at or below this threshold are classified "
             "as near zero. Default: 1e-6."
         ),
+=======
+        help="Absolute delta-s values at or below this threshold are classified as near zero.",
+>>>>>>> Stashed changes
     )
     parser.add_argument(
         "--structure",
         choices=("none", "first", "all"),
         default="first",
+<<<<<<< Updated upstream
         help=(
             "Print no structures, the structure of the first file, or "
             "the structure of every file. Default: first."
@@ -1393,6 +1444,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Episodes with |final-start| at or below this value are "
             "classified as near-zero. Default: 0.005 m."
         ),
+=======
+        help="Print no structures, the complete structure of the first file, or every file.",
+>>>>>>> Stashed changes
     )
     parser.add_argument(
         "--motion-threshold",
@@ -1522,11 +1576,15 @@ def main() -> None:
     missing_paths = [path for path in paths if not os.path.isfile(path)]
     for path in missing_paths:
         print(f"[WARN] file not found: {path}")
+<<<<<<< Updated upstream
 
+=======
+>>>>>>> Stashed changes
     paths = [path for path in paths if os.path.isfile(path)]
     if not paths:
         raise RuntimeError("None of the resolved paths are valid files.")
 
+<<<<<<< Updated upstream
     warnings = WarningCollector()
     chunks = ChunkAccumulator(chunk_size=args.chunk_size)
     records: List[EpisodeRecord] = []
@@ -1535,12 +1593,25 @@ def main() -> None:
     episode_displacements: List[float] = []
     legacy_flags: List[np.ndarray] = []
     attribute_values: Dict[str, Counter] = defaultdict(Counter)
+=======
+    delta_s_values = []
+    episode_mean_delta_s = []
+    episode_net_delta_s = []
+    legacy_flags = []
+    selected_goto_s_counts = []
+    desired_goal_values = []
+    desired_goal_deltas = []
+    desired_goal_start_vs_goal = []
+    desired_goal_by_direction = {"+s": [], "-s": [], "near-zero": []}
+    missing_or_ambiguous_goal_episodes = []
+>>>>>>> Stashed changes
 
     opened_files = 0
     skipped_files = 0
 
     for file_index, path in enumerate(paths):
         try:
+<<<<<<< Updated upstream
             with h5py.File(path, "r") as hdf5_file:
                 opened_files += 1
                 if (
@@ -1564,9 +1635,77 @@ def main() -> None:
                     warnings,
                     chunks,
                 )
+=======
+            with h5py.File(path, "r") as f:
+                if args.structure == "all" or (args.structure == "first" and file_index == 0):
+                    print_hdf5_structure(path, f)
+
+                if "action" not in f:
+                    print(f"[WARN] skipping action analysis for {path}: missing /action")
+                    skipped_files += 1
+                    continue
+
+                action = np.asarray(f["action"][:])
+                if action.ndim != 2:
+                    print(f"[WARN] skipping action analysis for {path}: /action shape is {action.shape}, expected (T, D)")
+                    skipped_files += 1
+                    continue
+                if action.shape[0] == 0:
+                    print(f"[WARN] skipping {path}: /action is empty")
+                    skipped_files += 1
+                    continue
+
+                if action.shape[1] == 1:
+                    episode_delta_s = action[:, 0]
+                    if not np.all(np.isfinite(episode_delta_s)):
+                        print(f"[WARN] skipping {path}: non-finite delta_s values")
+                        skipped_files += 1
+                        continue
+
+                    delta_s_values.append(episode_delta_s)
+                    episode_mean_delta_s.append(float(np.mean(episode_delta_s)))
+                    episode_net_delta_s.append(float(np.sum(episode_delta_s)))
+                    current_files += 1
+
+                    selected_values = None
+                    if (
+                        "/commands/selected_goto_s/timestamps" in f
+                        and "/commands/selected_goto_s/values" in f
+                        and "/targets/desired_intercept_s" in f
+                    ):
+                        selected_values = np.asarray(f["/commands/selected_goto_s/values"][:], dtype=np.float32).reshape(-1)
+                        selected_count = int(np.sum(np.isfinite(selected_values)))
+                        selected_goto_s_counts.append(selected_count)
+                        if selected_count != 1:
+                            missing_or_ambiguous_goal_episodes.append((path, selected_count))
+                        else:
+                            desired_goal = float(np.asarray(f["/targets/desired_intercept_s"][:], dtype=np.float32).reshape(-1)[0])
+                            if not np.isfinite(desired_goal):
+                                missing_or_ambiguous_goal_episodes.append((path, selected_count))
+                            else:
+                                desired_goal_values.append(desired_goal)
+                                delta_goal = desired_goal - episode_delta_s
+                                desired_goal_deltas.extend(delta_goal.tolist())
+                                desired_goal_start_vs_goal.append((float(episode_delta_s[0]), desired_goal))
+                                bucket = direction_label(_direction_from_scalar(desired_goal, args.zero_tol))
+                                desired_goal_by_direction[bucket].append(desired_goal)
+
+                elif action.shape[1] == 2:
+                    flags = action[:, 1]
+                    if not np.all(np.isfinite(flags)):
+                        print(f"[WARN] skipping {path}: non-finite commanded flags")
+                        skipped_files += 1
+                        continue
+                    legacy_flags.append(flags)
+                    legacy_files += 1
+                else:
+                    print(f"[WARN] skipping action analysis for {path}: unsupported /action shape {action.shape}")
+                    skipped_files += 1
+>>>>>>> Stashed changes
         except OSError as exc:
             warnings.add("unable to open file", f"{path}: {exc}")
             skipped_files += 1
+<<<<<<< Updated upstream
             continue
 
         if legacy is not None:
@@ -1586,10 +1725,13 @@ def main() -> None:
         stored_scalar_values.append(action)
         episode_stored_means.append(float(np.mean(action)))
         episode_displacements.append(record.displacement)
+=======
+>>>>>>> Stashed changes
 
     print("\n" + "=" * 100)
     print("DATASET SUMMARY")
     print("=" * 100)
+<<<<<<< Updated upstream
     print(f"files resolved:                 {len(paths)}")
     print(f"files opened:                   {opened_files}")
     print(f"current scalar-action files:    {len(records)}")
@@ -1635,14 +1777,50 @@ def main() -> None:
             displacements,
             args.direction_tol,
         )
+=======
+    print(f"files found:                  {len(paths)}")
+    print(f"current delta-s files:        {current_files}")
+    print(f"legacy commanded-flag files: {legacy_files}")
+    print(f"skipped/unsupported files:    {skipped_files}")
+
+    if delta_s_values:
+        delta_s = np.concatenate(delta_s_values)
+        episode_means = np.asarray(episode_mean_delta_s, dtype=np.float64)
+        episode_nets = np.asarray(episode_net_delta_s, dtype=np.float64)
+
+        print("\nCurrent schema: /action shape (T, 1)")
+        print_metric_summary("delta_s", delta_s)
+        print_metric_summary("|delta_s|", np.abs(delta_s))
+        print_metric_summary("Per-episode mean delta_s", episode_means)
+        print_metric_summary("Per-episode summed delta_s", episode_nets)
+
+        if selected_goto_s_counts:
+            print("\nSelected goal event counts:")
+            print_metric_summary("selected_goto_s events per episode", selected_goto_s_counts)
+
+        if desired_goal_values:
+            print("\nDesired goal summary by direction:")
+            for label in ("+s", "-s", "near-zero"):
+                values = desired_goal_by_direction[label]
+                if values:
+                    print_metric_summary(f"desired_intercept_s {label}", values, unit="m")
+            print_metric_summary("desired_intercept_s (all)", desired_goal_values, unit="m")
+            print_metric_summary("delta_goal over all anchors", desired_goal_deltas, unit="m")
+            print_metric_summary("starting TCP s", [pair[0] for pair in desired_goal_start_vs_goal], unit="m")
+            print_metric_summary("goal s", [pair[1] for pair in desired_goal_start_vs_goal], unit="m")
+
+        if missing_or_ambiguous_goal_episodes:
+            print("\nEpisodes missing or containing multiple goal events:")
+            for path, selected_count in missing_or_ambiguous_goal_episodes[:20]:
+                print(f"  {path}: selected_goto_s finite_count={selected_count}")
+            if len(missing_or_ambiguous_goal_episodes) > 20:
+                print(f"  ... and {len(missing_or_ambiguous_goal_episodes) - 20} more")
+>>>>>>> Stashed changes
 
     if legacy_flags:
         flags = np.concatenate(legacy_flags)
-        zero_flags = np.isclose(flags, 0.0)
-        one_flags = np.isclose(flags, 1.0)
-        valid_binary = zero_flags | one_flags
-
         print("\nLegacy schema: /action shape (T, 2)")
+<<<<<<< Updated upstream
         print("unique commanded flags:", np.unique(flags))
         print("uncommanded:", int(np.sum(zero_flags)))
         print("commanded:", int(np.sum(one_flags)))
@@ -1652,6 +1830,11 @@ def main() -> None:
                 "non-binary legacy commanded flags",
                 f"{int(np.sum(~valid_binary))} sample(s)",
             )
+=======
+        print(f"unique commanded flags: {np.unique(flags)}")
+        print(f"uncommanded: {int(np.sum(np.isclose(flags, 0.0)))}")
+        print(f"commanded: {int(np.sum(np.isclose(flags, 1.0)))}")
+>>>>>>> Stashed changes
 
     print_attribute_consistency(attribute_values)
 
