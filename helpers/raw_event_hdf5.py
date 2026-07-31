@@ -182,7 +182,9 @@ class RawEventStore:
         missing = [k for k in required if k not in self.f]
         if missing:
             self.f.close()
-            raise RuntimeError(f"Raw event HDF5 missing required datasets: {missing}")
+            raise ValueError(
+                f"Raw event HDF5 missing required datasets: {missing}"
+            )
 
         self.events_type_ds = self.f["events/type"]
         self.events_x_ds = self.f["events/x"]
@@ -192,6 +194,56 @@ class RawEventStore:
         self.packets_start_event_idx_ds = self.f["packets/start_event_idx"]
         self.packets_end_event_idx_ds = self.f["packets/end_event_idx"]
 
+        event_shapes = {
+            "events/type": self.events_type_ds.shape,
+            "events/x": self.events_x_ds.shape,
+            "events/y": self.events_y_ds.shape,
+            "events/t_us": self.events_t_us_ds.shape,
+        }
+        for dataset_name, shape in event_shapes.items():
+            if len(shape) != 1:
+                self.f.close()
+                raise ValueError(
+                    f"Malformed {dataset_name}: expected 1-D array, got shape {shape}"
+                )
+
+        event_lengths = {name: int(shape[0]) for name, shape in event_shapes.items()}
+        if len(set(event_lengths.values())) != 1:
+            self.f.close()
+            raise ValueError(
+                "Malformed event arrays: expected equal lengths for "
+                f"events/type, events/x, events/y, events/t_us; got {event_lengths}"
+            )
+        num_events = int(self.events_t_us_ds.shape[0])
+
+        packet_shapes = {
+            "packets/ros_t_ns": self.packets_ros_t_ns_ds.shape,
+            "packets/start_event_idx": self.packets_start_event_idx_ds.shape,
+            "packets/end_event_idx": self.packets_end_event_idx_ds.shape,
+        }
+        for dataset_name, shape in packet_shapes.items():
+            if len(shape) != 1:
+                self.f.close()
+                raise ValueError(
+                    f"Malformed {dataset_name}: expected 1-D array, got shape {shape}"
+                )
+
+        packet_lengths = {
+            name: int(shape[0]) for name, shape in packet_shapes.items()
+        }
+        if len(set(packet_lengths.values())) != 1:
+            self.f.close()
+            raise ValueError(
+                "Malformed packet arrays: expected equal lengths for "
+                "packets/ros_t_ns, packets/start_event_idx, packets/end_event_idx; "
+                f"got {packet_lengths}"
+            )
+        if int(self.packets_ros_t_ns_ds.shape[0]) <= 0:
+            self.f.close()
+            raise ValueError(
+                "Malformed packets/ros_t_ns: expected at least one packet timestamp"
+            )
+
         self.packet_ros_t_ns = np.asarray(self.packets_ros_t_ns_ds[:], dtype=np.int64)
         self.packet_start_event_idx = np.asarray(
             self.packets_start_event_idx_ds[:], dtype=np.int64
@@ -200,8 +252,84 @@ class RawEventStore:
             self.packets_end_event_idx_ds[:], dtype=np.int64
         )
 
-        self.width = int(self.f.attrs.get("width", 320))
-        self.height = int(self.f.attrs.get("height", 320))
+        if np.any(self.packet_ros_t_ns < 0):
+            self.f.close()
+            raise ValueError(
+                "Malformed packets/ros_t_ns: packet ROS timestamps must be >= 0"
+            )
+        if np.any(np.diff(self.packet_ros_t_ns) < 0):
+            self.f.close()
+            raise ValueError(
+                "Malformed packets/ros_t_ns: packet ROS timestamps must be non-decreasing"
+            )
+
+        if np.any(np.diff(self.packet_start_event_idx) < 0):
+            self.f.close()
+            raise ValueError(
+                "Malformed packets/start_event_idx: indices must be non-decreasing"
+            )
+        if np.any(np.diff(self.packet_end_event_idx) < 0):
+            self.f.close()
+            raise ValueError(
+                "Malformed packets/end_event_idx: indices must be non-decreasing"
+            )
+
+        if np.any(self.packet_start_event_idx < 0):
+            self.f.close()
+            raise ValueError(
+                "Malformed packets/start_event_idx: values must be >= 0"
+            )
+        if np.any(self.packet_end_event_idx < 0):
+            self.f.close()
+            raise ValueError(
+                "Malformed packets/end_event_idx: values must be >= 0"
+            )
+        if np.any(self.packet_start_event_idx > self.packet_end_event_idx):
+            self.f.close()
+            raise ValueError(
+                "Malformed packet indices: require start_event_idx <= end_event_idx for every packet"
+            )
+        if np.any(self.packet_end_event_idx > num_events):
+            self.f.close()
+            raise ValueError(
+                "Malformed packets/end_event_idx: value exceeds number of events "
+                f"({num_events})"
+            )
+
+        if "width" not in self.f.attrs:
+            self.f.close()
+            raise ValueError("Malformed sidecar metadata: missing attribute 'width'")
+        if "height" not in self.f.attrs:
+            self.f.close()
+            raise ValueError("Malformed sidecar metadata: missing attribute 'height'")
+
+        width_attr = self.f.attrs["width"]
+        height_attr = self.f.attrs["height"]
+        width_float = float(width_attr)
+        height_float = float(height_attr)
+        if not width_float.is_integer():
+            self.f.close()
+            raise ValueError(
+                f"Malformed sidecar metadata: width must be an integer, got {width_attr}"
+            )
+        if not height_float.is_integer():
+            self.f.close()
+            raise ValueError(
+                f"Malformed sidecar metadata: height must be an integer, got {height_attr}"
+            )
+
+        self.width = int(width_float)
+        self.height = int(height_float)
+        if self.width <= 0:
+            self.f.close()
+            raise ValueError(
+                f"Malformed sidecar metadata: width must be positive, got {self.width}"
+            )
+        if self.height <= 0:
+            self.f.close()
+            raise ValueError(
+                f"Malformed sidecar metadata: height must be positive, got {self.height}"
+            )
 
         if self.packet_ros_t_ns.size > 0:
             self.packet_ros_start_ns = int(self.packet_ros_t_ns[0])

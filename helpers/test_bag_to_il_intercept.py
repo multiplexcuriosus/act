@@ -101,10 +101,16 @@ class BagToIlInterceptTests(unittest.TestCase):
             goto_s_target_base="/trajectory_executor/executed_goto_s_target_base",
         )
 
-    def make_episode(self):
-        return self.mod.EpisodeWindow(source_idx=0, output_idx=0, start=0.0, end=0.4)
+    def make_episode(self, start=0.0, end=0.4):
+        return self.mod.EpisodeWindow(source_idx=0, output_idx=0, start=start, end=end)
 
-    def make_sampling_data(self, tcp_times, tcp_values, goto_values=None):
+    def make_sampling_data(
+        self,
+        tcp_times,
+        tcp_values,
+        goto_values=None,
+        base_time=0.0,
+    ):
         rgb0 = np.array([[[0, 0, 255]]], dtype=np.uint8)
         rgb1 = np.array([[[0, 255, 0]]], dtype=np.uint8)
         rgb2 = np.array([[[255, 0, 0]]], dtype=np.uint8)
@@ -114,9 +120,9 @@ class BagToIlInterceptTests(unittest.TestCase):
             self.make_raw_msg_bgr(rgb2),
         ]
         data = {
-            "rgb_t": [0.0, 0.1, 0.2],
+            "rgb_t": [base_time + 0.0, base_time + 0.1, base_time + 0.2],
             "rgb_msg": rgb_msgs,
-            "joint_t": [0.0, 0.1, 0.2],
+            "joint_t": [base_time + 0.0, base_time + 0.1, base_time + 0.2],
             "qpos": [
                 np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.float32),
                 np.asarray([2, 3, 4, 5, 6, 7, 8], dtype=np.float32),
@@ -130,37 +136,59 @@ class BagToIlInterceptTests(unittest.TestCase):
             "target_base": [],
         }
         if goto_values is not None:
-            data["goto_s_t"] = [0.05 + 0.1 * i for i in range(len(goto_values))]
+            data["goto_s_t"] = [
+                base_time + 0.05 + 0.1 * i for i in range(len(goto_values))
+            ]
             data["goto_s"] = list(goto_values)
         return data
 
     @staticmethod
-    def make_raw_events_h5(path: str):
+    def make_raw_events_h5(
+        path: str,
+        event_t_us=None,
+        packet_ros_t_ns=None,
+        packet_start_event_idx=None,
+        packet_end_event_idx=None,
+    ):
+        if event_t_us is None:
+            event_t_us = [780_000, 950_000, 1_050_000, 1_220_000]
+        if packet_ros_t_ns is None:
+            packet_ros_t_ns = [
+                780_000_000,
+                950_000_000,
+                1_050_000_000,
+                1_220_000_000,
+            ]
+        if packet_start_event_idx is None:
+            packet_start_event_idx = [0, 1, 2, 3]
+        if packet_end_event_idx is None:
+            packet_end_event_idx = [1, 2, 3, 4]
+
         with h5py.File(path, "w") as h5:
             h5.attrs["width"] = 1
             h5.attrs["height"] = 1
             events = h5.create_group("events")
             packets = h5.create_group("packets")
 
-            events.create_dataset("type", data=np.asarray([1, 1, 1], dtype=np.uint8))
-            events.create_dataset("x", data=np.asarray([0, 0, 0], dtype=np.int16))
-            events.create_dataset("y", data=np.asarray([0, 0, 0], dtype=np.int16))
+            events.create_dataset("type", data=np.asarray([1] * len(event_t_us), dtype=np.uint8))
+            events.create_dataset("x", data=np.asarray([0] * len(event_t_us), dtype=np.int16))
+            events.create_dataset("y", data=np.asarray([0] * len(event_t_us), dtype=np.int16))
             events.create_dataset(
                 "t_us",
-                data=np.asarray([100_000, 150_000, 210_000], dtype=np.int64),
+                data=np.asarray(event_t_us, dtype=np.int64),
             )
 
             packets.create_dataset(
                 "ros_t_ns",
-                data=np.asarray([100_000_000, 160_000_000, 220_000_000], dtype=np.int64),
+                data=np.asarray(packet_ros_t_ns, dtype=np.int64),
             )
             packets.create_dataset(
                 "start_event_idx",
-                data=np.asarray([0, 1, 2], dtype=np.int64),
+                data=np.asarray(packet_start_event_idx, dtype=np.int64),
             )
             packets.create_dataset(
                 "end_event_idx",
-                data=np.asarray([1, 2, 3], dtype=np.int64),
+                data=np.asarray(packet_end_event_idx, dtype=np.int64),
             )
 
     def test_decode_raw_image_msg(self):
@@ -402,8 +430,9 @@ class BagToIlInterceptTests(unittest.TestCase):
 
     def test_event_sidecar_shape_dtype_and_non_negative_age(self):
         data = self.make_sampling_data(
-            tcp_times=[0.0, 0.1, 0.2],
+            tcp_times=[1.0, 1.1, 1.2],
             tcp_values=[-0.5, 0.25, 0.75],
+            base_time=1.0,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             sidecar_path = os.path.join(tmpdir, "raw_events.h5")
@@ -412,7 +441,7 @@ class BagToIlInterceptTests(unittest.TestCase):
             try:
                 arrays = self.mod.sample_episode(
                     data=data,
-                    episode=self.make_episode(),
+                    episode=self.make_episode(start=1.0, end=1.4),
                     fps=10.0,
                     max_current_tcp_s_age_sec=0.2,
                     raw_event_store=store,
@@ -431,38 +460,49 @@ class BagToIlInterceptTests(unittest.TestCase):
 
     def test_event_empty_window_produces_neutral_128(self):
         data = self.make_sampling_data(
-            tcp_times=[0.0, 0.1, 0.2],
+            tcp_times=[1.0, 1.1, 1.2],
             tcp_values=[-0.5, 0.25, 0.75],
+            base_time=1.0,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             sidecar_path = os.path.join(tmpdir, "raw_events.h5")
-            self.make_raw_events_h5(sidecar_path)
+            self.make_raw_events_h5(
+                sidecar_path,
+                # Include one packet event that is too old for shifted middle bin
+                # while preserving required sidecar coverage interval.
+                event_t_us=[700_000, 1_000_000, 1_200_000],
+                packet_ros_t_ns=[800_000_000, 1_000_000_000, 1_200_000_000],
+                packet_start_event_idx=[0, 1, 2],
+                packet_end_event_idx=[1, 2, 3],
+            )
             store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
             try:
                 arrays = self.mod.sample_episode(
                     data=data,
-                    episode=self.make_episode(),
+                    episode=self.make_episode(start=1.0, end=1.4),
                     fps=10.0,
                     max_current_tcp_s_age_sec=0.2,
                     raw_event_store=store,
                     event_frame_windows_ms=(50.0, 100.0, 200.0),
                     event_frame_mode="shifted",
                     event_clip_count=4.0,
-                    event_packet_margin_ms=0.0,
                 )
             finally:
                 store.close()
 
-        self.assertEqual(int(arrays["event"][0, 0, 0, 0]), 128)
+        # For the first sampled frame, shifted channel 1 has no events and stays neutral.
+        self.assertEqual(int(arrays["event"][0, 0, 0, 1]), 128)
 
     def test_existing_arrays_unchanged_when_event_sidecar_added(self):
         data = self.make_sampling_data(
-            tcp_times=[0.0, 0.1, 0.2],
+            tcp_times=[1.0, 1.1, 1.2],
             tcp_values=[-0.5, 0.25, 0.75],
+            base_time=1.0,
         )
+        episode = self.make_episode(start=1.0, end=1.4)
         without_events = self.mod.sample_episode(
             data=data,
-            episode=self.make_episode(),
+            episode=episode,
             fps=10.0,
             max_current_tcp_s_age_sec=0.2,
         )
@@ -474,7 +514,7 @@ class BagToIlInterceptTests(unittest.TestCase):
             try:
                 with_events = self.mod.sample_episode(
                     data=data,
-                    episode=self.make_episode(),
+                    episode=episode,
                     fps=10.0,
                     max_current_tcp_s_age_sec=0.2,
                     raw_event_store=store,
@@ -520,10 +560,12 @@ class BagToIlInterceptTests(unittest.TestCase):
 
     def test_write_episode_with_event_sidecar_writes_expected_schema(self):
         data = self.make_sampling_data(
-            tcp_times=[0.0, 0.1, 0.2],
+            tcp_times=[1.0, 1.1, 1.2],
             tcp_values=[-0.5, 0.25, 0.75],
+            base_time=1.0,
         )
         topics = self.make_topics()
+        episode = self.make_episode(start=1.0, end=1.4)
         with tempfile.TemporaryDirectory() as tmpdir:
             sidecar_path = os.path.join(tmpdir, "raw_events.h5")
             self.make_raw_events_h5(sidecar_path)
@@ -531,7 +573,7 @@ class BagToIlInterceptTests(unittest.TestCase):
             try:
                 arrays = self.mod.sample_episode(
                     data=data,
-                    episode=self.make_episode(),
+                    episode=episode,
                     fps=10.0,
                     max_current_tcp_s_age_sec=0.2,
                     raw_event_store=store,
@@ -546,7 +588,7 @@ class BagToIlInterceptTests(unittest.TestCase):
             self.mod.write_episode(
                 output_path=out_path,
                 arrays=arrays,
-                episode=self.make_episode(),
+                episode=episode,
                 topics=topics,
                 fps=10.0,
                 compression="gzip",
@@ -575,6 +617,201 @@ class BagToIlInterceptTests(unittest.TestCase):
                     "latest_packet_at_or_before_grid_time",
                 )
                 self.assertEqual(h5.attrs["event_neutral_u8"], 128)
+                self.assertEqual(h5.attrs["event_representation"], "shifted_3chef_signed")
+                self.assertEqual(h5.attrs["event_frame_mode"], "shifted")
+
+    def test_sidecar_coverage_start_too_late_is_rejected(self):
+        data = self.make_sampling_data(
+            tcp_times=[1.0, 1.1, 1.2],
+            tcp_values=[0.0, 0.1, 0.2],
+            base_time=1.0,
+        )
+        episode = self.make_episode(start=1.0, end=1.4)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            # First packet at 0.85s, but required start is 0.8s.
+            self.make_raw_events_h5(
+                sidecar_path,
+                packet_ros_t_ns=[850_000_000, 950_000_000, 1_050_000_000],
+                packet_start_event_idx=[0, 1, 2],
+                packet_end_event_idx=[1, 2, 3],
+                event_t_us=[850_000, 950_000, 1_050_000],
+            )
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                with self.assertRaises(RuntimeError):
+                    self.mod.sample_episode(
+                        data=data,
+                        episode=episode,
+                        fps=10.0,
+                        max_current_tcp_s_age_sec=0.2,
+                        raw_event_store=store,
+                        event_frame_windows_ms=(50.0, 100.0, 200.0),
+                        event_frame_mode="shifted",
+                        event_clip_count=4.0,
+                    )
+            finally:
+                store.close()
+
+    def test_sidecar_coverage_end_too_early_is_rejected(self):
+        data = self.make_sampling_data(
+            tcp_times=[1.0, 1.1, 1.2],
+            tcp_values=[0.0, 0.1, 0.2],
+            base_time=1.0,
+        )
+        episode = self.make_episode(start=1.0, end=1.4)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            self.make_raw_events_h5(
+                sidecar_path,
+                packet_ros_t_ns=[780_000_000, 950_000_000, 1_150_000_000],
+                packet_start_event_idx=[0, 1, 2],
+                packet_end_event_idx=[1, 2, 3],
+                event_t_us=[780_000, 950_000, 1_150_000],
+            )
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                with self.assertRaises(RuntimeError):
+                    self.mod.sample_episode(
+                        data=data,
+                        episode=episode,
+                        fps=10.0,
+                        max_current_tcp_s_age_sec=0.2,
+                        raw_event_store=store,
+                        event_frame_windows_ms=(50.0, 100.0, 200.0),
+                        event_frame_mode="shifted",
+                        event_clip_count=4.0,
+                    )
+            finally:
+                store.close()
+
+    def test_missing_causal_packet_raises_instead_of_faking_source_timestamp(self):
+        data = self.make_sampling_data(
+            tcp_times=[1.0, 1.1, 1.2],
+            tcp_values=[0.0, 0.1, 0.2],
+            base_time=1.0,
+        )
+        episode = self.make_episode(start=1.0, end=1.4)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            # Coverage exists at both ends, but there is a large gap causing no causal packet
+            # for mid-grid timestamps when search window starts after the earlier packet.
+            self.make_raw_events_h5(
+                sidecar_path,
+                packet_ros_t_ns=[800_000_000, 1_300_000_000],
+                packet_start_event_idx=[0, 1],
+                packet_end_event_idx=[1, 2],
+                event_t_us=[800_000, 1_300_000],
+            )
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                with self.assertRaises(RuntimeError):
+                    self.mod.sample_episode(
+                        data=data,
+                        episode=episode,
+                        fps=10.0,
+                        max_current_tcp_s_age_sec=0.2,
+                        raw_event_store=store,
+                        event_frame_windows_ms=(50.0, 100.0, 200.0),
+                        event_frame_mode="shifted",
+                        event_clip_count=4.0,
+                    )
+            finally:
+                store.close()
+
+    def test_event_source_timestamps_are_causal_and_ages_match_difference(self):
+        data = self.make_sampling_data(
+            tcp_times=[1.0, 1.1, 1.2],
+            tcp_values=[0.0, 0.1, 0.2],
+            base_time=1.0,
+        )
+        episode = self.make_episode(start=1.0, end=1.4)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            self.make_raw_events_h5(sidecar_path)
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                arrays = self.mod.sample_episode(
+                    data=data,
+                    episode=episode,
+                    fps=10.0,
+                    max_current_tcp_s_age_sec=0.2,
+                    raw_event_store=store,
+                    event_frame_windows_ms=(50.0, 100.0, 200.0),
+                    event_frame_mode="shifted",
+                    event_clip_count=4.0,
+                )
+            finally:
+                store.close()
+
+        grid_ts = arrays["timestamps"]
+        src_ts = arrays["event_source_timestamps"]
+        age_sec = arrays["event_source_age_sec"]
+        packet_ts_set_ns = {780_000_000, 950_000_000, 1_050_000_000, 1_220_000_000}
+        for idx in range(grid_ts.size):
+            self.assertLessEqual(src_ts[idx], grid_ts[idx])
+            src_ns = int(np.rint(src_ts[idx] * 1e9))
+            self.assertIn(src_ns, packet_ts_set_ns)
+            self.assertAlmostEqual(float(age_sec[idx]), float(grid_ts[idx] - src_ts[idx]), places=6)
+
+    def test_cumulative_mode_is_rejected_by_parse_args(self):
+        argv = list(sys.argv)
+        try:
+            sys.argv = [
+                "bag_to_il_intercept.py",
+                "--bag",
+                "/tmp/bag",
+                "--out_dir",
+                "/tmp/out",
+                "--event_frame_mode",
+                "cumulative",
+            ]
+            with self.assertRaises(SystemExit):
+                self.mod.parse_args()
+        finally:
+            sys.argv = argv
+
+    def test_write_episode_rejects_non_shifted_event_metadata_mode(self):
+        data = self.make_sampling_data(
+            tcp_times=[1.0, 1.1, 1.2],
+            tcp_values=[0.0, 0.1, 0.2],
+            base_time=1.0,
+        )
+        episode = self.make_episode(start=1.0, end=1.4)
+        topics = self.make_topics()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            self.make_raw_events_h5(sidecar_path)
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                arrays = self.mod.sample_episode(
+                    data=data,
+                    episode=episode,
+                    fps=10.0,
+                    max_current_tcp_s_age_sec=0.2,
+                    raw_event_store=store,
+                    event_frame_windows_ms=(50.0, 100.0, 200.0),
+                    event_frame_mode="shifted",
+                    event_clip_count=4.0,
+                )
+            finally:
+                store.close()
+
+            with self.assertRaises(RuntimeError):
+                self.mod.write_episode(
+                    output_path=os.path.join(tmpdir, "episode_0.hdf5"),
+                    arrays=arrays,
+                    episode=episode,
+                    topics=topics,
+                    fps=10.0,
+                    compression="none",
+                    overwrite=False,
+                    raw_events_h5=sidecar_path,
+                    event_frame_windows_ms=(50.0, 100.0, 200.0),
+                    event_frame_mode="cumulative",
+                    event_clip_count=4.0,
+                )
 
 
 if __name__ == "__main__":

@@ -503,6 +503,7 @@ def sample_episode(
     grid = np.arange(effective_start, effective_end + 1e-9, dt, dtype=np.float64)
     if grid.size == 0:
         raise RuntimeError(f"Episode {episode.output_idx}: empty sampling grid")
+    grid_ns = np.rint(grid * 1e9).astype(np.int64)
 
     rgb_indices = np.searchsorted(rgb_times, grid, side="right") - 1
     joint_indices = np.searchsorted(joint_times, grid, side="right") - 1
@@ -566,11 +567,37 @@ def sample_episode(
                 "event_clip_count must be explicitly provided and positive when "
                 "raw-event sidecar conversion is enabled"
             )
+        if event_frame_mode != "shifted":
+            raise RuntimeError(
+                "Interception event conversion supports only shifted mode"
+            )
+
+        max_window_ns = int(np.rint(max(event_frame_windows_ms) * 1e6))
+        required_start_ns = int(grid_ns[0] - max_window_ns)
+        required_end_ns = int(grid_ns[-1])
+        required_start_sec = required_start_ns * 1e-9
+        required_end_sec = required_end_ns * 1e-9
+        available_start_ns = raw_event_store.packet_ros_start_ns
+        available_end_ns = raw_event_store.packet_ros_end_ns
+        episode_name = f"episode_{episode.output_idx}"
+
+        if available_start_ns is None or available_end_ns is None:
+            raise RuntimeError(
+                f"{episode_name}: raw-event sidecar has no packet timestamps; "
+                f"required interval {required_start_sec:.6f}s..{required_end_sec:.6f}s"
+            )
+        if available_start_ns > required_start_ns or available_end_ns < required_end_ns:
+            available_start_sec = available_start_ns * 1e-9
+            available_end_sec = available_end_ns * 1e-9
+            raise RuntimeError(
+                f"{episode_name}: raw-event sidecar coverage is incomplete; "
+                f"required interval={required_start_sec:.6f}s..{required_end_sec:.6f}s, "
+                f"available interval={available_start_sec:.6f}s..{available_end_sec:.6f}s"
+            )
 
         event_frames: List[np.ndarray] = []
         event_source_ns = np.empty((grid.size,), dtype=np.int64)
         event_counts = np.empty((grid.size, 3), dtype=np.int32)
-
         for index, t_g in enumerate(grid):
             frame_u8, source_packet_ros_t_ns, counts = (
                 raw_event_store.frame_3chef_with_metadata_at_bag_time(
@@ -586,13 +613,25 @@ def sample_episode(
             event_frames.append(frame_u8)
             event_counts[index, :] = counts
             if source_packet_ros_t_ns is None:
-                event_source_ns[index] = int(np.rint(t_g * 1e9))
-            else:
-                event_source_ns[index] = int(source_packet_ros_t_ns)
+                raise RuntimeError(
+                    f"{episode_name}: missing causal event source packet for "
+                    f"grid timestamp {float(t_g):.6f}s"
+                )
+
+            source_ns = int(source_packet_ros_t_ns)
+            if source_ns > int(grid_ns[index]):
+                raise RuntimeError(
+                    f"{episode_name}: non-causal event source packet detected "
+                    f"(source={source_ns}, grid={int(grid_ns[index])})"
+                )
+            event_source_ns[index] = source_ns
 
         event = np.stack(event_frames, axis=0).astype(np.uint8, copy=False)
         event_source_timestamps = event_source_ns.astype(np.float64) * 1e-9
-        event_source_age_sec = (grid - event_source_timestamps).astype(np.float32)
+        event_age_ns = grid_ns - event_source_ns
+        event_source_age_sec = (event_age_ns.astype(np.float64) * 1e-9).astype(
+            np.float32
+        )
         if np.any(event_source_age_sec < 0.0):
             min_age = float(np.min(event_source_age_sec))
             raise RuntimeError(
@@ -714,6 +753,11 @@ def write_episode(
                 if event_clip_count is None:
                     raise RuntimeError(
                         "event data present but event_clip_count is missing"
+                    )
+                if event_frame_mode != "shifted":
+                    raise RuntimeError(
+                        "Inconsistent event metadata: interception event sidecar "
+                        "must use event_frame_mode='shifted'"
                     )
                 h5.attrs["event_representation"] = "shifted_3chef_signed"
                 h5.attrs["event_frame_windows_ms"] = np.asarray(
@@ -916,9 +960,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--event_frame_mode",
-        choices=("shifted", "cumulative"),
         default="shifted",
-        help="Event channel binning mode.",
+        help="Event channel binning mode (shifted only for interception conversion).",
     )
     parser.add_argument(
         "--event_clip_count",
@@ -969,6 +1012,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--event_clip_count must be positive when provided")
     if args.event_packet_margin_ms < 0.0:
         parser.error("--event_packet_margin_ms must be non-negative")
+    if args.event_frame_mode != "shifted":
+        parser.error(
+            "--event_frame_mode must be 'shifted' for interception conversion"
+        )
     return args
 
 
