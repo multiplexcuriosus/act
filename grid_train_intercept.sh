@@ -2,7 +2,8 @@
 set -euo pipefail
 
 DATASETS=(
-  "/home/dyros/Data/jg_data/hdf5/hdf5_20260727_133739_pipeline_test"
+  "/home/dyros/Data/jg_data/hdf5/hdf5_20260728_225008"
+  "/home/dyros/Data/jg_data/hdf5/hdf5_20260727_215525"
 )
 
 # HDF5 qpos remains (T, 7), but the loader concatenates:

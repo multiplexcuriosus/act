@@ -890,7 +890,16 @@ def resolve_input_paths(
     )
     if args.raw_events_h5 is not None:
         return bag_path, os.path.abspath(os.path.expanduser(args.raw_events_h5))
-    return bag_path, auto_raw_events_h5
+
+    # In --rec_dir mode, event conversion is expected to use a colocated sidecar
+    # named <recording_name>_raw_events.h5 when --event_clip_count is provided.
+    if auto_raw_events_h5 is not None:
+        return bag_path, auto_raw_events_h5
+    if args.event_clip_count is not None:
+        rec_name = os.path.basename(os.path.normpath(rec_dir))
+        expected_sidecar = os.path.join(rec_dir, f"{rec_name}_raw_events.h5")
+        return bag_path, expected_sidecar
+    return bag_path, None
 
 
 def parse_args() -> argparse.Namespace:
@@ -1025,6 +1034,11 @@ def main() -> None:
     output_parent = os.path.abspath(os.path.expanduser(args.out_dir))
     if not os.path.exists(bag_path):
         raise RuntimeError(f"Bag path does not exist: {bag_path}")
+    if args.event_clip_count is not None and raw_events_h5 is None:
+        raise RuntimeError(
+            "--event_clip_count was provided but no raw-event sidecar could be resolved. "
+            "Provide --raw_events_h5 or use --rec_dir with <recording_name>_raw_events.h5 present."
+        )
     if raw_events_h5 is not None and not os.path.exists(raw_events_h5):
         raise RuntimeError(f"Raw-event sidecar does not exist: {raw_events_h5}")
     if raw_events_h5 is not None and args.event_clip_count is None:

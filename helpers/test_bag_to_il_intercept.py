@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 import cv2
 import h5py
@@ -812,6 +813,34 @@ class BagToIlInterceptTests(unittest.TestCase):
                     event_frame_mode="cumulative",
                     event_clip_count=4.0,
                 )
+
+    def test_resolve_input_paths_defaults_to_recording_sidecar_for_event_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rec_dir = os.path.join(tmpdir, "recording_20260728_225008")
+            os.makedirs(rec_dir)
+            bag_path = os.path.join(rec_dir, "recording_20260728_225008_bag")
+            os.makedirs(bag_path)
+
+            args = types.SimpleNamespace(
+                bag=None,
+                rec_dir=rec_dir,
+                raw_events_h5=None,
+                event_clip_count=16.0,
+            )
+
+            with mock.patch.object(
+                self.mod,
+                "resolve_recording_dir",
+                return_value=(bag_path, None, "recording_20260728_225008"),
+            ):
+                resolved_bag_path, resolved_sidecar_path = self.mod.resolve_input_paths(args)
+
+            expected_sidecar = os.path.join(
+                rec_dir,
+                "recording_20260728_225008_raw_events.h5",
+            )
+            self.assertEqual(resolved_bag_path, bag_path)
+            self.assertEqual(resolved_sidecar_path, expected_sidecar)
 
 
 if __name__ == "__main__":
