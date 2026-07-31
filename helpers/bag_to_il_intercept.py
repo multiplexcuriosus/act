@@ -27,6 +27,8 @@ import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
+from raw_event_hdf5 import RawEventStore, resolve_recording_dir
+
 
 DEFAULT_RGB_TOPIC = "auto"
 DEFAULT_RGB_TOPIC_RAW = "/top_cam/camera/color/image_raw"
@@ -463,6 +465,11 @@ def sample_episode(
     episode: EpisodeWindow,
     fps: float,
     max_current_tcp_s_age_sec: float,
+    raw_event_store: Optional[RawEventStore] = None,
+    event_frame_windows_ms: Tuple[float, float, float] = (50.0, 100.0, 200.0),
+    event_frame_mode: str = "shifted",
+    event_clip_count: Optional[float] = None,
+    event_packet_margin_ms: float = 50.0,
 ) -> Dict[str, np.ndarray]:
     """Causally sample observations and measured current_tcp_s action."""
     rgb_times = np.asarray(data["rgb_t"], dtype=np.float64)
@@ -549,6 +556,51 @@ def sample_episode(
             f"(T={grid.size}, rgb={rgb.shape[0]}, qpos={qpos.shape[0]})"
         )
 
+    event: Optional[np.ndarray] = None
+    event_source_timestamps: Optional[np.ndarray] = None
+    event_source_age_sec: Optional[np.ndarray] = None
+    event_count_per_channel: Optional[np.ndarray] = None
+    if raw_event_store is not None:
+        if event_clip_count is None or float(event_clip_count) <= 0.0:
+            raise RuntimeError(
+                "event_clip_count must be explicitly provided and positive when "
+                "raw-event sidecar conversion is enabled"
+            )
+
+        event_frames: List[np.ndarray] = []
+        event_source_ns = np.empty((grid.size,), dtype=np.int64)
+        event_counts = np.empty((grid.size, 3), dtype=np.int32)
+
+        for index, t_g in enumerate(grid):
+            frame_u8, source_packet_ros_t_ns, counts = (
+                raw_event_store.frame_3chef_with_metadata_at_bag_time(
+                    bag_t_sec=float(t_g),
+                    windows_ms=event_frame_windows_ms,
+                    mode=event_frame_mode,
+                    packet_margin_ms=event_packet_margin_ms,
+                    scaling_mode="signed_log1p_fixed_clip",
+                    event_clip_count=float(event_clip_count),
+                )
+            )
+
+            event_frames.append(frame_u8)
+            event_counts[index, :] = counts
+            if source_packet_ros_t_ns is None:
+                event_source_ns[index] = int(np.rint(t_g * 1e9))
+            else:
+                event_source_ns[index] = int(source_packet_ros_t_ns)
+
+        event = np.stack(event_frames, axis=0).astype(np.uint8, copy=False)
+        event_source_timestamps = event_source_ns.astype(np.float64) * 1e-9
+        event_source_age_sec = (grid - event_source_timestamps).astype(np.float32)
+        if np.any(event_source_age_sec < 0.0):
+            min_age = float(np.min(event_source_age_sec))
+            raise RuntimeError(
+                f"Episode {episode.output_idx}: negative event source age detected "
+                f"(min={min_age:.6e}s)"
+            )
+        event_count_per_channel = event_counts
+
     log(
         f"[INFO] episode {episode.output_idx}: sampled {grid.size} steps at "
         f"{fps:.3f} Hz; current_tcp_s age sec min/mean/max="
@@ -568,7 +620,7 @@ def sample_episode(
     else:
         target_base = np.empty((0, 3), dtype=np.float32)
 
-    return {
+    arrays = {
         "timestamps": grid,
         "rgb": rgb,
         "qpos": qpos,
@@ -580,6 +632,14 @@ def sample_episode(
         "target_base_timestamps": target_base_t,
         "target_base_points": target_base,
     }
+
+    if event is not None:
+        arrays["event"] = event
+        arrays["event_source_timestamps"] = event_source_timestamps
+        arrays["event_source_age_sec"] = event_source_age_sec
+        arrays["event_count_per_channel"] = event_count_per_channel
+
+    return arrays
 
 
 def dataset_kwargs(compression: str) -> Dict[str, Any]:
@@ -598,6 +658,10 @@ def write_episode(
     fps: float,
     compression: str,
     overwrite: bool,
+    raw_events_h5: Optional[str] = None,
+    event_frame_windows_ms: Tuple[float, float, float] = (50.0, 100.0, 200.0),
+    event_frame_mode: str = "shifted",
+    event_clip_count: Optional[float] = None,
 ) -> None:
     if os.path.exists(output_path) and not overwrite:
         raise RuntimeError(
@@ -641,6 +705,31 @@ def write_episode(
             h5.attrs["rgb_temporal_stacking"] = "deferred_to_training_loader"
             h5.attrs["command_count"] = int(arrays["command_timestamps"].size)
 
+            has_event_sidecar = "event" in arrays
+            if has_event_sidecar:
+                if raw_events_h5 is None:
+                    raise RuntimeError(
+                        "event data present but raw_events_h5 metadata path is missing"
+                    )
+                if event_clip_count is None:
+                    raise RuntimeError(
+                        "event data present but event_clip_count is missing"
+                    )
+                h5.attrs["event_representation"] = "shifted_3chef_signed"
+                h5.attrs["event_frame_windows_ms"] = np.asarray(
+                    event_frame_windows_ms,
+                    dtype=np.float32,
+                )
+                h5.attrs["event_frame_mode"] = event_frame_mode
+                h5.attrs["event_channel_order"] = "recent_to_oldest"
+                h5.attrs["event_scaling"] = "signed_log1p_fixed_clip"
+                h5.attrs["event_clip_count"] = float(event_clip_count)
+                h5.attrs["event_neutral_u8"] = 128
+                h5.attrs["event_sampling_policy"] = (
+                    "latest_packet_at_or_before_grid_time"
+                )
+                h5.attrs["raw_events_h5"] = str(raw_events_h5)
+
             observations = h5.create_group("observations")
             images = observations.create_group("images")
             observations.create_dataset(
@@ -656,6 +745,14 @@ def write_episode(
                 chunks=(1, *arrays["rgb"].shape[1:]),
                 **compression_kwargs,
             )
+            if has_event_sidecar:
+                images.create_dataset(
+                    "event",
+                    data=arrays["event"],
+                    dtype=np.uint8,
+                    chunks=(1, *arrays["event"].shape[1:]),
+                    **compression_kwargs,
+                )
 
             h5.create_dataset("action", data=arrays["action"], dtype=np.float32)
             h5.create_dataset(
@@ -668,6 +765,22 @@ def write_episode(
                 data=arrays["action_source_age_sec"],
                 dtype=np.float32,
             )
+            if has_event_sidecar:
+                h5.create_dataset(
+                    "event_source_timestamps",
+                    data=arrays["event_source_timestamps"],
+                    dtype=np.float64,
+                )
+                h5.create_dataset(
+                    "event_source_age_sec",
+                    data=arrays["event_source_age_sec"],
+                    dtype=np.float32,
+                )
+                h5.create_dataset(
+                    "event_count_per_channel",
+                    data=arrays["event_count_per_channel"],
+                    dtype=np.int32,
+                )
 
             commands = h5.create_group("commands")
             goto_s = commands.create_group("goto_s")
@@ -715,36 +828,25 @@ def output_dir_name(args: argparse.Namespace, bag_path: str) -> str:
     return recording_name(bag_path)
 
 
-def resolve_bag_path(args: argparse.Namespace) -> str:
+def resolve_input_paths(
+    args: argparse.Namespace,
+) -> Tuple[str, Optional[str]]:
     if args.bag is not None:
-        return os.path.abspath(os.path.expanduser(args.bag))
+        bag_path = os.path.abspath(os.path.expanduser(args.bag))
+        raw_events_h5 = None
+        if args.raw_events_h5 is not None:
+            raw_events_h5 = os.path.abspath(os.path.expanduser(args.raw_events_h5))
+        return bag_path, raw_events_h5
 
     rec_dir = os.path.abspath(os.path.expanduser(args.rec_dir))
-    if not os.path.isdir(rec_dir):
-        raise RuntimeError(f"Recording directory does not exist: {rec_dir}")
-
-    bag_candidates: List[str] = []
-    for entry in os.scandir(rec_dir):
-        if entry.is_dir() and entry.name.endswith("_bag"):
-            bag_candidates.append(entry.path)
-
-    if not bag_candidates:
-        log(
-            f"[WARNING] no subdirectory ending in '_bag' was found under: {rec_dir}"
-        )
-        raise RuntimeError(
-            "Could not resolve bag directory from recording directory "
-            f"{rec_dir}; expected a child folder ending with '_bag'"
-        )
-
-    bag_candidates.sort()
-    if len(bag_candidates) > 1:
-        log(
-            "[WARNING] multiple '_bag' directories found under "
-            f"{rec_dir}; using first in sorted order: {bag_candidates[0]}"
-        )
-
-    return bag_candidates[0]
+    bag_path, auto_raw_events_h5, _ = resolve_recording_dir(
+        rec_dir,
+        allow_missing_raw_events=True,
+        logger=log,
+    )
+    if args.raw_events_h5 is not None:
+        return bag_path, os.path.abspath(os.path.expanduser(args.raw_events_h5))
+    return bag_path, auto_raw_events_h5
 
 
 def parse_args() -> argparse.Namespace:
@@ -793,9 +895,46 @@ def parse_args() -> argparse.Namespace:
         "--compression",
         choices=("none", "lzf", "gzip"),
         default="none",
-        help="HDF5 compression for RGB frames",
+        help="HDF5 compression for RGB frames and event frames when enabled",
     )
     parser.add_argument("--overwrite", action="store_true")
+
+    parser.add_argument(
+        "--raw_events_h5",
+        default=None,
+        help=(
+            "Optional raw-event sidecar HDF5. When provided (or auto-resolved via "
+            "--rec_dir), event tensors are rendered from raw packets."
+        ),
+    )
+    parser.add_argument(
+        "--event_frame_windows_ms",
+        type=float,
+        nargs=3,
+        default=[50.0, 100.0, 200.0],
+        help="Three shifted/cumulative event windows in milliseconds.",
+    )
+    parser.add_argument(
+        "--event_frame_mode",
+        choices=("shifted", "cumulative"),
+        default="shifted",
+        help="Event channel binning mode.",
+    )
+    parser.add_argument(
+        "--event_clip_count",
+        type=float,
+        default=None,
+        help=(
+            "Fixed clip denominator for signed_log1p_fixed_clip rendering. "
+            "Required when event conversion is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--event_packet_margin_ms",
+        type=float,
+        default=50.0,
+        help="Extra raw-event packet margin before the largest window.",
+    )
 
     parser.add_argument("--rgb_topic", default=DEFAULT_RGB_TOPIC)
     parser.add_argument("--joint_topic", default=DEFAULT_JOINT_TOPIC)
@@ -815,17 +954,42 @@ def parse_args() -> argparse.Namespace:
         parser.error("--min_duration must be non-negative")
     if args.max_episodes is not None and args.max_episodes <= 0:
         parser.error("--max_episodes must be positive")
+    if len(args.event_frame_windows_ms) != 3:
+        parser.error("--event_frame_windows_ms must contain exactly 3 values")
+    if any(w <= 0.0 for w in args.event_frame_windows_ms):
+        parser.error("--event_frame_windows_ms values must be positive")
+    if any(
+        args.event_frame_windows_ms[i] > args.event_frame_windows_ms[i + 1]
+        for i in range(2)
+    ):
+        parser.error(
+            "--event_frame_windows_ms must be non-decreasing, e.g. 50 100 200"
+        )
+    if args.event_clip_count is not None and args.event_clip_count <= 0.0:
+        parser.error("--event_clip_count must be positive when provided")
+    if args.event_packet_margin_ms < 0.0:
+        parser.error("--event_packet_margin_ms must be non-negative")
     return args
 
 
 def main() -> None:
     args = parse_args()
-    bag_path = resolve_bag_path(args)
+    bag_path, raw_events_h5 = resolve_input_paths(args)
     output_parent = os.path.abspath(os.path.expanduser(args.out_dir))
     if not os.path.exists(bag_path):
         raise RuntimeError(f"Bag path does not exist: {bag_path}")
+    if raw_events_h5 is not None and not os.path.exists(raw_events_h5):
+        raise RuntimeError(f"Raw-event sidecar does not exist: {raw_events_h5}")
+    if raw_events_h5 is not None and args.event_clip_count is None:
+        raise RuntimeError(
+            "--event_clip_count is required when event conversion is enabled"
+        )
 
     log(f"[INFO] bag: {bag_path}")
+    if raw_events_h5 is not None:
+        log(f"[INFO] raw events H5: {raw_events_h5}")
+    else:
+        log("[INFO] raw events H5: disabled")
     log(f"[INFO] storage: {args.storage_id}")
 
     reader = open_reader(bag_path, args.storage_id)
@@ -861,38 +1025,73 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
     log(f"[INFO] output directory: {output_dir}")
 
+    raw_event_store: Optional[RawEventStore] = None
+    if raw_events_h5 is not None:
+        raw_event_store = RawEventStore(raw_events_h5, logger=log)
+        if episodes:
+            selected_start = min(ep.start for ep in episodes)
+            selected_end = max(ep.end for ep in episodes)
+            if (
+                raw_event_store.packet_ros_start_ns is None
+                or raw_event_store.packet_ros_end_ns is None
+            ):
+                raise RuntimeError(
+                    "Raw-event sidecar has no packet ROS timestamps and cannot be "
+                    "used for event conversion"
+                )
+            raw_start_sec = raw_event_store.packet_ros_start_ns * 1e-9
+            raw_end_sec = raw_event_store.packet_ros_end_ns * 1e-9
+            if selected_end < raw_start_sec or selected_start > raw_end_sec:
+                raise RuntimeError(
+                    "Raw-event sidecar packet ROS timestamps do not overlap selected "
+                    "episode windows"
+                )
+
     lengths: List[int] = []
-    for episode in episodes:
-        data = collect_episode(
-            bag_path=bag_path,
-            storage_id=args.storage_id,
-            episode=episode,
-            topics=topics,
-            collect_goto_s_debug=collect_goto_s_debug,
-            collect_target_base_debug=collect_target_base_debug,
-        )
-        arrays = sample_episode(
-            data=data,
-            episode=episode,
-            fps=args.fps,
-            max_current_tcp_s_age_sec=args.max_current_tcp_s_age_sec,
-        )
-        output_path = os.path.join(
-            output_dir, f"episode_{episode.output_idx}.hdf5"
-        )
-        write_episode(
-            output_path=output_path,
-            arrays=arrays,
-            episode=episode,
-            topics=topics,
-            fps=args.fps,
-            compression=args.compression,
-            overwrite=args.overwrite,
-        )
-        lengths.append(int(arrays["timestamps"].size))
-        del data
-        del arrays
-        gc.collect()
+    try:
+        for episode in episodes:
+            data = collect_episode(
+                bag_path=bag_path,
+                storage_id=args.storage_id,
+                episode=episode,
+                topics=topics,
+                collect_goto_s_debug=collect_goto_s_debug,
+                collect_target_base_debug=collect_target_base_debug,
+            )
+            arrays = sample_episode(
+                data=data,
+                episode=episode,
+                fps=args.fps,
+                max_current_tcp_s_age_sec=args.max_current_tcp_s_age_sec,
+                raw_event_store=raw_event_store,
+                event_frame_windows_ms=tuple(args.event_frame_windows_ms),
+                event_frame_mode=args.event_frame_mode,
+                event_clip_count=args.event_clip_count,
+                event_packet_margin_ms=args.event_packet_margin_ms,
+            )
+            output_path = os.path.join(
+                output_dir, f"episode_{episode.output_idx}.hdf5"
+            )
+            write_episode(
+                output_path=output_path,
+                arrays=arrays,
+                episode=episode,
+                topics=topics,
+                fps=args.fps,
+                compression=args.compression,
+                overwrite=args.overwrite,
+                raw_events_h5=raw_events_h5,
+                event_frame_windows_ms=tuple(args.event_frame_windows_ms),
+                event_frame_mode=args.event_frame_mode,
+                event_clip_count=args.event_clip_count,
+            )
+            lengths.append(int(arrays["timestamps"].size))
+            del data
+            del arrays
+            gc.collect()
+    finally:
+        if raw_event_store is not None:
+            raw_event_store.close()
 
     log("[INFO] conversion complete")
     log(f"       episodes: {len(lengths)}")

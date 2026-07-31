@@ -53,6 +53,8 @@ def load_converter_module():
         sys.modules["rosidl_runtime_py.utilities"] = utilities
 
     here = os.path.dirname(__file__)
+    if here not in sys.path:
+        sys.path.insert(0, here)
     module_path = os.path.join(here, "bag_to_il_intercept.py")
     spec = importlib.util.spec_from_file_location(
         "bag_to_il_intercept_under_test", module_path
@@ -131,6 +133,35 @@ class BagToIlInterceptTests(unittest.TestCase):
             data["goto_s_t"] = [0.05 + 0.1 * i for i in range(len(goto_values))]
             data["goto_s"] = list(goto_values)
         return data
+
+    @staticmethod
+    def make_raw_events_h5(path: str):
+        with h5py.File(path, "w") as h5:
+            h5.attrs["width"] = 1
+            h5.attrs["height"] = 1
+            events = h5.create_group("events")
+            packets = h5.create_group("packets")
+
+            events.create_dataset("type", data=np.asarray([1, 1, 1], dtype=np.uint8))
+            events.create_dataset("x", data=np.asarray([0, 0, 0], dtype=np.int16))
+            events.create_dataset("y", data=np.asarray([0, 0, 0], dtype=np.int16))
+            events.create_dataset(
+                "t_us",
+                data=np.asarray([100_000, 150_000, 210_000], dtype=np.int64),
+            )
+
+            packets.create_dataset(
+                "ros_t_ns",
+                data=np.asarray([100_000_000, 160_000_000, 220_000_000], dtype=np.int64),
+            )
+            packets.create_dataset(
+                "start_event_idx",
+                data=np.asarray([0, 1, 2], dtype=np.int64),
+            )
+            packets.create_dataset(
+                "end_event_idx",
+                data=np.asarray([1, 2, 3], dtype=np.int64),
+            )
 
     def test_decode_raw_image_msg(self):
         image_bgr = np.array([[[0, 0, 255], [0, 255, 0]]], dtype=np.uint8)
@@ -368,6 +399,182 @@ class BagToIlInterceptTests(unittest.TestCase):
                     h5["action"].shape[0],
                     h5["observations/images/rgb"].shape[0],
                 )
+
+    def test_event_sidecar_shape_dtype_and_non_negative_age(self):
+        data = self.make_sampling_data(
+            tcp_times=[0.0, 0.1, 0.2],
+            tcp_values=[-0.5, 0.25, 0.75],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            self.make_raw_events_h5(sidecar_path)
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                arrays = self.mod.sample_episode(
+                    data=data,
+                    episode=self.make_episode(),
+                    fps=10.0,
+                    max_current_tcp_s_age_sec=0.2,
+                    raw_event_store=store,
+                    event_frame_windows_ms=(50.0, 100.0, 200.0),
+                    event_frame_mode="shifted",
+                    event_clip_count=4.0,
+                )
+            finally:
+                store.close()
+
+        self.assertIn("event", arrays)
+        self.assertEqual(arrays["event"].shape, (3, 1, 1, 3))
+        self.assertEqual(arrays["event"].dtype, np.uint8)
+        self.assertTrue(np.all(arrays["event_source_age_sec"] >= 0.0))
+        self.assertEqual(arrays["event_count_per_channel"].shape, (3, 3))
+
+    def test_event_empty_window_produces_neutral_128(self):
+        data = self.make_sampling_data(
+            tcp_times=[0.0, 0.1, 0.2],
+            tcp_values=[-0.5, 0.25, 0.75],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            self.make_raw_events_h5(sidecar_path)
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                arrays = self.mod.sample_episode(
+                    data=data,
+                    episode=self.make_episode(),
+                    fps=10.0,
+                    max_current_tcp_s_age_sec=0.2,
+                    raw_event_store=store,
+                    event_frame_windows_ms=(50.0, 100.0, 200.0),
+                    event_frame_mode="shifted",
+                    event_clip_count=4.0,
+                    event_packet_margin_ms=0.0,
+                )
+            finally:
+                store.close()
+
+        self.assertEqual(int(arrays["event"][0, 0, 0, 0]), 128)
+
+    def test_existing_arrays_unchanged_when_event_sidecar_added(self):
+        data = self.make_sampling_data(
+            tcp_times=[0.0, 0.1, 0.2],
+            tcp_values=[-0.5, 0.25, 0.75],
+        )
+        without_events = self.mod.sample_episode(
+            data=data,
+            episode=self.make_episode(),
+            fps=10.0,
+            max_current_tcp_s_age_sec=0.2,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            self.make_raw_events_h5(sidecar_path)
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                with_events = self.mod.sample_episode(
+                    data=data,
+                    episode=self.make_episode(),
+                    fps=10.0,
+                    max_current_tcp_s_age_sec=0.2,
+                    raw_event_store=store,
+                    event_frame_windows_ms=(50.0, 100.0, 200.0),
+                    event_frame_mode="shifted",
+                    event_clip_count=4.0,
+                )
+            finally:
+                store.close()
+
+        np.testing.assert_allclose(
+            without_events["timestamps"],
+            with_events["timestamps"],
+        )
+        np.testing.assert_array_equal(
+            without_events["rgb"],
+            with_events["rgb"],
+        )
+        np.testing.assert_allclose(
+            without_events["qpos"],
+            with_events["qpos"],
+        )
+        np.testing.assert_allclose(
+            without_events["action"],
+            with_events["action"],
+        )
+        np.testing.assert_allclose(
+            without_events["action_source_timestamps"],
+            with_events["action_source_timestamps"],
+        )
+        np.testing.assert_allclose(
+            without_events["action_source_age_sec"],
+            with_events["action_source_age_sec"],
+        )
+        np.testing.assert_allclose(
+            without_events["command_timestamps"],
+            with_events["command_timestamps"],
+        )
+        np.testing.assert_array_equal(
+            without_events["command_values"],
+            with_events["command_values"],
+        )
+
+    def test_write_episode_with_event_sidecar_writes_expected_schema(self):
+        data = self.make_sampling_data(
+            tcp_times=[0.0, 0.1, 0.2],
+            tcp_values=[-0.5, 0.25, 0.75],
+        )
+        topics = self.make_topics()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            self.make_raw_events_h5(sidecar_path)
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                arrays = self.mod.sample_episode(
+                    data=data,
+                    episode=self.make_episode(),
+                    fps=10.0,
+                    max_current_tcp_s_age_sec=0.2,
+                    raw_event_store=store,
+                    event_frame_windows_ms=(50.0, 100.0, 200.0),
+                    event_frame_mode="shifted",
+                    event_clip_count=16.0,
+                )
+            finally:
+                store.close()
+
+            out_path = os.path.join(tmpdir, "episode_0.hdf5")
+            self.mod.write_episode(
+                output_path=out_path,
+                arrays=arrays,
+                episode=self.make_episode(),
+                topics=topics,
+                fps=10.0,
+                compression="gzip",
+                overwrite=False,
+                raw_events_h5=sidecar_path,
+                event_frame_windows_ms=(50.0, 100.0, 200.0),
+                event_frame_mode="shifted",
+                event_clip_count=16.0,
+            )
+
+            with h5py.File(out_path, "r") as h5:
+                self.assertIn("observations/images/event", h5)
+                self.assertEqual(
+                    h5["observations/images/event"].dtype,
+                    np.dtype(np.uint8),
+                )
+                self.assertEqual(
+                    h5["observations/images/event"].shape[0],
+                    h5["observations/timestamps"].shape[0],
+                )
+                self.assertIn("event_source_timestamps", h5)
+                self.assertIn("event_source_age_sec", h5)
+                self.assertIn("event_count_per_channel", h5)
+                self.assertEqual(
+                    h5.attrs["event_sampling_policy"],
+                    "latest_packet_at_or_before_grid_time",
+                )
+                self.assertEqual(h5.attrs["event_neutral_u8"], 128)
 
 
 if __name__ == "__main__":
