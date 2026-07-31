@@ -48,6 +48,15 @@ DEFAULT_JOINT_DATA_CONFIG = {
 
 
 INTERCEPT_HISTORY_OFFSETS_DEFAULT = (-6, -3, 0)
+INTERCEPT_EVENT_WINDOWS_MS_DEFAULT = [50.0, 100.0, 200.0]
+INTERCEPT_EVENT_REQUIRED_ATTRS = {
+    'event_representation': 'shifted_3chef_signed',
+    'event_frame_mode': 'shifted',
+    'event_channel_order': 'recent_to_oldest',
+    'event_scaling': 'signed_log1p_fixed_clip',
+    'event_neutral_u8': 128,
+    'event_sampling_policy': 'latest_packet_at_or_before_grid_time',
+}
 INTERCEPT_REQUIRED_ROOT_METADATA = {
     'action_type': 'measured_tcp_s_absolute',
     'action_representation': 'absolute',
@@ -234,19 +243,77 @@ def _validate_joint_episode_structure(
     return qpos, action
 
 
-def _validate_intercept_episode_structure(root, dataset_path):
+def _extract_intercept_event_metadata(root, dataset_path):
+    metadata = {}
+    for key, expected in INTERCEPT_EVENT_REQUIRED_ATTRS.items():
+        if key not in root.attrs:
+            raise ValueError(
+                f"Missing interception event metadata at HDF5 root in {dataset_path}: {key}"
+            )
+        value = _decode_h5_attr(root.attrs[key])
+        if value != expected:
+            raise ValueError(
+                f"Interception event metadata mismatch in {dataset_path} for {key}: "
+                f"expected {expected!r}, found {value!r}"
+            )
+        metadata[key] = value
+
+    if 'event_frame_windows_ms' not in root.attrs:
+        raise ValueError(
+            f"Missing interception event metadata at HDF5 root in {dataset_path}: event_frame_windows_ms"
+        )
+    windows = np.asarray(root.attrs['event_frame_windows_ms'], dtype=np.float64).reshape(-1)
+    if windows.shape != (3,):
+        raise ValueError(
+            f"Interception event metadata event_frame_windows_ms must have shape (3,), got {windows.shape} in {dataset_path}"
+        )
+    expected_windows = np.asarray(INTERCEPT_EVENT_WINDOWS_MS_DEFAULT, dtype=np.float64)
+    if not np.allclose(windows, expected_windows, atol=1e-9):
+        raise ValueError(
+            f"Interception event metadata mismatch in {dataset_path} for event_frame_windows_ms: "
+            f"expected {expected_windows.tolist()}, found {windows.tolist()}"
+        )
+    metadata['event_frame_windows_ms'] = windows.astype(np.float32).tolist()
+
+    if 'event_clip_count' not in root.attrs:
+        raise ValueError(
+            f"Missing interception event metadata at HDF5 root in {dataset_path}: event_clip_count"
+        )
+    event_clip_count = float(root.attrs['event_clip_count'])
+    if not np.isfinite(event_clip_count) or event_clip_count <= 0.0:
+        raise ValueError(
+            f"Invalid event_clip_count in {dataset_path}: expected positive finite value, got {event_clip_count}"
+        )
+    metadata['event_clip_count'] = event_clip_count
+
+    return metadata
+
+
+def _validate_intercept_episode_structure(
+    root,
+    dataset_path,
+    modality='rgb',
+    expected_event_metadata=None,
+):
     _validate_intercept_root_metadata(root, dataset_path)
+
+    if modality not in ('rgb', 'event'):
+        raise ValueError(f"Unsupported interception modality {modality!r} for {dataset_path}")
 
     if '/action' not in root:
         raise ValueError(f"Missing required dataset: /action in {dataset_path}")
     if '/observations/qpos' not in root:
         raise ValueError(f"Missing required dataset: /observations/qpos in {dataset_path}")
-    if '/observations/images/rgb' not in root:
-        raise ValueError(f"Missing required dataset: /observations/images/rgb in {dataset_path}")
+    image_key = '/observations/images/rgb' if modality == 'rgb' else '/observations/images/event'
+    if image_key not in root:
+        raise ValueError(f"Missing required dataset: {image_key} in {dataset_path}")
+    if '/observations/timestamps' not in root:
+        raise ValueError(f"Missing required dataset: /observations/timestamps in {dataset_path}")
 
     action = np.asarray(root['/action'][()], dtype=np.float32)
     qpos = np.asarray(root['/observations/qpos'][()], dtype=np.float32)
-    rgb_ds = root['/observations/images/rgb']
+    image_ds = root[image_key]
+    obs_timestamps = np.asarray(root['/observations/timestamps'][()], dtype=np.float64)
 
     if action.ndim != 2 or action.shape[1] != 1:
         raise ValueError(
@@ -264,9 +331,13 @@ def _validate_intercept_episode_structure(root, dataset_path):
         raise ValueError(
             f"Unequal numbers of qpos and action steps in {dataset_path}: {qpos.shape[0]} != {T}"
         )
-    if rgb_ds.shape[0] != T:
+    if image_ds.shape[0] != T:
         raise ValueError(
-            f"Unequal numbers of rgb and action steps in {dataset_path}: {rgb_ds.shape[0]} != {T}"
+            f"Unequal numbers of visual and action steps in {dataset_path}: {image_ds.shape[0]} != {T}"
+        )
+    if obs_timestamps.shape != (T,):
+        raise ValueError(
+            f"Interception /observations/timestamps must have shape (T,) in {dataset_path}, got {obs_timestamps.shape}"
         )
 
     if not np.isfinite(action).all():
@@ -274,7 +345,64 @@ def _validate_intercept_episode_structure(root, dataset_path):
     if not np.isfinite(qpos).all():
         raise ValueError(f"Non-finite values found in /observations/qpos for {dataset_path}")
 
-    return qpos, action
+    event_metadata = None
+    if modality == 'event':
+        event_array = np.asarray(image_ds[()])
+        if event_array.ndim != 4 or event_array.shape[-1] != 3:
+            raise ValueError(
+                f"Interception /observations/images/event must have shape (T,H,W,3) in {dataset_path}, got {event_array.shape}"
+            )
+        if event_array.dtype != np.uint8:
+            raise ValueError(
+                f"Interception /observations/images/event must be uint8 in {dataset_path}, got {event_array.dtype}"
+            )
+
+        for required_key in ('/event_source_timestamps', '/event_source_age_sec', '/event_count_per_channel'):
+            if required_key not in root:
+                raise ValueError(f"Missing required dataset: {required_key} in {dataset_path}")
+
+        event_source_timestamps = np.asarray(root['/event_source_timestamps'][()], dtype=np.float64)
+        event_source_age_sec = np.asarray(root['/event_source_age_sec'][()], dtype=np.float64)
+        event_count_per_channel = np.asarray(root['/event_count_per_channel'][()])
+
+        if event_source_timestamps.shape != (T,):
+            raise ValueError(
+                f"Interception /event_source_timestamps must have shape (T,) in {dataset_path}, got {event_source_timestamps.shape}"
+            )
+        if event_source_age_sec.shape != (T,):
+            raise ValueError(
+                f"Interception /event_source_age_sec must have shape (T,) in {dataset_path}, got {event_source_age_sec.shape}"
+            )
+        if event_count_per_channel.shape != (T, 3):
+            raise ValueError(
+                f"Interception /event_count_per_channel must have shape (T,3) in {dataset_path}, got {event_count_per_channel.shape}"
+            )
+
+        if not np.isfinite(event_source_timestamps).all():
+            raise ValueError(f"Non-finite values found in /event_source_timestamps for {dataset_path}")
+        if not np.isfinite(event_source_age_sec).all():
+            raise ValueError(f"Non-finite values found in /event_source_age_sec for {dataset_path}")
+        if np.any(event_source_timestamps > obs_timestamps):
+            raise ValueError(
+                f"Non-causal event source timestamps found in {dataset_path}: source timestamp exceeds observation timestamp"
+            )
+        if np.any(event_source_age_sec < 0.0):
+            raise ValueError(f"Negative event source ages found in {dataset_path}")
+
+        computed_age = obs_timestamps - event_source_timestamps
+        if not np.allclose(event_source_age_sec, computed_age, atol=1e-6):
+            raise ValueError(
+                f"Event source ages mismatch in {dataset_path}: expected observation_timestamp - source_timestamp"
+            )
+
+        event_metadata = _extract_intercept_event_metadata(root, dataset_path)
+        if expected_event_metadata is not None and event_metadata != expected_event_metadata:
+            raise ValueError(
+                f"Interception event metadata mismatch across episodes in {dataset_path}: "
+                f"expected {expected_event_metadata}, found {event_metadata}"
+            )
+
+    return qpos, action, event_metadata
 
 def rotate_n_crop_transform(img, size=(360, 480), angle=None, top=None):
     if angle is None:
@@ -419,7 +547,43 @@ def _sample_spatial_aug_params():
     return angle, (top_h, top_w)
 
 
-def _prepare_rgb_history_frames(frames, camera_names, image_size, photometric_aug=False, spatial_aug=False):
+def _prepare_visual_history_frames(
+    frames,
+    modality,
+    camera_names,
+    image_size,
+    photometric_aug=False,
+    spatial_aug=False,
+):
+    if modality not in ('rgb', 'event'):
+        raise ValueError(f"Unsupported visual modality: {modality}")
+
+    if modality == 'event':
+        if photometric_aug:
+            raise ValueError(
+                'photometric_aug is not supported for interception event mode '
+                'because event channels are temporal bins, not colors.'
+            )
+        if spatial_aug:
+            raise ValueError(
+                'spatial_aug is not supported for interception event mode in this controlled experiment.'
+            )
+        processed_frames = []
+        for frame in frames:
+            processed_frame = _prepare_camera_image(
+                np.asarray(frame),
+                'event',
+                camera_names,
+                image_size,
+                event_channel_indices=None,
+            )
+            if processed_frame.ndim != 3 or processed_frame.shape[-1] != 3:
+                raise ValueError(
+                    f"Interception event frame must resolve to HWC3 after preprocessing, got {processed_frame.shape}"
+                )
+            processed_frames.append(processed_frame)
+        return processed_frames
+
     jitter_params = _sample_shared_color_jitter_params() if photometric_aug else None
     spatial_params = _sample_spatial_aug_params() if spatial_aug else None
 
@@ -441,6 +605,17 @@ def _prepare_rgb_history_frames(frames, camera_names, image_size, photometric_au
         processed_frames.append(processed_frame)
 
     return processed_frames
+
+
+def _prepare_rgb_history_frames(frames, camera_names, image_size, photometric_aug=False, spatial_aug=False):
+    return _prepare_visual_history_frames(
+        frames,
+        modality='rgb',
+        camera_names=camera_names,
+        image_size=image_size,
+        photometric_aug=photometric_aug,
+        spatial_aug=spatial_aug,
+    )
 
 
 def _natural_episode_sort_key(dataset_path):
@@ -884,6 +1059,8 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         photometric_aug=False,
         spatial_aug=False,
         image_size=None,
+        input_modality='rgb',
+        expected_event_metadata=None,
     ):
         super(EpisodicInterceptDataset).__init__()
         self.episode_paths = list(episode_paths)
@@ -894,13 +1071,20 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         self.photometric_aug = bool(photometric_aug)
         self.spatial_aug = bool(spatial_aug)
         self.image_size = canonical_image_size(image_size)
+        self.input_modality = str(input_modality)
+        self.expected_event_metadata = expected_event_metadata
         self.is_sim = None
         self._printed_image_debug = False
         self._printed_intercept_debug = False
 
-        if self.camera_names != ['rgb']:
+        if self.input_modality not in ('rgb', 'event'):
             raise ValueError(
-                f"Interception dataset requires camera_names=['rgb'], got {self.camera_names}"
+                f"Interception input_modality must be 'rgb' or 'event', got {self.input_modality!r}"
+            )
+        expected_camera_names = ['rgb'] if self.input_modality == 'rgb' else ['event']
+        if self.camera_names != expected_camera_names:
+            raise ValueError(
+                f"Interception dataset requires camera_names={expected_camera_names} for modality {self.input_modality!r}, got {self.camera_names}"
             )
         if len(self.history_offsets) != 3:
             raise ValueError(
@@ -917,7 +1101,12 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         dataset_path = self.episode_paths[index]
         with h5py.File(dataset_path, 'r') as root:
             is_sim = bool(root.attrs.get('sim', False))
-            qpos_full, action_full = _validate_intercept_episode_structure(root, dataset_path)
+            qpos_full, action_full, _ = _validate_intercept_episode_structure(
+                root,
+                dataset_path,
+                modality=self.input_modality,
+                expected_event_metadata=self.expected_event_metadata,
+            )
             T = action_full.shape[0]
 
             # Valid anchors are 0..T-2 so token-0 always has a true future s(t+1)-s(t).
@@ -927,9 +1116,11 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
             qpos_history = qpos_full[history_indices]
             qpos = qpos_history.reshape(-1).astype(np.float32)
 
-            rgb_frames = [root['/observations/images/rgb'][ts] for ts in history_indices]
-            processed_frames = _prepare_rgb_history_frames(
-                rgb_frames,
+            visual_key = '/observations/images/rgb' if self.input_modality == 'rgb' else '/observations/images/event'
+            visual_frames = [root[visual_key][ts] for ts in history_indices]
+            processed_frames = _prepare_visual_history_frames(
+                visual_frames,
+                self.input_modality,
                 self.camera_names,
                 self.image_size,
                 photometric_aug=self.photometric_aug,
@@ -1027,13 +1218,20 @@ def get_intercept_norm_stats(
     episode_paths,
     chunk_size,
     history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
+    input_modality='rgb',
+    event_metadata=None,
 ):
     qpos_histories = []
     delta_tokens = []
 
     for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
-            qpos_full, action_full = _validate_intercept_episode_structure(root, dataset_path)
+            qpos_full, action_full, _ = _validate_intercept_episode_structure(
+                root,
+                dataset_path,
+                modality=input_modality,
+                expected_event_metadata=event_metadata,
+            )
 
         T = action_full.shape[0]
         for anchor_t in range(T - 1):
@@ -1060,7 +1258,7 @@ def get_intercept_norm_stats(
     action_mean = np.asarray([all_delta_values.mean()], dtype=np.float32)
     action_std = np.asarray([all_delta_values.std()], dtype=np.float32).clip(1e-2, np.inf)
 
-    return {
+    stats = {
         'action_mean': action_mean,
         'action_std': action_std,
         'qpos_mean': qpos_mean,
@@ -1070,19 +1268,47 @@ def get_intercept_norm_stats(
         'raw_qpos_dim': 7,
         'state_dim': 21,
         'action_dim': 1,
+        'input_modality': str(input_modality),
+        'visual_history_frames': 3,
+        'visual_history_offsets': list(history_offsets),
+        'visual_frame_order': 'oldest_to_newest',
+        'channels_per_visual_frame': 3,
         'rgb_history_frames': 3,
         'rgb_history_offsets': list(history_offsets),
         'rgb_frame_order': 'oldest_to_newest',
         'qpos_history_offsets': list(history_offsets),
         'qpos_flatten_order': 'oldest_to_newest',
         'image_channels': 9,
+        'image_normalization': 'imagenet' if str(input_modality) == 'rgb' else 'shifted_3chef_centered',
         'action_type': 'measured_tcp_s_delta',
         'action_representation': 'future_delta_relative_to_anchor',
         'action_anchor_offset': 0,
         'action_first_target_offset': 1,
         'action_positive_direction': 'robot_base_positive_x',
         'action_units': 'm',
+        'camera_names': ['rgb'] if str(input_modality) == 'rgb' else ['event'],
     }
+
+    if str(input_modality) == 'event':
+        if event_metadata is None:
+            raise ValueError('event_metadata is required when input_modality=event')
+        for key in (
+            'event_representation',
+            'event_frame_mode',
+            'event_frame_windows_ms',
+            'event_channel_order',
+            'event_scaling',
+            'event_clip_count',
+            'event_neutral_u8',
+            'event_sampling_policy',
+        ):
+            if key not in event_metadata:
+                raise ValueError(
+                    f"Missing canonical event metadata key for interception stats: {key}"
+                )
+            stats[key] = event_metadata[key]
+
+    return stats
 
 
 def load_joint_data(
@@ -1260,20 +1486,35 @@ def load_intercept_data(
     action_dim=1,
     image_size=None,
     rgb_history_frames=3,
+    visual_history_frames=None,
     history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
 ):
     del split_num_trials  # currently unused in interception loader
 
-    if camera_names != ['rgb']:
-        raise ValueError(f"Interception requires camera_names=['rgb'], got {camera_names}")
+    if camera_names not in (['rgb'], ['event']):
+        raise ValueError(
+            f"Interception requires camera_names=['rgb'] or ['event'], got {camera_names}"
+        )
+    input_modality = 'event' if camera_names == ['event'] else 'rgb'
     if int(raw_qpos_dim) != 7:
         raise ValueError(f"Interception raw_qpos_dim must be 7, got {raw_qpos_dim}")
     if int(state_dim) != 21:
         raise ValueError(f"Interception state_dim must be 21, got {state_dim}")
     if int(action_dim) != 1:
         raise ValueError(f"Interception action_dim must be 1, got {action_dim}")
-    if int(rgb_history_frames) != 3:
-        raise ValueError(f"Interception rgb_history_frames must be 3, got {rgb_history_frames}")
+
+    resolved_visual_history_frames = (
+        int(rgb_history_frames) if visual_history_frames is None else int(visual_history_frames)
+    )
+    if int(rgb_history_frames) != resolved_visual_history_frames:
+        raise ValueError(
+            f"Interception visual-history conflict: rgb_history_frames={rgb_history_frames} "
+            f"but visual_history_frames={visual_history_frames}"
+        )
+    if resolved_visual_history_frames != 3:
+        raise ValueError(
+            f"Interception visual_history_frames must be 3, got {resolved_visual_history_frames}"
+        )
 
     history_offsets = tuple(int(offset) for offset in history_offsets)
     if history_offsets != INTERCEPT_HISTORY_OFFSETS_DEFAULT:
@@ -1301,9 +1542,17 @@ def load_intercept_data(
     print('')
     _warn_if_episode_indices_noncontiguous(episode_paths)
 
+    expected_event_metadata = None
     for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
-            _validate_intercept_episode_structure(root, dataset_path)
+            _, _, event_metadata = _validate_intercept_episode_structure(
+                root,
+                dataset_path,
+                modality=input_modality,
+                expected_event_metadata=expected_event_metadata,
+            )
+            if input_modality == 'event' and expected_event_metadata is None:
+                expected_event_metadata = event_metadata
 
     episode_indices = list(range(total_episode_count))
     rng = np.random.RandomState(split_seed)
@@ -1330,6 +1579,8 @@ def load_intercept_data(
         train_episode_paths,
         chunk_size=chunk_size,
         history_offsets=history_offsets,
+        input_modality=input_modality,
+        event_metadata=expected_event_metadata,
     )
 
     train_dataset = EpisodicInterceptDataset(
@@ -1341,6 +1592,8 @@ def load_intercept_data(
         photometric_aug=photometric_aug,
         spatial_aug=spatial_aug,
         image_size=image_size,
+        input_modality=input_modality,
+        expected_event_metadata=expected_event_metadata,
     )
     val_dataset = EpisodicInterceptDataset(
         val_episode_paths,
@@ -1351,6 +1604,8 @@ def load_intercept_data(
         photometric_aug=False,
         spatial_aug=False,
         image_size=image_size,
+        input_modality=input_modality,
+        expected_event_metadata=expected_event_metadata,
     )
 
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)

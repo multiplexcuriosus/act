@@ -10,7 +10,17 @@ e = IPython.embed
 from roma.mappings import special_gramschmidt
 
 
-def _build_image_normalizer(image_channels):
+def _build_image_normalizer(image_channels, normalization_mode='imagenet'):
+    normalization_mode = str(normalization_mode)
+    if normalization_mode == 'shifted_3chef_centered':
+        if image_channels <= 0:
+            raise ValueError(f"image_channels must be positive, got {image_channels}")
+        mean = [128.0 / 255.0] * image_channels
+        std = [127.0 / 255.0] * image_channels
+        return transforms.Normalize(mean=mean, std=std)
+    if normalization_mode != 'imagenet':
+        raise ValueError(f"Unsupported image_normalization mode: {normalization_mode!r}")
+
     base_mean = [0.485, 0.456, 0.406]
     base_std = [0.229, 0.224, 0.225]
     if image_channels == 1:
@@ -68,7 +78,8 @@ class ACTPolicy(nn.Module):
             False
         )
         self.image_channels = int(args_override.get('image_channels', 3))
-        self.normalize = _build_image_normalizer(self.image_channels)
+        self.image_normalization = args_override.get('image_normalization', 'imagenet')
+        self.normalize = _build_image_normalizer(self.image_channels, self.image_normalization)
         _assert_backbone_channels(self.model, self.image_channels)
         print(f'KL Weight {self.kl_weight}')
 
@@ -117,7 +128,8 @@ class ACTTaskPolicy(nn.Module):
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
         self.image_channels = int(args_override.get('image_channels', 3))
-        self.normalize = _build_image_normalizer(self.image_channels)
+        self.image_normalization = args_override.get('image_normalization', 'imagenet')
+        self.normalize = _build_image_normalizer(self.image_channels, self.image_normalization)
         _assert_backbone_channels(self.model, self.image_channels)
         print(f'KL Weight {self.kl_weight}')
 
@@ -177,7 +189,8 @@ class CNNMLPPolicy(nn.Module):
         self.model = model # decoder
         self.optimizer = optimizer
         self.image_channels = int(args_override.get('image_channels', 3))
-        self.normalize = _build_image_normalizer(self.image_channels)
+        self.image_normalization = args_override.get('image_normalization', 'imagenet')
+        self.normalize = _build_image_normalizer(self.image_channels, self.image_normalization)
         _assert_backbone_channels(self.model, self.image_channels)
 
     def __call__(self, qpos, image, actions=None, is_pad=None):

@@ -11,7 +11,7 @@ RAW_QPOS_DIM=7
 STATE_DIM=21
 ACTION_DIM=1
 
-RGB_HISTORY_FRAMES=3
+VISUAL_HISTORY_FRAMES=3
 CHUNK_SIZE=30
 
 DATASET_NAME="$(basename "${DATASETS[0]}")"
@@ -22,7 +22,8 @@ if [[ -f "$0" ]]; then
   cp "$0" "$BASE_CKPT/run_grid.sh"
 fi
 
-CAMERA_MODES=(rgb)
+CAMERA_MODE="${CAMERA_MODE:-rgb}"
+CAMERA_MODES=("${CAMERA_MODE}")
 
 for IMAGE_SIZE in 320; do
   for LR in 2e-5 1e-5; do
@@ -33,7 +34,11 @@ for IMAGE_SIZE in 320; do
           case "$CAM_MODE" in
             rgb)
               CAM_NAMES=(rgb)
-              CAM_TAG="rgb"
+              CAM_TAG="rgb_hist3"
+              ;;
+            event)
+              CAM_NAMES=(event)
+              CAM_TAG="event_3chef_hist3"
               ;;
             *)
               echo "Unsupported CAM_MODE: $CAM_MODE" >&2
@@ -41,7 +46,7 @@ for IMAGE_SIZE in 320; do
               ;;
           esac
 
-          RUN_NAME="intercept_delta_s_cam_${CAM_TAG}_hist_${RGB_HISTORY_FRAMES}_chunk_${CHUNK_SIZE}_lr_${LR}_bs_${BS}_kl_${KL}_imgsize_${IMAGE_SIZE}"
+          RUN_NAME="intercept_delta_s_cam_${CAM_TAG}_hist_${VISUAL_HISTORY_FRAMES}_chunk_${CHUNK_SIZE}_lr_${LR}_bs_${BS}_kl_${KL}_imgsize_${IMAGE_SIZE}"
           CKPT_DIR="${BASE_CKPT}/${RUN_NAME}"
           mkdir -p "$CKPT_DIR"
 
@@ -69,7 +74,7 @@ for IMAGE_SIZE in 320; do
             --data_mode intercept
             --state_dim "$STATE_DIM"
             --action_dim "$ACTION_DIM"
-            --rgb_history_frames "$RGB_HISTORY_FRAMES"
+            --visual_history_frames "$VISUAL_HISTORY_FRAMES"
             --no_use_bce_last_action_dim
 
             --batch_size "$BS"
