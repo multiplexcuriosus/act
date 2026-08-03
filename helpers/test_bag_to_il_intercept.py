@@ -30,7 +30,15 @@ def load_converter_module():
             def read_next(self):
                 raise StopIteration
 
+            def set_filter(self, *_args, **_kwargs):
+                return None
+
+        class _DummyStorageFilter:
+            def __init__(self, topics):
+                self.topics = list(topics)
+
         rosbag2_py.SequentialReader = _DummySequentialReader
+        rosbag2_py.StorageFilter = _DummyStorageFilter
         rosbag2_py.StorageOptions = lambda **kwargs: kwargs
         rosbag2_py.ConverterOptions = lambda **kwargs: kwargs
         sys.modules["rosbag2_py"] = rosbag2_py
@@ -841,6 +849,184 @@ class BagToIlInterceptTests(unittest.TestCase):
             )
             self.assertEqual(resolved_bag_path, bag_path)
             self.assertEqual(resolved_sidecar_path, expected_sidecar)
+
+    def test_apply_storage_filter_sets_expected_topics(self):
+        captured = {}
+
+        class Reader:
+            def set_filter(self, storage_filter):
+                captured["topics"] = list(storage_filter.topics)
+
+        filtered = self.mod.apply_storage_filter(
+            Reader(),
+            ["/episode/control", "/episode/control", "/joint_states"],
+        )
+        self.assertEqual(filtered, ["/episode/control", "/joint_states"])
+        self.assertEqual(captured["topics"], ["/episode/control", "/joint_states"])
+
+    def test_validate_non_overlapping_windows_rejects_overlap(self):
+        windows = [
+            self.mod.EpisodeWindow(source_idx=0, output_idx=0, start=1.0, end=2.0),
+            self.mod.EpisodeWindow(source_idx=1, output_idx=1, start=2.0, end=3.0),
+        ]
+        with self.assertRaises(RuntimeError):
+            self.mod.validate_non_overlapping_windows(windows)
+
+    def test_main_streams_across_two_episodes_with_boundary_and_gap_routing(self):
+        class FakeReader:
+            def __init__(self, messages, types_map):
+                self._messages = list(messages)
+                self._index = 0
+                self._allowed_topics = None
+                self.types_map = dict(types_map)
+                self.applied_filters = []
+
+            def open(self, *_args, **_kwargs):
+                return None
+
+            def get_all_topics_and_types(self):
+                return [
+                    types.SimpleNamespace(name=name, type=type_name)
+                    for name, type_name in self.types_map.items()
+                ]
+
+            def set_filter(self, storage_filter):
+                self._allowed_topics = set(storage_filter.topics)
+                self.applied_filters.append(list(storage_filter.topics))
+
+            def _next_visible_index(self):
+                i = self._index
+                while i < len(self._messages):
+                    topic = self._messages[i][0]
+                    if self._allowed_topics is None or topic in self._allowed_topics:
+                        return i
+                    i += 1
+                return None
+
+            def has_next(self):
+                return self._next_visible_index() is not None
+
+            def read_next(self):
+                nxt = self._next_visible_index()
+                if nxt is None:
+                    raise StopIteration
+                self._index = nxt + 1
+                return self._messages[nxt]
+
+        types_map = {
+            "/rgb": self.mod.RAW_IMAGE_TYPE,
+            "/joint_states": "sensor_msgs/msg/JointState",
+            "/episode/control": "std_msgs/msg/UInt8",
+            "/middle_line/current_tcp_s": self.mod.FLOAT64_TYPE,
+            "/trajectory_executor/executed_goto_s": self.mod.FLOAT64_TYPE,
+            "/trajectory_executor/executed_goto_s_target_base": "geometry_msgs/msg/PointStamped",
+        }
+
+        marker_msgs = [
+            ("/episode/control", types.SimpleNamespace(data=1), int(1.0e9)),
+            ("/episode/control", types.SimpleNamespace(data=2), int(2.0e9)),
+            ("/episode/control", types.SimpleNamespace(data=1), int(4.0e9)),
+            ("/episode/control", types.SimpleNamespace(data=2), int(5.0e9)),
+        ]
+
+        joint_msg = lambda offset: types.SimpleNamespace(name=list(self.mod.ARM_JOINT_NAMES), position=[offset + i for i in range(7)])
+        target_msg = lambda: types.SimpleNamespace(point=types.SimpleNamespace(x=0.1, y=0.2, z=0.3))
+        rgb_msg = self.make_raw_msg_bgr(np.array([[[0, 0, 255]]], dtype=np.uint8))
+
+        data_msgs = [
+            ("/rgb", rgb_msg, int(0.5e9)),
+            ("/joint_states", joint_msg(0.5), int(0.5e9)),
+            ("/middle_line/current_tcp_s", types.SimpleNamespace(data=0.5), int(0.5e9)),
+            ("/rgb", rgb_msg, int(1.0e9)),
+            ("/joint_states", joint_msg(1.0), int(1.0e9)),
+            ("/middle_line/current_tcp_s", types.SimpleNamespace(data=1.0), int(1.0e9)),
+            ("/trajectory_executor/executed_goto_s", types.SimpleNamespace(data=1.0), int(1.0e9)),
+            ("/trajectory_executor/executed_goto_s_target_base", target_msg(), int(1.0e9)),
+            ("/rgb", rgb_msg, int(2.0e9)),
+            ("/joint_states", joint_msg(2.0), int(2.0e9)),
+            ("/middle_line/current_tcp_s", types.SimpleNamespace(data=2.0), int(2.0e9)),
+            ("/rgb", rgb_msg, int(3.0e9)),
+            ("/joint_states", joint_msg(3.0), int(3.0e9)),
+            ("/middle_line/current_tcp_s", types.SimpleNamespace(data=3.0), int(3.0e9)),
+            ("/rgb", rgb_msg, int(4.0e9)),
+            ("/joint_states", joint_msg(4.0), int(4.0e9)),
+            ("/middle_line/current_tcp_s", types.SimpleNamespace(data=4.0), int(4.0e9)),
+            ("/rgb", rgb_msg, int(5.0e9)),
+            ("/joint_states", joint_msg(5.0), int(5.0e9)),
+            ("/middle_line/current_tcp_s", types.SimpleNamespace(data=5.0), int(5.0e9)),
+        ]
+
+        marker_reader = FakeReader(marker_msgs, types_map)
+        data_reader = FakeReader(data_msgs, types_map)
+        finalize_calls = []
+
+        def fake_finalize_episode(**kwargs):
+            ep = kwargs["episode"]
+            data = kwargs["data"]
+            finalize_calls.append(
+                {
+                    "episode": ep.output_idx,
+                    "rgb_t": list(data["rgb_t"]),
+                    "joint_t": list(data["joint_t"]),
+                    "tcp_t": list(data["current_tcp_s_t"]),
+                }
+            )
+            data.clear()
+            return len(finalize_calls)
+
+        args = types.SimpleNamespace(
+            bag="/tmp/fake_bag",
+            rec_dir=None,
+            out_dir="/tmp/fake_out",
+            storage_id="mcap",
+            fps=30.0,
+            min_duration=0.0,
+            max_episodes=None,
+            max_current_tcp_s_age_sec=0.10,
+            no_target_base=False,
+            compression="none",
+            overwrite=False,
+            raw_events_h5=None,
+            event_frame_windows_ms=[50.0, 100.0, 200.0],
+            event_frame_mode="shifted",
+            event_clip_count=None,
+            event_packet_margin_ms=50.0,
+            rgb_topic="/rgb",
+            joint_topic="/joint_states",
+            episode_topic="/episode/control",
+            current_tcp_s_topic="/middle_line/current_tcp_s",
+            goto_s_topic="/trajectory_executor/executed_goto_s",
+            goto_s_target_base_topic="/trajectory_executor/executed_goto_s_target_base",
+        )
+
+        with mock.patch.object(self.mod, "parse_args", return_value=args), \
+             mock.patch.object(self.mod, "resolve_input_paths", return_value=("/tmp/fake_bag", None)), \
+             mock.patch.object(self.mod, "open_reader", side_effect=[marker_reader, data_reader]) as open_reader_mock, \
+             mock.patch.object(self.mod, "finalize_episode", side_effect=fake_finalize_episode), \
+             mock.patch.object(self.mod, "deserialize_message", side_effect=lambda raw, _cls: raw), \
+             mock.patch.object(self.mod.os.path, "exists", return_value=True), \
+             mock.patch.object(self.mod.os, "makedirs", return_value=None):
+            self.mod.main()
+
+        self.assertEqual(open_reader_mock.call_count, 2)
+        self.assertEqual(marker_reader.applied_filters[-1], ["/episode/control"])
+        self.assertEqual(
+            data_reader.applied_filters[-1],
+            [
+                "/rgb",
+                "/joint_states",
+                "/middle_line/current_tcp_s",
+                "/trajectory_executor/executed_goto_s",
+                "/trajectory_executor/executed_goto_s_target_base",
+            ],
+        )
+        self.assertEqual(len(finalize_calls), 2)
+        self.assertEqual(finalize_calls[0]["episode"], 0)
+        self.assertEqual(finalize_calls[1]["episode"], 1)
+        self.assertEqual(finalize_calls[0]["rgb_t"], [1.0, 2.0])
+        self.assertEqual(finalize_calls[1]["rgb_t"], [4.0, 5.0])
+        self.assertNotIn(3.0, finalize_calls[0]["rgb_t"])
+        self.assertNotIn(3.0, finalize_calls[1]["rgb_t"])
 
 
 if __name__ == "__main__":

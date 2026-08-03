@@ -2,8 +2,8 @@
 set -euo pipefail
 
 DATASETS=(
-  "/home/dyros/Data/jg_data/hdf5/hdf5_20260728_225008"
-  "/home/dyros/Data/jg_data/hdf5/hdf5_20260727_215525"
+  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260728_225008"
+  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260727_215525"
 )
 
 # HDF5 qpos remains (T, 7), but the loader concatenates:
@@ -23,13 +23,13 @@ if [[ -f "$0" ]]; then
   cp "$0" "$BASE_CKPT/run_grid.sh"
 fi
 
-CAMERA_MODE="${CAMERA_MODE:-rgb}"
+CAMERA_MODE="event"
 CAMERA_MODES=("${CAMERA_MODE}")
 
 for IMAGE_SIZE in 320; do
-  for LR in 2e-5 1e-5; do
-    for BS in 32 16 8; do
-      for KL in 1 10; do
+  for LR in 1e-5 2e-5; do
+    for BS in 8 16 32; do
+      for KL in 1 5 10; do
         for CAM_MODE in "${CAMERA_MODES[@]}"; do
 
           case "$CAM_MODE" in

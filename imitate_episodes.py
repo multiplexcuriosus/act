@@ -93,6 +93,14 @@ def validate_visual_history_settings(
         raise ValueError(
             f"Interception mode requires visual_history_frames=3 with offsets {list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)}, got {visual_history_frames}"
         )
+    if data_mode == 'intercept':
+        if camera_names not in (['rgb'], ['event']):
+            raise ValueError(
+                f"Interception mode currently supports only a single camera modality, got {camera_names}"
+            )
+        if event_channel_selection is not None:
+            raise ValueError('Interception mode does not support --event_channel_selection.')
+        return visual_history_frames
     if visual_history_frames == 1:
         return visual_history_frames
     if camera_names != ['rgb']:

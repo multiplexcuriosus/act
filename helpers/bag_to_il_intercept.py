@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -98,8 +99,35 @@ def open_reader(bag_path: str, storage_id: str) -> rosbag2_py.SequentialReader:
     return reader
 
 
+def apply_storage_filter(
+    reader: rosbag2_py.SequentialReader, topics: Sequence[str]
+) -> List[str]:
+    filtered = list(dict.fromkeys(topics))
+    if not filtered:
+        raise RuntimeError("Storage filter topic list must be non-empty")
+    reader.set_filter(rosbag2_py.StorageFilter(topics=filtered))
+    return filtered
+
+
+def open_filtered_reader(
+    bag_path: str, storage_id: str, topics: Sequence[str]
+) -> rosbag2_py.SequentialReader:
+    reader = open_reader(bag_path, storage_id)
+    apply_storage_filter(reader, topics)
+    return reader
+
+
 def topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
     return {item.name: item.type for item in reader.get_all_topics_and_types()}
+
+
+def format_hms(seconds: float) -> str:
+    if not np.isfinite(seconds) or seconds < 0.0:
+        return "n/a"
+    total_seconds = int(round(seconds))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def message_classes(
@@ -181,15 +209,13 @@ def validate_topics(
 
 
 def extract_episode_windows(
-    bag_path: str,
-    storage_id: str,
+    reader: rosbag2_py.SequentialReader,
+    types: Dict[str, str],
     episode_topic: str,
     min_duration: float,
 ) -> List[EpisodeWindow]:
     """Apply the recording manager's start/stop/cancel protocol."""
     log("[INFO] Pass 1: scanning episode-control markers")
-    reader = open_reader(bag_path, storage_id)
-    types = topic_type_map(reader)
     if episode_topic not in types:
         raise RuntimeError(f"Episode topic not present: {episode_topic}")
     msg_cls = get_message(types[episode_topic])
@@ -273,6 +299,21 @@ def extract_episode_windows(
             f"({episode.duration:.3f}s)"
         )
     return windows
+
+
+def validate_non_overlapping_windows(windows: Sequence[EpisodeWindow]) -> None:
+    if not windows:
+        return
+    for previous, current in zip(windows, windows[1:]):
+        # Inclusive [start, end] windows overlap unless next.start is strictly greater.
+        if current.start <= previous.end:
+            raise RuntimeError(
+                "Selected episode windows overlap under inclusive boundaries: "
+                f"output {previous.output_idx} [{previous.start:.6f}, {previous.end:.6f}] "
+                f"and output {current.output_idx} [{current.start:.6f}, {current.end:.6f}]. "
+                "Refusing to continue because a single message timestamp could belong "
+                "to multiple episodes."
+            )
 
 
 def decode_raw_image_to_rgb(msg: Any) -> np.ndarray:
@@ -363,30 +404,20 @@ def arm_qpos(joint_names: Sequence[str], positions: Sequence[float]) -> np.ndarr
     )
 
 
-def collect_episode(
-    bag_path: str,
-    storage_id: str,
-    episode: EpisodeWindow,
+def required_data_topics(
     topics: Topics,
     collect_goto_s_debug: bool,
     collect_target_base_debug: bool,
-) -> Dict[str, Any]:
-    """Read only sensor and optional debug messages inside one episode window."""
-    log(
-        f"[INFO] Pass 2: collecting output episode {episode.output_idx} "
-        f"[{episode.start:.6f}, {episode.end:.6f}]"
-    )
-    reader = open_reader(bag_path, storage_id)
-    types = topic_type_map(reader)
-
-    tracked = {topics.rgb, topics.joint, topics.current_tcp_s}
+) -> List[str]:
+    tracked = [topics.rgb, topics.joint, topics.current_tcp_s]
     if collect_goto_s_debug:
-        tracked.add(topics.goto_s)
+        tracked.append(topics.goto_s)
     if collect_target_base_debug:
-        tracked.add(topics.goto_s_target_base)
-    classes = message_classes(types, tracked)
+        tracked.append(topics.goto_s_target_base)
+    return tracked
 
-    data: Dict[str, Any] = {
+def create_episode_buffer() -> Dict[str, Any]:
+    return {
         "rgb_t": [],
         "rgb_msg": [],
         "joint_t": [],
@@ -399,36 +430,51 @@ def collect_episode(
         "target_base": [],
     }
 
-    while reader.has_next():
-        topic, raw, timestamp_ns = reader.read_next()
-        if topic not in tracked:
-            continue
 
-        timestamp = ns_to_sec(timestamp_ns)
-        if timestamp < episode.start:
-            continue
-        if timestamp > episode.end:
-            # Bags are time ordered, so no later tracked message can be in-window.
-            break
+def ingest_episode_message(
+    data: Dict[str, Any],
+    topic: str,
+    msg: Any,
+    timestamp: float,
+    topics: Topics,
+) -> None:
+    if topic == topics.rgb:
+        data["rgb_t"].append(timestamp)
+        data["rgb_msg"].append(msg)
+    elif topic == topics.joint:
+        data["joint_t"].append(timestamp)
+        data["qpos"].append(arm_qpos(msg.name, msg.position))
+    elif topic == topics.current_tcp_s:
+        data["current_tcp_s_t"].append(timestamp)
+        data["current_tcp_s"].append(float(msg.data))
+    elif topic == topics.goto_s:
+        data["goto_s_t"].append(timestamp)
+        data["goto_s"].append(float(msg.data))
+    elif topic == topics.goto_s_target_base:
+        data["target_base_t"].append(timestamp)
+        data["target_base"].append(
+            [float(msg.point.x), float(msg.point.y), float(msg.point.z)]
+        )
 
-        msg = deserialize_message(raw, classes[topic])
-        if topic == topics.rgb:
-            data["rgb_t"].append(timestamp)
-            data["rgb_msg"].append(msg)
-        elif topic == topics.joint:
-            data["joint_t"].append(timestamp)
-            data["qpos"].append(arm_qpos(msg.name, msg.position))
-        elif topic == topics.current_tcp_s:
-            data["current_tcp_s_t"].append(timestamp)
-            data["current_tcp_s"].append(float(msg.data))
-        elif topic == topics.goto_s:
-            data["goto_s_t"].append(timestamp)
-            data["goto_s"].append(float(msg.data))
-        elif topic == topics.goto_s_target_base:
-            data["target_base_t"].append(timestamp)
-            data["target_base"].append(
-                [float(msg.point.x), float(msg.point.y), float(msg.point.z)]
-            )
+
+def finalize_episode(
+    episode: EpisodeWindow,
+    data: Dict[str, Any],
+    output_dir: str,
+    topics: Topics,
+    fps: float,
+    max_current_tcp_s_age_sec: float,
+    compression: str,
+    overwrite: bool,
+    collect_started_wall: float,
+    raw_event_store: Optional[RawEventStore] = None,
+    raw_events_h5: Optional[str] = None,
+    event_frame_windows_ms: Tuple[float, float, float] = (50.0, 100.0, 200.0),
+    event_frame_mode: str = "shifted",
+    event_clip_count: Optional[float] = None,
+    event_packet_margin_ms: float = 50.0,
+) -> int:
+    collect_sec = max(0.0, time.perf_counter() - collect_started_wall)
 
     log(
         f"[INFO] episode {episode.output_idx}: "
@@ -447,7 +493,86 @@ def collect_episode(
             f"Episode {episode.output_idx}: no current_tcp_s measurements"
         )
 
-    return data
+    sample_start = time.perf_counter()
+    arrays = sample_episode(
+        data=data,
+        episode=episode,
+        fps=fps,
+        max_current_tcp_s_age_sec=max_current_tcp_s_age_sec,
+        raw_event_store=raw_event_store,
+        event_frame_windows_ms=event_frame_windows_ms,
+        event_frame_mode=event_frame_mode,
+        event_clip_count=event_clip_count,
+        event_packet_margin_ms=event_packet_margin_ms,
+    )
+    sample_sec = max(0.0, time.perf_counter() - sample_start)
+
+    write_start = time.perf_counter()
+    output_path = os.path.join(output_dir, f"episode_{episode.output_idx}.hdf5")
+    write_episode(
+        output_path=output_path,
+        arrays=arrays,
+        episode=episode,
+        topics=topics,
+        fps=fps,
+        compression=compression,
+        overwrite=overwrite,
+        raw_events_h5=raw_events_h5,
+        event_frame_windows_ms=event_frame_windows_ms,
+        event_frame_mode=event_frame_mode,
+        event_clip_count=event_clip_count,
+    )
+    write_sec = max(0.0, time.perf_counter() - write_start)
+    total_sec = collect_sec + sample_sec + write_sec
+
+    log(
+        f"[INFO] episode {episode.output_idx}: "
+        f"collect={collect_sec:.3f}s sample/event_render={sample_sec:.3f}s "
+        f"write={write_sec:.3f}s total={total_sec:.3f}s"
+    )
+
+    length = int(arrays["timestamps"].size)
+    del arrays
+    data.clear()
+    gc.collect()
+    return length
+
+def log_data_pass_progress(
+    current_timestamp: float,
+    completed_episodes: int,
+    total_episodes: int,
+    pass_start_wall: float,
+    selected_start: float,
+    selected_end: float,
+) -> None:
+    elapsed = max(0.0, time.perf_counter() - pass_start_wall)
+    if total_episodes == 0:
+        progress = 1.0
+    elif selected_end <= selected_start:
+        progress = 1.0 if completed_episodes >= total_episodes else 0.0
+    else:
+        clamped = min(max(current_timestamp, selected_start), selected_end)
+        progress = (clamped - selected_start) / (selected_end - selected_start)
+        progress = float(min(max(progress, 0.0), 1.0))
+        if completed_episodes >= total_episodes:
+            progress = 1.0
+
+    stable_for_estimate = elapsed >= 15.0 and progress >= 0.05
+    if stable_for_estimate:
+        estimated_total = elapsed / progress
+        remaining = max(0.0, estimated_total - elapsed)
+        remaining_text = f"~{format_hms(remaining)}"
+        total_text = f"~{format_hms(estimated_total)}"
+    else:
+        remaining_text = "n/a"
+        total_text = "n/a"
+
+    log(
+        f"[INFO] Data pass: {progress * 100.0:.1f}% | "
+        f"episodes {completed_episodes}/{total_episodes} | "
+        f"elapsed {format_hms(elapsed)} | "
+        f"remaining {remaining_text} | total {total_text}"
+    )
 
 
 def _validate_monotonic_non_decreasing(name: str, values: np.ndarray) -> None:
@@ -1029,6 +1154,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    conversion_start_wall = time.perf_counter()
     args = parse_args()
     bag_path, raw_events_h5 = resolve_input_paths(args)
     output_parent = os.path.abspath(os.path.expanduser(args.out_dir))
@@ -1053,8 +1179,9 @@ def main() -> None:
         log("[INFO] raw events H5: disabled")
     log(f"[INFO] storage: {args.storage_id}")
 
-    reader = open_reader(bag_path, args.storage_id)
-    types = topic_type_map(reader)
+    marker_pass_start_wall = time.perf_counter()
+    marker_reader = open_reader(bag_path, args.storage_id)
+    types = topic_type_map(marker_reader)
     selected_rgb_topic = resolve_rgb_topic(types, args.rgb_topic)
 
     topics = Topics(
@@ -1073,18 +1200,58 @@ def main() -> None:
         collect_target_base_debug=not args.no_target_base,
     )
 
+    marker_filter = apply_storage_filter(marker_reader, [topics.episode])
+    log(f"[INFO] marker filter topics: {marker_filter}")
+
     episodes = extract_episode_windows(
-        bag_path=bag_path,
-        storage_id=args.storage_id,
+        reader=marker_reader,
+        types=types,
         episode_topic=topics.episode,
         min_duration=args.min_duration,
     )
     if args.max_episodes is not None:
         episodes = episodes[: args.max_episodes]
+    validate_non_overlapping_windows(episodes)
+
+    marker_elapsed = max(0.0, time.perf_counter() - marker_pass_start_wall)
+    log(
+        f"[INFO] marker scan complete: retained {len(episodes)} episodes "
+        f"in {format_hms(marker_elapsed)}"
+    )
 
     output_dir = os.path.join(output_parent, output_dir_name(args, bag_path))
     os.makedirs(output_dir, exist_ok=True)
     log(f"[INFO] output directory: {output_dir}")
+
+    if not episodes:
+        raise RuntimeError("No episodes selected for conversion")
+
+    data_topics = required_data_topics(
+        topics=topics,
+        collect_goto_s_debug=collect_goto_s_debug,
+        collect_target_base_debug=collect_target_base_debug,
+    )
+    log(f"[INFO] data filter topics: {data_topics}")
+
+    data_reader = open_filtered_reader(
+        bag_path=bag_path,
+        storage_id=args.storage_id,
+        topics=data_topics,
+    )
+    classes = message_classes(types, set(data_topics))
+    missing_classes = [topic for topic in data_topics if topic not in classes]
+    if missing_classes:
+        raise RuntimeError(
+            f"Missing message class definitions for topics: {missing_classes}"
+        )
+
+    selected_start = episodes[0].start
+    selected_end = episodes[-1].end
+    log(
+        "[INFO] selected episode time range (sec): "
+        f"{selected_start:.6f} .. {selected_end:.6f}"
+    )
+    log("[INFO] Pass 2: streaming selected episodes with one filtered data reader")
 
     raw_event_store: Optional[RawEventStore] = None
     if raw_events_h5 is not None:
@@ -1110,46 +1277,111 @@ def main() -> None:
 
     lengths: List[int] = []
     try:
-        for episode in episodes:
-            data = collect_episode(
-                bag_path=bag_path,
-                storage_id=args.storage_id,
-                episode=episode,
-                topics=topics,
-                collect_goto_s_debug=collect_goto_s_debug,
-                collect_target_base_debug=collect_target_base_debug,
+        total_episodes = len(episodes)
+        completed_episodes = 0
+        active_index = 0
+        active_buffer = create_episode_buffer()
+        active_collect_start_wall = time.perf_counter()
+        data_pass_start_wall = time.perf_counter()
+        last_progress_wall = data_pass_start_wall
+        progress_interval_sec = 7.0
+        latest_timestamp = selected_start
+
+        while data_reader.has_next() and active_index < total_episodes:
+            topic, raw, timestamp_ns = data_reader.read_next()
+            timestamp = ns_to_sec(timestamp_ns)
+            latest_timestamp = timestamp
+
+            while active_index < total_episodes and timestamp > episodes[active_index].end:
+                episode = episodes[active_index]
+                lengths.append(
+                    finalize_episode(
+                        episode=episode,
+                        data=active_buffer,
+                        output_dir=output_dir,
+                        topics=topics,
+                        fps=args.fps,
+                        max_current_tcp_s_age_sec=args.max_current_tcp_s_age_sec,
+                        compression=args.compression,
+                        overwrite=args.overwrite,
+                        collect_started_wall=active_collect_start_wall,
+                        raw_event_store=raw_event_store,
+                        raw_events_h5=raw_events_h5,
+                        event_frame_windows_ms=tuple(args.event_frame_windows_ms),
+                        event_frame_mode=args.event_frame_mode,
+                        event_clip_count=args.event_clip_count,
+                        event_packet_margin_ms=args.event_packet_margin_ms,
+                    )
+                )
+                completed_episodes += 1
+                active_index += 1
+                if active_index < total_episodes:
+                    active_buffer = create_episode_buffer()
+                    active_collect_start_wall = time.perf_counter()
+
+            if active_index >= total_episodes:
+                break
+
+            active_episode = episodes[active_index]
+            if timestamp < active_episode.start:
+                pass
+            elif timestamp <= active_episode.end:
+                msg = deserialize_message(raw, classes[topic])
+                ingest_episode_message(
+                    data=active_buffer,
+                    topic=topic,
+                    msg=msg,
+                    timestamp=timestamp,
+                    topics=topics,
+                )
+
+            now = time.perf_counter()
+            if now - last_progress_wall >= progress_interval_sec:
+                log_data_pass_progress(
+                    current_timestamp=timestamp,
+                    completed_episodes=completed_episodes,
+                    total_episodes=total_episodes,
+                    pass_start_wall=data_pass_start_wall,
+                    selected_start=selected_start,
+                    selected_end=selected_end,
+                )
+                last_progress_wall = now
+
+        while active_index < total_episodes:
+            episode = episodes[active_index]
+            lengths.append(
+                finalize_episode(
+                    episode=episode,
+                    data=active_buffer,
+                    output_dir=output_dir,
+                    topics=topics,
+                    fps=args.fps,
+                    max_current_tcp_s_age_sec=args.max_current_tcp_s_age_sec,
+                    compression=args.compression,
+                    overwrite=args.overwrite,
+                    collect_started_wall=active_collect_start_wall,
+                    raw_event_store=raw_event_store,
+                    raw_events_h5=raw_events_h5,
+                    event_frame_windows_ms=tuple(args.event_frame_windows_ms),
+                    event_frame_mode=args.event_frame_mode,
+                    event_clip_count=args.event_clip_count,
+                    event_packet_margin_ms=args.event_packet_margin_ms,
+                )
             )
-            arrays = sample_episode(
-                data=data,
-                episode=episode,
-                fps=args.fps,
-                max_current_tcp_s_age_sec=args.max_current_tcp_s_age_sec,
-                raw_event_store=raw_event_store,
-                event_frame_windows_ms=tuple(args.event_frame_windows_ms),
-                event_frame_mode=args.event_frame_mode,
-                event_clip_count=args.event_clip_count,
-                event_packet_margin_ms=args.event_packet_margin_ms,
-            )
-            output_path = os.path.join(
-                output_dir, f"episode_{episode.output_idx}.hdf5"
-            )
-            write_episode(
-                output_path=output_path,
-                arrays=arrays,
-                episode=episode,
-                topics=topics,
-                fps=args.fps,
-                compression=args.compression,
-                overwrite=args.overwrite,
-                raw_events_h5=raw_events_h5,
-                event_frame_windows_ms=tuple(args.event_frame_windows_ms),
-                event_frame_mode=args.event_frame_mode,
-                event_clip_count=args.event_clip_count,
-            )
-            lengths.append(int(arrays["timestamps"].size))
-            del data
-            del arrays
-            gc.collect()
+            completed_episodes += 1
+            active_index += 1
+            if active_index < total_episodes:
+                active_buffer = create_episode_buffer()
+                active_collect_start_wall = time.perf_counter()
+
+        log_data_pass_progress(
+            current_timestamp=max(latest_timestamp, selected_end),
+            completed_episodes=completed_episodes,
+            total_episodes=total_episodes,
+            pass_start_wall=data_pass_start_wall,
+            selected_start=selected_start,
+            selected_end=selected_end,
+        )
     finally:
         if raw_event_store is not None:
             raw_event_store.close()
@@ -1160,6 +1392,8 @@ def main() -> None:
         f"       lengths: min={min(lengths)}, "
         f"mean={float(np.mean(lengths)):.2f}, max={max(lengths)}"
     )
+    total_wall = max(0.0, time.perf_counter() - conversion_start_wall)
+    log(f"       total wall time: {format_hms(total_wall)}")
 
 
 if __name__ == "__main__":
