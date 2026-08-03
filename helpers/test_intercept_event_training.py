@@ -89,7 +89,7 @@ def _write_intercept_episode(path, mode="event", steps=12, metadata_override=Non
             root.attrs["event_scaling"] = metadata_override.get(
                 "event_scaling", "signed_log1p_fixed_clip"
             )
-            root.attrs["event_clip_count"] = float(metadata_override.get("event_clip_count", 3.0))
+            root.attrs["event_clip_count"] = float(metadata_override.get("event_clip_count", 16.0))
             root.attrs["event_neutral_u8"] = int(metadata_override.get("event_neutral_u8", 128))
             root.attrs["event_sampling_policy"] = metadata_override.get(
                 "event_sampling_policy", "latest_packet_at_or_before_grid_time"

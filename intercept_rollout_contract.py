@@ -18,7 +18,7 @@ ARM_JOINT_NAMES = (
 )
 
 
-EXPECTED_INTERCEPT_METADATA = {
+EXPECTED_INTERCEPT_COMMON_METADATA = {
     "data_mode": "intercept",
     "raw_qpos_dim": 7,
     "state_dim": 21,
@@ -37,15 +37,50 @@ EXPECTED_INTERCEPT_METADATA = {
     "action_units": "m",
 }
 
+EXPECTED_INTERCEPT_RGB_METADATA = {
+    **EXPECTED_INTERCEPT_COMMON_METADATA,
+    "input_modality": "rgb",
+    "camera_names": ["rgb"],
+    "visual_history_frames": 3,
+    "visual_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+    "channels_per_visual_frame": 3,
+    "visual_frame_order": "oldest_to_newest",
+    "image_normalization": "imagenet",
+}
+
+EXPECTED_INTERCEPT_EVENT_METADATA = {
+    **EXPECTED_INTERCEPT_COMMON_METADATA,
+    "input_modality": "event",
+    "camera_names": ["event"],
+    "visual_history_frames": 3,
+    "visual_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+    "channels_per_visual_frame": 3,
+    "visual_frame_order": "oldest_to_newest",
+    "image_normalization": "shifted_3chef_centered",
+    "event_representation": "shifted_3chef_signed",
+    "event_frame_mode": "shifted",
+    "event_frame_windows_ms": [50.0, 100.0, 200.0],
+    "event_channel_order": "recent_to_oldest",
+    "event_scaling": "signed_log1p_fixed_clip",
+    "event_clip_count": 16.0,
+    "event_neutral_u8": 128,
+    "event_sampling_policy": "latest_packet_at_or_before_grid_time",
+}
+
 
 @dataclass(frozen=True)
 class SyncSelection:
     history_indices: Tuple[int, int, int]
-    rgb_timestamps: Tuple[float, float, float]
+    visual_timestamps: Tuple[float, float, float]
     qpos_timestamps: Tuple[float, float, float]
     anchor_tcp_s: float
     anchor_tcp_s_timestamp: float
     qpos_history: np.ndarray
+
+    @property
+    def rgb_timestamps(self) -> Tuple[float, float, float]:
+        # Backward-compatible alias used by existing rollout code/tests.
+        return self.visual_timestamps
 
 
 @dataclass(frozen=True)
@@ -261,35 +296,99 @@ def build_qpos_history(qpos_samples: Sequence[np.ndarray]) -> np.ndarray:
     return out
 
 
-def build_rgb_history_tensor(rgb_frames: Sequence[np.ndarray], image_size: int) -> np.ndarray:
-    if len(rgb_frames) != 3:
-        raise ValueError(f"Expected 3 RGB frames for temporal history, got {len(rgb_frames)}")
+def build_visual_history_tensor(
+    visual_frames: Sequence[np.ndarray],
+    image_size: int,
+    modality: str,
+) -> np.ndarray:
+    if len(visual_frames) != 3:
+        raise ValueError(f"Expected 3 visual frames for temporal history, got {len(visual_frames)}")
 
     target = int(image_size)
     if target <= 0:
         raise ValueError(f"image_size must be positive, got {target}")
 
+    modality = str(modality).strip().lower()
+    if modality not in ("rgb", "event"):
+        raise ValueError(f"Unsupported visual modality: {modality!r}")
+
     processed = []
-    for frame in rgb_frames:
+    for frame in visual_frames:
         arr = np.asarray(frame)
         if arr.ndim != 3 or arr.shape[2] != 3:
-            raise ValueError(f"Each RGB frame must be HWC3, got {arr.shape}")
+            raise ValueError(f"Each visual frame must be HWC3, got {arr.shape}")
+        if modality == "event" and arr.dtype != np.uint8:
+            raise ValueError(
+                f"Event frame dtype must be uint8 before policy preprocessing, got {arr.dtype}"
+            )
         resized = cv2.resize(arr, (target, target), interpolation=cv2.INTER_AREA)
         processed.append(resized)
 
     image_hwc = np.concatenate(processed, axis=2)
     if image_hwc.shape != (target, target, 9):
         raise AssertionError(
-            f"Temporal RGB concat mismatch: expected {(target, target, 9)}, got {image_hwc.shape}"
+            f"Temporal visual concat mismatch: expected {(target, target, 9)}, got {image_hwc.shape}"
         )
 
     image = np.transpose(image_hwc, (2, 0, 1))[None, None, ...].astype(np.float32) / 255.0
     if image.shape != (1, 1, 9, target, target):
         raise AssertionError(
-            "Temporal RGB tensor shape mismatch: "
+            "Temporal visual tensor shape mismatch: "
             f"expected {(1, 1, 9, target, target)}, got {image.shape}"
         )
     return image
+
+
+def build_rgb_history_tensor(rgb_frames: Sequence[np.ndarray], image_size: int) -> np.ndarray:
+    return build_visual_history_tensor(rgb_frames, image_size=image_size, modality="rgb")
+
+
+def _resolve_policy_modality(policy_config: Dict[str, object]) -> str:
+    camera_names = policy_config.get("camera_names")
+    if not isinstance(camera_names, (list, tuple)) or len(camera_names) != 1:
+        raise ValueError(
+            "Interception policy config must set camera_names to exactly one value: ['rgb'] or ['event']"
+        )
+    camera_name = str(camera_names[0])
+    if camera_name not in ("rgb", "event"):
+        raise ValueError(
+            f"Interception camera_names must be ['rgb'] or ['event'], got {camera_names}"
+        )
+
+    input_modality = policy_config.get("input_modality")
+    if input_modality is None:
+        # Legacy fallback allowed only for RGB checkpoints.
+        if camera_name == "rgb":
+            return "rgb"
+        raise ValueError(
+            "Event rollout requires explicit input_modality='event' in policy config"
+        )
+
+    input_modality = str(input_modality)
+    if input_modality not in ("rgb", "event"):
+        raise ValueError(f"Unsupported policy input_modality: {input_modality!r}")
+    if input_modality != camera_name:
+        raise ValueError(
+            "Interception modality mismatch in policy config: "
+            f"camera_names={camera_names}, input_modality={input_modality!r}"
+        )
+    return input_modality
+
+
+def _stats_modality(stats: Dict[str, object]) -> Optional[str]:
+    modality = stats.get("input_modality")
+    if modality is not None:
+        modality = str(modality)
+        if modality not in ("rgb", "event"):
+            raise ValueError(f"Unsupported checkpoint input_modality in stats: {modality!r}")
+        return modality
+
+    camera_names = stats.get("camera_names")
+    if camera_names == ["rgb"]:
+        return "rgb"
+    if camera_names == ["event"]:
+        return "event"
+    return None
 
 
 def validate_intercept_stats_and_config(
@@ -297,8 +396,33 @@ def validate_intercept_stats_and_config(
     policy_config: Dict[str, object],
     expected_chunk_size: int,
 ) -> Dict[str, np.ndarray]:
-    for key, expected in EXPECTED_INTERCEPT_METADATA.items():
+    rollout_modality = _resolve_policy_modality(policy_config)
+    checkpoint_modality = _stats_modality(stats)
+
+    if checkpoint_modality is None:
+        if rollout_modality != "rgb":
+            raise ValueError(
+                "Checkpoint does not declare event modality metadata; refusing event rollout"
+            )
+        checkpoint_modality = "rgb"
+
+    if checkpoint_modality != rollout_modality:
+        raise ValueError(
+            "Checkpoint/rollout modality mismatch: "
+            f"checkpoint={checkpoint_modality}, rollout={rollout_modality}"
+        )
+
+    expected_metadata = (
+        EXPECTED_INTERCEPT_EVENT_METADATA
+        if rollout_modality == "event"
+        else EXPECTED_INTERCEPT_RGB_METADATA
+    )
+
+    for key, expected in expected_metadata.items():
         if key not in stats:
+            if rollout_modality == "rgb" and key in ("input_modality", "camera_names", "visual_history_frames", "visual_history_offsets", "channels_per_visual_frame", "visual_frame_order", "image_normalization"):
+                # Legacy RGB checkpoints are allowed to miss newer metadata keys.
+                continue
             raise ValueError(f"Missing interception checkpoint metadata in dataset_stats.pkl: {key}")
         if stats[key] != expected:
             raise ValueError(
@@ -311,6 +435,8 @@ def validate_intercept_stats_and_config(
         "action_dim": 1,
         "num_queries": int(expected_chunk_size),
         "rgb_history_frames": 3,
+        "visual_history_frames": 3,
+        "channels_per_visual_frame": 3,
         "image_channels": 9,
     }
     for key, expected in required_config.items():
@@ -322,6 +448,20 @@ def validate_intercept_stats_and_config(
 
     if bool(policy_config.get("use_bce_last_action_dim", False)):
         raise ValueError("Interception rollout requires use_bce_last_action_dim=false")
+
+    expected_norm = "shifted_3chef_centered" if rollout_modality == "event" else "imagenet"
+    if str(policy_config.get("image_normalization", "")) != expected_norm:
+        raise ValueError(
+            "Interception policy config mismatch for image_normalization: "
+            f"expected {expected_norm!r}, found {policy_config.get('image_normalization')!r}"
+        )
+
+    expected_offsets = list(INTERCEPT_HISTORY_OFFSETS)
+    if list(policy_config.get("visual_history_offsets", expected_offsets)) != expected_offsets:
+        raise ValueError(
+            "Interception policy config mismatch for visual_history_offsets: "
+            f"expected {expected_offsets}, found {policy_config.get('visual_history_offsets')}"
+        )
 
     arrays: Dict[str, np.ndarray] = {}
     for stat_key, expected_shape in (
@@ -390,7 +530,7 @@ def select_sync_observation(
     history_offsets: Sequence[int] = INTERCEPT_HISTORY_OFFSETS,
 ) -> SyncSelection:
     if not rgb_timestamps:
-        raise ValueError("No RGB samples available")
+        raise ValueError("No visual samples available")
     if len(joint_timestamps) != len(joint_qpos_samples):
         raise ValueError("joint_timestamps and joint_qpos_samples length mismatch")
     if len(tcp_timestamps) != len(tcp_values):
@@ -407,7 +547,7 @@ def select_sync_observation(
         joint_idx = select_latest_index_at_or_before(joint_timestamps, rgb_ts)
         if joint_idx is None:
             raise ValueError(
-                "No causal JointState sample available at or before RGB timestamp "
+                "No causal JointState sample available at or before visual timestamp "
                 f"{rgb_ts:.6f}"
             )
         selected_qpos_ts.append(float(joint_timestamps[joint_idx]))
@@ -419,7 +559,7 @@ def select_sync_observation(
     tcp_idx = select_latest_index_at_or_before(tcp_timestamps, anchor_ts)
     if tcp_idx is None:
         raise ValueError(
-            "No causal current_tcp_s sample available at or before RGB anchor timestamp "
+            "No causal current_tcp_s sample available at or before visual anchor timestamp "
             f"{anchor_ts:.6f}"
         )
 
@@ -431,7 +571,7 @@ def select_sync_observation(
 
     return SyncSelection(
         history_indices=tuple(history_indices),
-        rgb_timestamps=tuple(selected_rgb_ts),
+        visual_timestamps=tuple(selected_rgb_ts),
         qpos_timestamps=tuple(selected_qpos_ts),
         anchor_tcp_s=anchor_tcp_s,
         anchor_tcp_s_timestamp=anchor_tcp_ts,

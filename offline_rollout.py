@@ -10,7 +10,7 @@ import torch
 from intercept_rollout_contract import (
     INTERCEPT_HISTORY_OFFSETS,
     absolute_s_from_anchor,
-    build_rgb_history_tensor,
+    build_visual_history_tensor,
     compute_history_indices,
     denormalize_delta_chunk,
     validate_intercept_stats_and_config,
@@ -22,7 +22,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt_dir", required=True)
     ap.add_argument("--hdf5", required=True)
-    ap.add_argument("--camera_name", default="rgb", choices=["rgb"])
+    ap.add_argument("--camera_name", default="rgb", choices=["rgb", "event"])
     ap.add_argument("--chunk_size", type=int, default=30)
     ap.add_argument("--hidden_dim", type=int, default=512)
     ap.add_argument("--dim_feedforward", type=int, default=3200)
@@ -54,10 +54,16 @@ def main():
         "dec_layers": 7,
         "nheads": 8,
         "camera_names": [args.camera_name],
+        "input_modality": args.camera_name,
         "state_dim": args.state_dim,
         "action_dim": args.action_dim,
         "use_bce_last_action_dim": False,
         "rgb_history_frames": 3,
+        "visual_history_frames": 3,
+        "visual_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+        "channels_per_visual_frame": 3,
+        "visual_frame_order": "oldest_to_newest",
+        "image_normalization": "shifted_3chef_centered" if args.camera_name == "event" else "imagenet",
         "image_channels": 9,
         "image_size": args.image_size,
     }
@@ -86,7 +92,7 @@ def main():
             q_tensor = torch.from_numpy(q_norm).float().to(device).unsqueeze(0)
 
             rgb_frames = [rgb[index] for index in history_indices]
-            image_np = build_rgb_history_tensor(rgb_frames, args.image_size)
+            image_np = build_visual_history_tensor(rgb_frames, args.image_size, modality=args.camera_name)
             image_tensor = torch.from_numpy(image_np).float().to(device)
 
             raw = policy(q_tensor, image_tensor)

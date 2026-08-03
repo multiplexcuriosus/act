@@ -21,7 +21,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from intercept_rollout_contract import (
     TemporalAbsoluteAggregator,
     absolute_s_from_anchor,
-    build_rgb_history_tensor,
+    build_visual_history_tensor,
     denormalize_delta_chunk,
     extract_arm_qpos,
     resolve_temporal_agg_mode,
@@ -73,6 +73,7 @@ class FrankaActRolloutNode(Node):
         self.state_dim = args.state_dim
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
+        self.input_modality = str(args.camera_name)
         self.image_channels = 9
         self.image_size = int(args.image_size)
         self.max_source_buffer = int(args.max_source_buffer)
@@ -81,7 +82,7 @@ class FrankaActRolloutNode(Node):
         self.diag_log_period_sec = float(args.diag_log_period_sec)
         self.reject_log_period_sec = float(args.reject_log_period_sec)
 
-        self.rgb_buffer: Deque[Tuple[float, Image]] = deque(maxlen=self.max_source_buffer)
+        self.visual_buffer: Deque[Tuple[float, Image]] = deque(maxlen=self.max_source_buffer)
         self.joint_buffer: Deque[Tuple[float, np.ndarray]] = deque(maxlen=self.max_source_buffer)
         self.tcp_buffer: Deque[Tuple[float, float]] = deque(maxlen=self.max_source_buffer)
 
@@ -120,10 +121,16 @@ class FrankaActRolloutNode(Node):
             "dec_layers": args.dec_layers,
             "nheads": args.nheads,
             "camera_names": [args.camera_name],
+            "input_modality": self.input_modality,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
             "use_bce_last_action_dim": args.use_bce_last_action_dim,
             "rgb_history_frames": args.rgb_history_frames,
+            "visual_history_frames": args.rgb_history_frames,
+            "visual_history_offsets": [-6, -3, 0],
+            "channels_per_visual_frame": 3,
+            "visual_frame_order": "oldest_to_newest",
+            "image_normalization": "shifted_3chef_centered" if self.input_modality == "event" else "imagenet",
             "image_channels": self.image_channels,
             "image_size": self.image_size,
         }
@@ -230,7 +237,7 @@ class FrankaActRolloutNode(Node):
             t = stamp_to_sec(msg.header.stamp)
         except Exception:
             t = self.get_clock().now().nanoseconds * 1e-9
-        self._append_monotonic("RGB", self.rgb_buffer, t, msg)
+        self._append_monotonic("visual", self.visual_buffer, t, msg)
 
     def joint_cb(self, msg: JointState) -> None:
         try:
@@ -250,7 +257,7 @@ class FrankaActRolloutNode(Node):
         self._append_monotonic("current_tcp_s", self.tcp_buffer, t, value)
 
     def ready(self) -> bool:
-        return bool(self.rgb_buffer) and bool(self.joint_buffer) and bool(self.tcp_buffer)
+        return bool(self.visual_buffer) and bool(self.joint_buffer) and bool(self.tcp_buffer)
 
     def _reject(self, reason: str) -> None:
         now = time.time()
@@ -307,11 +314,11 @@ class FrankaActRolloutNode(Node):
 
     def _anchor_timestamp_ns_from_observation(
             self,
-            rgb_msg: Image,
+            visual_msg: Image,
             fallback_sec: float,
         ) -> int:
             try:
-                stamp = rgb_msg.header.stamp
+                stamp = visual_msg.header.stamp
                 return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
             except Exception:
                 return int(round(float(fallback_sec) * 1e9))
@@ -331,8 +338,8 @@ class FrankaActRolloutNode(Node):
         del request
         with self._aggregation_lock:
             floor_anchor_ns: Optional[int] = None
-            if self.rgb_buffer:
-                floor_sec, floor_msg = self.rgb_buffer[-1]
+            if self.visual_buffer:
+                floor_sec, floor_msg = self.visual_buffer[-1]
                 floor_anchor_ns = self._anchor_timestamp_ns_from_observation(floor_msg, floor_sec)
 
             discarded_entries = self._reset_temporal_aggregation("service_reset")
@@ -348,49 +355,56 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(
             "Temporal aggregation reset acknowledged: "
             f"epoch={self.rollout_epoch} reason=service_reset "
-            f"rgb_anchor_floor_ns={floor_text} discarded_entries={discarded_entries}"
+            f"visual_anchor_floor_ns={floor_text} discarded_entries={discarded_entries}"
         )
         return response
 
     def _warn_post_inference_stale(
         self,
-        rgb_age_sec: float,
+        visual_age_sec: float,
         tcp_age_sec: float,
         inference_ms: float,
     ) -> None:
         self._throttled_warn(
             "post_inference_stale",
             "Rejecting stale post-inference rollout result: "
-            f"rgb_age={rgb_age_sec:.4f}s (limit={self.max_observation_age_sec:.4f}s), "
+            f"visual_age={visual_age_sec:.4f}s (limit={self.max_observation_age_sec:.4f}s), "
             f"tcp_age={tcp_age_sec:.4f}s (limit={self.max_anchor_age_sec:.4f}s), "
             f"inference_ms={inference_ms:.2f}"
         )
 
     def build_policy_inputs(self):
-        rgb_timestamps = [item[0] for item in self.rgb_buffer]
-        rgb_messages = [item[1] for item in self.rgb_buffer]
+        visual_timestamps = [item[0] for item in self.visual_buffer]
+        visual_messages = [item[1] for item in self.visual_buffer]
         joint_timestamps = [item[0] for item in self.joint_buffer]
         joint_qpos = [item[1] for item in self.joint_buffer]
         tcp_timestamps = [item[0] for item in self.tcp_buffer]
         tcp_values = [item[1] for item in self.tcp_buffer]
 
         sync = select_sync_observation(
-            rgb_timestamps=rgb_timestamps,
+            rgb_timestamps=visual_timestamps,
             joint_timestamps=joint_timestamps,
             joint_qpos_samples=joint_qpos,
             tcp_timestamps=tcp_timestamps,
             tcp_values=tcp_values,
         )
 
-        selected_rgb_msgs = [rgb_messages[index] for index in sync.history_indices]
-        rgb_frames = [
-            self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
-            for msg in selected_rgb_msgs
+        selected_visual_msgs = [visual_messages[index] for index in sync.history_indices]
+        desired_encoding = "passthrough" if self.input_modality == "event" else "rgb8"
+        visual_frames = [
+            self.bridge.imgmsg_to_cv2(msg, desired_encoding=desired_encoding)
+            for msg in selected_visual_msgs
         ]
-        image_np = build_rgb_history_tensor(rgb_frames, self.image_size)
+        if self.input_modality == "event":
+            for frame in visual_frames:
+                if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+                    raise ValueError(
+                        "Event image decoding contract violated: expected uint8 HxWx3 from /openmv_cam/event_frame_3ch"
+                    )
+        image_np = build_visual_history_tensor(visual_frames, self.image_size, modality=self.input_modality)
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
-        anchor_observation_timestamp = sync.rgb_timestamps[-1]
+        anchor_observation_timestamp = sync.visual_timestamps[-1]
         validate_anchor_freshness(
             anchor_timestamp=sync.anchor_tcp_s_timestamp,
             observation_timestamp=anchor_observation_timestamp,
@@ -405,9 +419,9 @@ class FrankaActRolloutNode(Node):
 
         qpos = torch.from_numpy(qpos_norm).float().to(self.device).unsqueeze(0)
         image = torch.from_numpy(image_np).float().to(self.device)
-        anchor_rgb_msg = selected_rgb_msgs[-1]
+        anchor_visual_msg = selected_visual_msgs[-1]
         anchor_timestamp_ns = self._anchor_timestamp_ns_from_observation(
-            anchor_rgb_msg,
+            anchor_visual_msg,
             anchor_observation_timestamp,
         )
         return sync, qpos, image, anchor_timestamp_ns
@@ -439,18 +453,18 @@ class FrankaActRolloutNode(Node):
                     return
                 if delta_ns < 0:
                     self.backward_anchor_count += 1
-                    self._reset_temporal_aggregation("backward_rgb_anchor_timestamp")
+                    self._reset_temporal_aggregation("backward_visual_anchor_timestamp")
                     self._throttled_warn(
                         "backward_anchor",
-                        "Detected backward RGB anchor timestamp; resetting temporal aggregation. "
+                        "Detected backward visual anchor timestamp; resetting temporal aggregation. "
                         f"anchor_ns={anchor_timestamp_ns} delta_ns={delta_ns}",
                     )
                 elif delta_ns > self.anchor_gap_reset_threshold_ns:
                     self.aggregation_reset_gap_count += 1
-                    self._reset_temporal_aggregation("rgb_anchor_gap")
+                    self._reset_temporal_aggregation("visual_anchor_gap")
                     self._throttled_warn(
                         "anchor_gap",
-                        "Detected RGB anchor timestamp gap; resetting temporal aggregation. "
+                        "Detected visual anchor timestamp gap; resetting temporal aggregation. "
                         f"delta_ms={delta_ns / 1e6:.2f} expected_ms={self.expected_step_ns / 1e6:.2f} "
                         f"tolerance_ms={self.anchor_gap_tolerance_ns / 1e6:.2f}",
                     )
@@ -485,7 +499,7 @@ class FrankaActRolloutNode(Node):
         try:
             validate_anchor_freshness(
                 anchor_timestamp=sync.anchor_tcp_s_timestamp,
-                observation_timestamp=sync.rgb_timestamps[-1],
+                observation_timestamp=sync.visual_timestamps[-1],
                 now_timestamp=post_now_sec,
                 max_anchor_age_sec=self.max_anchor_age_sec,
                 max_observation_age_sec=self.max_observation_age_sec,
@@ -494,10 +508,10 @@ class FrankaActRolloutNode(Node):
             with self._aggregation_lock:
                 self.post_inference_stale_count += 1
                 self.failed_or_stale_inference_gap_count += 1
-            rgb_age_sec = post_now_sec - sync.rgb_timestamps[-1]
-            tcp_age_sec = sync.rgb_timestamps[-1] - sync.anchor_tcp_s_timestamp
+            visual_age_sec = post_now_sec - sync.visual_timestamps[-1]
+            tcp_age_sec = sync.visual_timestamps[-1] - sync.anchor_tcp_s_timestamp
             self._warn_post_inference_stale(
-                rgb_age_sec=rgb_age_sec,
+                visual_age_sec=visual_age_sec,
                 tcp_age_sec=tcp_age_sec,
                 inference_ms=inference_ms,
             )
@@ -540,10 +554,10 @@ class FrankaActRolloutNode(Node):
             self.accepted_distinct_anchor_count += 1
 
         total_step_ms = (time.time() - step_start_wall) * 1000.0
-        max_input_age = post_now_sec - sync.rgb_timestamps[-1]
+        max_input_age = post_now_sec - sync.visual_timestamps[-1]
         max_sync_error = max(
-            max(abs(rgb_ts - qpos_ts) for rgb_ts, qpos_ts in zip(sync.rgb_timestamps, sync.qpos_timestamps)),
-            sync.rgb_timestamps[-1] - sync.anchor_tcp_s_timestamp,
+            max(abs(visual_ts - qpos_ts) for visual_ts, qpos_ts in zip(sync.visual_timestamps, sync.qpos_timestamps)),
+            sync.visual_timestamps[-1] - sync.anchor_tcp_s_timestamp,
         )
 
         now_wall = time.time()
@@ -567,7 +581,7 @@ class FrankaActRolloutNode(Node):
                 f"selected_target_offset_frames={self.selected_target_offset_frames} "
                 f"selected_target_offset_ms={self.selected_target_offset_ms:.2f} "
                 f"history_indices={list(sync.history_indices)} "
-                f"rgb_ts={[round(ts, 6) for ts in sync.rgb_timestamps]} "
+                f"visual_ts={[round(ts, 6) for ts in sync.visual_timestamps]} "
                 f"qpos_ts={[round(ts, 6) for ts in sync.qpos_timestamps]} "
                 f"anchor_s={sync.anchor_tcp_s:+.6f} anchor_ts={sync.anchor_tcp_s_timestamp:.6f} "
                 f"qpos_shape={tuple(sync.qpos_history.shape)} image_shape={tuple(curr_image.shape)} "
@@ -583,7 +597,7 @@ class FrankaActRolloutNode(Node):
 
     def timer_cb(self) -> None:
         if not self.ready():
-            self._reject("waiting for RGB, JointState, and current_tcp_s streams")
+            self._reject("waiting for visual image, JointState, and current_tcp_s streams")
             return
 
         if not self.running:
@@ -637,7 +651,7 @@ def main():
     parser.add_argument("--chunk_size", type=int, default=30)
     parser.add_argument("--rgb_history_frames", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=320)
-    parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb"])
+    parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb", "event"])
 
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--kl_weight", type=int, default=10)

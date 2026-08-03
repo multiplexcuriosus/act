@@ -12,10 +12,12 @@ if ACT_ROOT not in sys.path:
     sys.path.insert(0, ACT_ROOT)
 
 from intercept_rollout_contract import (  # noqa: E402
-    EXPECTED_INTERCEPT_METADATA,
+    EXPECTED_INTERCEPT_EVENT_METADATA,
+    EXPECTED_INTERCEPT_RGB_METADATA,
     AggregationSelection,
     TemporalAbsoluteAggregator,
     absolute_s_from_anchor,
+    build_visual_history_tensor,
     build_qpos_history,
     build_rgb_history_tensor,
     compute_history_indices,
@@ -28,8 +30,11 @@ from intercept_rollout_contract import (  # noqa: E402
 
 
 class InterceptRolloutContractTests(unittest.TestCase):
-    def make_stats(self):
-        stats = dict(EXPECTED_INTERCEPT_METADATA)
+    def make_stats(self, modality="rgb"):
+        if modality == "event":
+            stats = dict(EXPECTED_INTERCEPT_EVENT_METADATA)
+        else:
+            stats = dict(EXPECTED_INTERCEPT_RGB_METADATA)
         stats.update(
             {
                 "qpos_mean": np.zeros(21, dtype=np.float32),
@@ -40,12 +45,18 @@ class InterceptRolloutContractTests(unittest.TestCase):
         )
         return stats
 
-    def make_policy_config(self):
+    def make_policy_config(self, modality="rgb"):
         return {
             "state_dim": 21,
             "action_dim": 1,
             "num_queries": 30,
             "rgb_history_frames": 3,
+            "visual_history_frames": 3,
+            "visual_history_offsets": [-6, -3, 0],
+            "channels_per_visual_frame": 3,
+            "camera_names": [modality],
+            "input_modality": modality,
+            "image_normalization": "shifted_3chef_centered" if modality == "event" else "imagenet",
             "image_channels": 9,
             "use_bce_last_action_dim": False,
         }
@@ -111,8 +122,8 @@ class InterceptRolloutContractTests(unittest.TestCase):
         np.testing.assert_allclose(absolute, np.asarray([1.3, 1.5, 1.8], dtype=np.float32), atol=1e-6)
 
     def test_no_bce_contract(self):
-        stats = self.make_stats()
-        config = self.make_policy_config()
+        stats = self.make_stats("rgb")
+        config = self.make_policy_config("rgb")
         config["use_bce_last_action_dim"] = True
         with self.assertRaises(ValueError):
             validate_intercept_stats_and_config(stats, config, expected_chunk_size=30)
@@ -128,10 +139,99 @@ class InterceptRolloutContractTests(unittest.TestCase):
             )
 
     def test_legacy_stats_fail_fast(self):
-        stats = self.make_stats()
+        stats = self.make_stats("rgb")
         stats["action_dim"] = 2
         with self.assertRaises(ValueError):
-            validate_intercept_stats_and_config(stats, self.make_policy_config(), expected_chunk_size=30)
+            validate_intercept_stats_and_config(stats, self.make_policy_config("rgb"), expected_chunk_size=30)
+
+    def test_event_history_concat_order_and_shape(self):
+        frame_t_minus_6 = np.zeros((4, 4, 3), dtype=np.uint8)
+        frame_t_minus_3 = np.zeros((4, 4, 3), dtype=np.uint8)
+        frame_t = np.zeros((4, 4, 3), dtype=np.uint8)
+
+        frame_t_minus_6[:, :, 0] = 11
+        frame_t_minus_6[:, :, 1] = 12
+        frame_t_minus_6[:, :, 2] = 13
+        frame_t_minus_3[:, :, 0] = 21
+        frame_t_minus_3[:, :, 1] = 22
+        frame_t_minus_3[:, :, 2] = 23
+        frame_t[:, :, 0] = 31
+        frame_t[:, :, 1] = 32
+        frame_t[:, :, 2] = 33
+
+        image = build_visual_history_tensor(
+            [frame_t_minus_6, frame_t_minus_3, frame_t], image_size=4, modality="event"
+        )
+        self.assertEqual(image.shape, (1, 1, 9, 4, 4))
+        channel_means = image[0, 0].reshape(9, -1).mean(axis=1) * 255.0
+        np.testing.assert_allclose(
+            channel_means,
+            np.asarray([11, 12, 13, 21, 22, 23, 31, 32, 33], dtype=np.float32),
+            atol=0.5,
+        )
+
+    def test_event_neutral_normalizes_to_zero(self):
+        frame = np.full((4, 4, 3), 128, dtype=np.uint8)
+        image = build_visual_history_tensor([frame, frame, frame], image_size=4, modality="event")
+        # Apply event normalization (u8 - 128) / 127 in uint8/255 domain.
+        normalized = (image - (128.0 / 255.0)) / (127.0 / 255.0)
+        self.assertAlmostEqual(float(np.max(np.abs(normalized))), 0.0, places=6)
+
+    def test_event_positive_negative_normalize_correctly(self):
+        frame_lo = np.full((2, 2, 3), 1, dtype=np.uint8)
+        frame_hi = np.full((2, 2, 3), 255, dtype=np.uint8)
+        image = build_visual_history_tensor([frame_lo, frame_hi, frame_hi], image_size=2, modality="event")
+        normalized = (image - (128.0 / 255.0)) / (127.0 / 255.0)
+        self.assertAlmostEqual(float(normalized.min()), -1.0, places=6)
+        self.assertAlmostEqual(float(normalized.max()), 1.0, places=6)
+
+    def test_event_metadata_accepted(self):
+        stats = self.make_stats("event")
+        cfg = self.make_policy_config("event")
+        out = validate_intercept_stats_and_config(stats, cfg, expected_chunk_size=30)
+        self.assertIn("qpos_mean", out)
+
+    def test_event_metadata_mismatch_rejected(self):
+        mismatch_keys = [
+            "event_frame_windows_ms",
+            "event_scaling",
+            "event_clip_count",
+            "event_channel_order",
+            "event_sampling_policy",
+            "image_normalization",
+            "visual_history_offsets",
+        ]
+        for key in mismatch_keys:
+            with self.subTest(key=key):
+                stats = self.make_stats("event")
+                cfg = self.make_policy_config("event")
+                if key in stats:
+                    stats[key] = "broken" if not isinstance(stats[key], list) else [1.0, 2.0, 3.0]
+                else:
+                    cfg[key] = [0, -3, -6] if key == "visual_history_offsets" else "broken"
+                with self.assertRaises(ValueError):
+                    validate_intercept_stats_and_config(stats, cfg, expected_chunk_size=30)
+
+    def test_event_rgb_checkpoint_mismatch_rejected(self):
+        stats_event = self.make_stats("event")
+        cfg_rgb = self.make_policy_config("rgb")
+        with self.assertRaises(ValueError):
+            validate_intercept_stats_and_config(stats_event, cfg_rgb, expected_chunk_size=30)
+
+        stats_rgb = self.make_stats("rgb")
+        cfg_event = self.make_policy_config("event")
+        with self.assertRaises(ValueError):
+            validate_intercept_stats_and_config(stats_rgb, cfg_event, expected_chunk_size=30)
+
+    def test_event_frames_are_not_channel_swapped(self):
+        # Each channel keeps its own temporal byte values in order.
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        frame[:, :, 0] = 5
+        frame[:, :, 1] = 100
+        frame[:, :, 2] = 250
+        image = build_visual_history_tensor([frame, frame, frame], image_size=2, modality="event")
+        first_triplet = image[0, 0, :3, 0, 0] * 255.0
+        np.testing.assert_allclose(first_triplet, np.asarray([5.0, 100.0, 250.0]), atol=0.5)
 
     def test_temporal_aggregation_in_absolute_coordinates(self):
         agg = TemporalAbsoluteAggregator(chunk_size=5, decay=0.0)
