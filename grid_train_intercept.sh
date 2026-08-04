@@ -2,8 +2,8 @@
 set -euo pipefail
 
 DATASETS=(
-  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260728_225008_xyt200_s320_t9_signed"
-  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260727_215525_xyt200_s320_t9_signed"
+  "/home/dyros/Data/jg_data/hdf5/event_only/voxel/hdf5_20260727_215525_xyt200_s320_t9_signed"
+  "/home/dyros/Data/jg_data/hdf5/event_only/voxel/hdf5_20260728_225008_xyt200_s320_t9_signed"
 )
 
 # HDF5 qpos remains (T, 7), but the loader concatenates:
@@ -28,8 +28,8 @@ CAMERA_MODES=("${CAMERA_MODE}")
 
 for IMAGE_SIZE in 320; do
   for LR in 1e-5 2e-5; do
-    for BS in 8 16 32; do
-      for KL in 1 5 10; do
+    for BS in 8 16; do
+      for KL in 1 5; do
         for CAM_MODE in "${CAMERA_MODES[@]}"; do
 
           case "$CAM_MODE" in
