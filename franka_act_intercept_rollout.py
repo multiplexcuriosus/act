@@ -13,6 +13,8 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float64, Float64MultiArray
 from std_srvs.srv import Trigger
+from rcl_interfaces.msg import ParameterType
+from rcl_interfaces.srv import GetParameters
 
 import rclpy
 from rclpy.node import Node
@@ -22,14 +24,16 @@ from intercept_rollout_contract import (
     TemporalAbsoluteAggregator,
     absolute_s_from_anchor,
     build_visual_history_tensor,
+    decode_uint8_hwc_image_message,
     denormalize_delta_chunk,
     extract_arm_qpos,
+    resolve_intercept_visual_contract,
     resolve_temporal_agg_mode,
     select_sync_observation,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
+    validate_xyt_orientation_parity,
 )
-from policy import ACTPolicy
 
 
 def stamp_to_sec(stamp) -> float:
@@ -73,8 +77,6 @@ class FrankaActRolloutNode(Node):
         self.state_dim = args.state_dim
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
-        self.input_modality = str(args.camera_name)
-        self.image_channels = 9
         self.image_size = int(args.image_size)
         self.max_source_buffer = int(args.max_source_buffer)
         self.max_observation_age_sec = float(args.max_observation_age_sec)
@@ -109,6 +111,33 @@ class FrankaActRolloutNode(Node):
         self.anchor_gap_tolerance_ns = max(int(round(0.35 * self.expected_step_ns)), 5_000_000)
         self.anchor_gap_reset_threshold_ns = self.expected_step_ns + self.anchor_gap_tolerance_ns
 
+        ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
+        stats_path = os.path.join(args.ckpt_dir, args.stats_name)
+        with open(stats_path, "rb") as f:
+            stats = pickle.load(f)
+
+        self.visual_contract = resolve_intercept_visual_contract(
+            stats,
+            cli_camera_name=args.camera_name,
+            cli_event_representation=args.event_representation,
+            cli_visual_history_frames=args.rgb_history_frames,
+        )
+        self.event_representation = self.visual_contract.representation
+        self.input_modality = self.visual_contract.input_modality
+        self.image_channels = self.visual_contract.image_channels
+        self.visual_history_offsets = self.visual_contract.visual_history_offsets
+        self.qpos_history_offsets = self.visual_contract.qpos_history_offsets
+        self.image_normalization = self.visual_contract.image_normalization
+
+        self.live_event_rotation_degrees = None
+        self.orientation_parity_status = "not_applicable"
+        if self.event_representation == "xyt_signed_voxel_v1":
+            self.live_event_rotation_degrees = self._query_openmv_rotation_degrees()
+            self.orientation_parity_status = validate_xyt_orientation_parity(
+                self.live_event_rotation_degrees,
+                parity_verified=bool(args.xyt_orientation_parity_verified),
+            )
+
         policy_config = {
             "lr": args.lr,
             "num_queries": self.chunk_size,
@@ -120,26 +149,23 @@ class FrankaActRolloutNode(Node):
             "enc_layers": args.enc_layers,
             "dec_layers": args.dec_layers,
             "nheads": args.nheads,
-            "camera_names": [args.camera_name],
+            "camera_names": [self.input_modality],
             "input_modality": self.input_modality,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
             "use_bce_last_action_dim": args.use_bce_last_action_dim,
-            "rgb_history_frames": args.rgb_history_frames,
-            "visual_history_frames": args.rgb_history_frames,
-            "visual_history_offsets": [-6, -3, 0],
-            "channels_per_visual_frame": 3,
+            "rgb_history_frames": len(self.visual_history_offsets),
+            "visual_history_frames": len(self.visual_history_offsets),
+            "visual_history_offsets": list(self.visual_history_offsets),
+            "channels_per_visual_frame": self.visual_contract.channels_per_visual_frame,
             "visual_frame_order": "oldest_to_newest",
-            "image_normalization": "shifted_3chef_centered" if self.input_modality == "event" else "imagenet",
+            "image_normalization": self.image_normalization,
             "image_channels": self.image_channels,
             "image_size": self.image_size,
+            "event_representation": (
+                self.event_representation if self.input_modality == "event" else None
+            ),
         }
-
-        ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
-        stats_path = os.path.join(args.ckpt_dir, args.stats_name)
-
-        with open(stats_path, "rb") as f:
-            stats = pickle.load(f)
 
         stats_arrays = validate_intercept_stats_and_config(
             stats=stats,
@@ -151,6 +177,8 @@ class FrankaActRolloutNode(Node):
         self.qpos_std = stats_arrays["qpos_std"]
         self.action_mean = stats_arrays["action_mean"]
         self.action_std = stats_arrays["action_std"]
+
+        from policy import ACTPolicy
 
         self.policy = ACTPolicy(policy_config)
         loading_status = self.policy.load_state_dict(torch.load(ckpt_path, map_location=self.device))
@@ -210,14 +238,41 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(f"prediction_current_topic={self.prediction_current_topic}")
         self.get_logger().info("prediction_current_msg_type=std_msgs/msg/Float64")
         self.get_logger().info(f"publish_current_scalar={self.publish_current_scalar}")
+        self.get_logger().info(f"checkpoint_path={ckpt_path}")
+        self.get_logger().info(f"stats_path={stats_path}")
+        self.get_logger().info(
+            "Visual contract: "
+            f"representation={self.event_representation} "
+            f"image_topic={self.image_topic} "
+            f"expected_encoding={self.visual_contract.expected_encoding} "
+            f"expected_dimensions=({self.visual_contract.expected_height},"
+            f"{self.visual_contract.expected_width}) "
+            f"visual_offsets={list(self.visual_history_offsets)} "
+            f"qpos_offsets={list(self.qpos_history_offsets)} "
+            f"image_channels={self.image_channels} "
+            f"normalization={self.image_normalization}"
+        )
+        if self.event_representation == "xyt_signed_voxel_v1":
+            self.get_logger().info(
+                "XYT orientation parity: "
+                "offline_rotation_degrees=0 "
+                f"live_rotation_degrees={self.live_event_rotation_degrees} "
+                f"status={self.orientation_parity_status}"
+            )
+            self.get_logger().warn(
+                "Do not call OpenMV rotation services during XYT rollout: those services "
+                "change effective output rotation without updating the ROS parameter."
+            )
         self.get_logger().info(
             "This rollout node publishes interception predictions only; it does not publish robot motion commands."
         )
         self.get_logger().info(
             "Interception contract: "
             f"state_dim={self.state_dim} action_dim={self.action_dim} "
-            f"chunk_size={self.chunk_size} rgb_history_frames={args.rgb_history_frames} "
-            f"image_channels=9 use_bce_last_action_dim={args.use_bce_last_action_dim}"
+            f"chunk_size={self.chunk_size} "
+            f"visual_history_frames={len(self.visual_history_offsets)} "
+            f"image_channels={self.image_channels} "
+            f"use_bce_last_action_dim={args.use_bce_last_action_dim}"
         )
         if self.running:
             self.get_logger().info("Rollout starts immediately.")
@@ -288,6 +343,33 @@ class FrankaActRolloutNode(Node):
         inference_ms = (time.time() - start) * 1000.0
         return raw_output, inference_ms
 
+    def _query_openmv_rotation_degrees(self) -> Optional[int]:
+        client = self.create_client(GetParameters, "/openmv_cam/get_parameters")
+        if not client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error(
+                "OpenMV parameter service is unavailable; cannot verify XYT orientation"
+            )
+            return None
+        request = GetParameters.Request()
+        request.names = ["event_frame_rotation_degrees"]
+        future = client.call_async(request)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        if not future.done() or future.result() is None:
+            self.get_logger().error(
+                "Timed out querying /openmv_cam event_frame_rotation_degrees"
+            )
+            return None
+        values = future.result().values
+        if len(values) != 1:
+            self.get_logger().error("OpenMV rotation query returned no parameter value")
+            return None
+        if values[0].type != ParameterType.PARAMETER_INTEGER:
+            self.get_logger().error(
+                "OpenMV event_frame_rotation_degrees is unavailable or not an integer"
+            )
+            return None
+        return int(values[0].integer_value)
+
     def _warm_up_model_once(self) -> None:
         warmup_qpos = torch.zeros(
             (1, self.state_dim),
@@ -298,7 +380,7 @@ class FrankaActRolloutNode(Node):
             (
                 1,                    # batch
                 1,                    # one logical camera
-                self.image_channels,  # 9 for 3 RGB history frames
+                self.image_channels,
                 self.image_size,
                 self.image_size,
             ),
@@ -387,21 +469,48 @@ class FrankaActRolloutNode(Node):
             joint_qpos_samples=joint_qpos,
             tcp_timestamps=tcp_timestamps,
             tcp_values=tcp_values,
+            history_offsets=self.visual_history_offsets,
+            qpos_history_offsets=self.qpos_history_offsets,
+            frame_period_sec=1.0 / self.fps,
+            qpos_relative_to_anchor=(
+                self.event_representation == "xyt_signed_voxel_v1"
+            ),
+            max_qpos_age_sec=(
+                self.max_anchor_age_sec
+                if self.event_representation == "xyt_signed_voxel_v1"
+                else None
+            ),
         )
 
         selected_visual_msgs = [visual_messages[index] for index in sync.history_indices]
-        desired_encoding = "passthrough" if self.input_modality == "event" else "rgb8"
-        visual_frames = [
-            self.bridge.imgmsg_to_cv2(msg, desired_encoding=desired_encoding)
-            for msg in selected_visual_msgs
-        ]
-        if self.input_modality == "event":
+        if self.event_representation == "xyt_signed_voxel_v1":
+            visual_frames = [
+                decode_uint8_hwc_image_message(
+                    selected_visual_msgs[0],
+                    expected_encoding="8UC9",
+                    expected_height=self.visual_contract.expected_height,
+                    expected_width=self.visual_contract.expected_width,
+                    expected_channels=self.image_channels,
+                )
+            ]
+        else:
+            desired_encoding = "passthrough" if self.input_modality == "event" else "rgb8"
+            visual_frames = [
+                self.bridge.imgmsg_to_cv2(msg, desired_encoding=desired_encoding)
+                for msg in selected_visual_msgs
+            ]
+        if self.input_modality == "event" and self.event_representation != "xyt_signed_voxel_v1":
             for frame in visual_frames:
                 if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
                     raise ValueError(
                         "Event image decoding contract violated: expected uint8 HxWx3 from /openmv_cam/event_frame_3ch"
                     )
-        image_np = build_visual_history_tensor(visual_frames, self.image_size, modality=self.input_modality)
+        image_np = build_visual_history_tensor(
+            visual_frames,
+            self.image_size,
+            modality=self.input_modality,
+            expected_channels=self.image_channels,
+        )
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         anchor_observation_timestamp = sync.visual_timestamps[-1]
@@ -556,7 +665,13 @@ class FrankaActRolloutNode(Node):
         total_step_ms = (time.time() - step_start_wall) * 1000.0
         max_input_age = post_now_sec - sync.visual_timestamps[-1]
         max_sync_error = max(
-            max(abs(visual_ts - qpos_ts) for visual_ts, qpos_ts in zip(sync.visual_timestamps, sync.qpos_timestamps)),
+            max(
+                abs(target_ts - qpos_ts)
+                for target_ts, qpos_ts in zip(
+                    sync.qpos_target_timestamps,
+                    sync.qpos_timestamps,
+                )
+            ),
             sync.visual_timestamps[-1] - sync.anchor_tcp_s_timestamp,
         )
 
@@ -582,6 +697,7 @@ class FrankaActRolloutNode(Node):
                 f"selected_target_offset_ms={self.selected_target_offset_ms:.2f} "
                 f"history_indices={list(sync.history_indices)} "
                 f"visual_ts={[round(ts, 6) for ts in sync.visual_timestamps]} "
+                f"qpos_target_ts={[round(ts, 6) for ts in sync.qpos_target_timestamps]} "
                 f"qpos_ts={[round(ts, 6) for ts in sync.qpos_timestamps]} "
                 f"anchor_s={sync.anchor_tcp_s:+.6f} anchor_ts={sync.anchor_tcp_s_timestamp:.6f} "
                 f"qpos_shape={tuple(sync.qpos_history.shape)} image_shape={tuple(curr_image.shape)} "
@@ -649,9 +765,32 @@ def main():
     parser.add_argument("--state_dim", type=int, default=21)
     parser.add_argument("--action_dim", type=int, default=1)
     parser.add_argument("--chunk_size", type=int, default=30)
-    parser.add_argument("--rgb_history_frames", type=int, default=3)
+    parser.add_argument("--rgb_history_frames", type=int, default=None)
     parser.add_argument("--image_size", type=int, default=320)
-    parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb", "event"])
+    parser.add_argument(
+        "--camera_name",
+        type=str,
+        default=None,
+        choices=["rgb", "event"],
+    )
+    parser.add_argument(
+        "--event_representation",
+        type=str,
+        default=None,
+        choices=[
+            "rgb_history",
+            "shifted_3chef_signed",
+            "xyt_signed_voxel_v1",
+        ],
+    )
+    parser.add_argument(
+        "--xyt_orientation_parity_verified",
+        action="store_true",
+        help=(
+            "Allow nonzero live OpenMV rotation only after a synthetic or recorded "
+            "comparison proves parity with unrotated offline XYT tensors."
+        ),
+    )
 
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--kl_weight", type=int, default=10)
@@ -722,9 +861,10 @@ def main():
         raise ValueError(f"Interception rollout requires --action_dim 1, got {args.action_dim}")
     if int(args.chunk_size) != 30:
         raise ValueError(f"Interception rollout requires --chunk_size 30, got {args.chunk_size}")
-    if int(args.rgb_history_frames) != 3:
+    if args.rgb_history_frames is not None and int(args.rgb_history_frames) <= 0:
         raise ValueError(
-            f"Interception rollout requires --rgb_history_frames 3, got {args.rgb_history_frames}"
+            "--rgb_history_frames must be positive when explicitly supplied, "
+            f"got {args.rgb_history_frames}"
         )
     if int(args.image_size) != 320:
         raise ValueError(f"Interception rollout requires --image_size 320, got {args.image_size}")

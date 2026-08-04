@@ -3,6 +3,7 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -22,17 +23,22 @@ from intercept_rollout_contract import (  # noqa: E402
     build_qpos_history,
     build_rgb_history_tensor,
     compute_history_indices,
+    decode_uint8_hwc_image_message,
     denormalize_delta_chunk,
+    resolve_intercept_visual_contract,
     resolve_temporal_agg_mode,
     select_sync_observation,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
+    validate_xyt_orientation_parity,
 )
 
 
 class InterceptRolloutContractTests(unittest.TestCase):
     def make_stats(self, modality="rgb"):
-        if modality == "event":
+        if modality == "xyt":
+            stats = dict(EXPECTED_INTERCEPT_XYT_METADATA)
+        elif modality == "event":
             stats = dict(EXPECTED_INTERCEPT_EVENT_METADATA)
         else:
             stats = dict(EXPECTED_INTERCEPT_RGB_METADATA)
@@ -45,6 +51,211 @@ class InterceptRolloutContractTests(unittest.TestCase):
             }
         )
         return stats
+
+    def test_xyt_visual_contract_is_checkpoint_derived(self):
+        stats = self.make_stats("xyt")
+        contract = resolve_intercept_visual_contract(
+            stats,
+            cli_camera_name="event",
+            cli_event_representation="xyt_signed_voxel_v1",
+            cli_visual_history_frames=1,
+        )
+        self.assertEqual(contract.representation, "xyt_signed_voxel_v1")
+        self.assertEqual(contract.visual_history_offsets, (0,))
+        self.assertEqual(contract.qpos_history_offsets, (-6, -3, 0))
+        self.assertEqual(contract.image_channels, 9)
+        self.assertEqual(contract.expected_encoding, "8UC9")
+        self.assertEqual((contract.expected_height, contract.expected_width), (320, 320))
+
+    def test_xyt_visual_contract_rejects_cli_mismatches(self):
+        stats = self.make_stats("xyt")
+        mismatches = [
+            {"cli_camera_name": "rgb"},
+            {"cli_event_representation": "shifted_3chef_signed"},
+            {"cli_visual_history_frames": 3},
+        ]
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch), self.assertRaises(ValueError):
+                resolve_intercept_visual_contract(stats, **mismatch)
+
+    def test_xyt_metadata_mismatches_are_rejected(self):
+        for key, broken in (
+            ("visual_history_offsets", [-6, -3, 0]),
+            ("qpos_history_offsets", [0]),
+            ("channels_per_visual_frame", 3),
+            ("image_channels", 3),
+            ("image_normalization", "shifted_3chef_centered"),
+            ("event_spatial_height", 240),
+            ("event_spatial_width", 240),
+        ):
+            with self.subTest(key=key):
+                stats = self.make_stats("xyt")
+                stats[key] = broken
+                config = self.make_policy_config("event")
+                config.update(
+                    rgb_history_frames=1,
+                    visual_history_frames=1,
+                    visual_history_offsets=[0],
+                    channels_per_visual_frame=9,
+                    image_normalization="signed_event_u8_centered",
+                    event_representation="xyt_signed_voxel_v1",
+                )
+                with self.assertRaises(ValueError):
+                    validate_intercept_stats_and_config(stats, config, 30)
+
+    def test_manual_8uc9_decode_handles_packed_and_padded_rows(self):
+        packed_data = bytes(range(2 * 3 * 9))
+        packed_msg = SimpleNamespace(
+            height=2,
+            width=3,
+            encoding="8UC9",
+            step=27,
+            data=packed_data,
+        )
+        packed = decode_uint8_hwc_image_message(
+            packed_msg,
+            expected_encoding="8UC9",
+            expected_height=2,
+            expected_width=3,
+            expected_channels=9,
+        )
+        self.assertEqual(packed.shape, (2, 3, 9))
+        self.assertEqual(packed.dtype, np.uint8)
+        self.assertTrue(packed.flags.c_contiguous)
+        np.testing.assert_array_equal(packed.reshape(-1), np.arange(54, dtype=np.uint8))
+
+        padded_data = packed_data[:27] + b"abcde" + packed_data[27:] + b"vwxyz"
+        padded_msg = SimpleNamespace(
+            height=2,
+            width=3,
+            encoding="8UC9",
+            step=32,
+            data=padded_data,
+        )
+        padded = decode_uint8_hwc_image_message(
+            padded_msg,
+            expected_encoding="8UC9",
+            expected_height=2,
+            expected_width=3,
+            expected_channels=9,
+        )
+        np.testing.assert_array_equal(padded, packed)
+
+    def test_manual_8uc9_decode_rejects_malformed_messages(self):
+        base = dict(height=2, width=3, encoding="8UC9", step=27, data=bytes(54))
+        malformed = [
+            {"encoding": "8UC3"},
+            {"height": 1, "data": bytes(27)},
+            {"width": 2},
+            {"step": 26, "data": bytes(52)},
+            {"data": bytes(53)},
+            {"data": bytes(55)},
+        ]
+        for overrides in malformed:
+            fields = dict(base)
+            fields.update(overrides)
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                decode_uint8_hwc_image_message(
+                    SimpleNamespace(**fields),
+                    expected_encoding="8UC9",
+                    expected_height=2,
+                    expected_width=3,
+                    expected_channels=9,
+                )
+
+    def test_xyt_one_image_selects_three_anchor_relative_qpos_samples(self):
+        visual_ts = [10.0]
+        joint_ts = [9.79, 9.89, 9.99]
+        joint_q = [np.full(7, value, dtype=np.float32) for value in (1, 2, 3)]
+        sync = select_sync_observation(
+            rgb_timestamps=visual_ts,
+            joint_timestamps=joint_ts,
+            joint_qpos_samples=joint_q,
+            tcp_timestamps=[9.98],
+            tcp_values=[0.25],
+            history_offsets=(0,),
+            qpos_history_offsets=(-6, -3, 0),
+            frame_period_sec=1.0 / 30.0,
+            qpos_relative_to_anchor=True,
+            max_qpos_age_sec=0.02,
+        )
+        self.assertEqual(sync.history_indices, (0,))
+        np.testing.assert_allclose(sync.qpos_target_timestamps, [9.8, 9.9, 10.0])
+        np.testing.assert_allclose(sync.qpos_timestamps, joint_ts)
+        np.testing.assert_allclose(sync.qpos_history.reshape(3, 7)[:, 0], [1, 2, 3])
+
+    def test_xyt_sync_rejects_missing_or_stale_sources(self):
+        common = dict(
+            rgb_timestamps=[10.0],
+            joint_timestamps=[9.79, 9.89, 9.99],
+            joint_qpos_samples=[np.zeros(7, dtype=np.float32)] * 3,
+            tcp_timestamps=[9.99],
+            tcp_values=[0.1],
+            history_offsets=(0,),
+            qpos_history_offsets=(-6, -3, 0),
+            frame_period_sec=1.0 / 30.0,
+            qpos_relative_to_anchor=True,
+            max_qpos_age_sec=0.02,
+        )
+        for overrides in (
+            {"rgb_timestamps": []},
+            {"joint_timestamps": [], "joint_qpos_samples": []},
+            {"joint_timestamps": [9.0], "joint_qpos_samples": [np.zeros(7)]},
+            {"tcp_timestamps": [], "tcp_values": []},
+        ):
+            kwargs = dict(common)
+            kwargs.update(overrides)
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                select_sync_observation(**kwargs)
+
+        with self.assertRaises(ValueError):
+            validate_anchor_freshness(9.99, 10.0, 10.3, 0.1, 0.2)
+
+    def test_xyt_tensor_shape_and_centered_neutral(self):
+        frame = np.full((320, 320, 9), 128, dtype=np.uint8)
+        image = build_visual_history_tensor(
+            [frame],
+            image_size=320,
+            modality="event",
+            expected_channels=9,
+        )
+        self.assertEqual(image.shape, (1, 1, 9, 320, 320))
+        normalized = (image - (128.0 / 255.0)) / (127.0 / 255.0)
+        self.assertAlmostEqual(float(np.max(np.abs(normalized))), 0.0, places=6)
+
+    def test_mocked_policy_forward_accepts_xyt_tensor(self):
+        import torch
+        from franka_act_intercept_rollout import FrankaActRolloutNode
+
+        seen = {}
+
+        def policy(qpos, image):
+            seen["qpos"] = tuple(qpos.shape)
+            seen["image"] = tuple(image.shape)
+            return torch.zeros((1, 30, 1), dtype=torch.float32)
+
+        fake_node = SimpleNamespace(device=torch.device("cpu"), policy=policy)
+        output, elapsed_ms = FrankaActRolloutNode._run_policy_forward(
+            fake_node,
+            torch.zeros((1, 21), dtype=torch.float32),
+            torch.zeros((1, 1, 9, 320, 320), dtype=torch.float32),
+        )
+        self.assertEqual(tuple(output.shape), (1, 30, 1))
+        self.assertEqual(seen, {"qpos": (1, 21), "image": (1, 1, 9, 320, 320)})
+        self.assertGreaterEqual(elapsed_ms, 0.0)
+
+    def test_xyt_orientation_parity_gate(self):
+        self.assertEqual(
+            validate_xyt_orientation_parity(0, parity_verified=False),
+            "zero_rotation",
+        )
+        self.assertEqual(
+            validate_xyt_orientation_parity(90, parity_verified=True),
+            "comparison_verified",
+        )
+        for rotation in (None, 45, -90, 90, 180):
+            with self.subTest(rotation=rotation), self.assertRaises(ValueError):
+                validate_xyt_orientation_parity(rotation, parity_verified=False)
 
     def make_policy_config(self, modality="rgb"):
         return {
