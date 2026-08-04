@@ -41,14 +41,17 @@ def _write_intercept_episode(path, mode="event", steps=12, metadata_override=Non
         [np.full((24, 24, 3), fill_value=min(255, i * 7), dtype=np.uint8) for i in range(steps)],
         axis=0,
     )
+    event_channels = 9 if mode == "xyt" else 3
+    event_height = 320 if mode == "xyt" else 24
+    event_width = 320 if mode == "xyt" else 24
     event = np.stack(
-        [np.full((24, 24, 3), fill_value=128 + ((i % 3) - 1) * 20, dtype=np.uint8) for i in range(steps)],
+        [np.full((event_height, event_width, event_channels), fill_value=128 + ((i % 3) - 1) * 20, dtype=np.uint8) for i in range(steps)],
         axis=0,
     )
 
     event_source_timestamps = timestamps - 0.001
     event_source_age_sec = timestamps - event_source_timestamps
-    event_count_per_channel = np.full((steps, 3), fill_value=5, dtype=np.int64)
+    event_count_per_channel = np.full((steps, event_channels), fill_value=5, dtype=np.int64)
 
     qpos = np.asarray(data_override.get("qpos", qpos), dtype=np.float32)
     action_abs = np.asarray(data_override.get("action", action_abs), dtype=np.float32)
@@ -74,32 +77,57 @@ def _write_intercept_episode(path, mode="event", steps=12, metadata_override=Non
             "action_positive_direction", "robot_base_positive_x"
         )
 
-        if mode == "event":
-            root.attrs["event_representation"] = metadata_override.get(
-                "event_representation", "shifted_3chef_signed"
-            )
-            root.attrs["event_frame_mode"] = metadata_override.get("event_frame_mode", "shifted")
-            root.attrs["event_frame_windows_ms"] = np.asarray(
-                metadata_override.get("event_frame_windows_ms", INTERCEPT_EVENT_WINDOWS_MS_DEFAULT),
-                dtype=np.float64,
-            )
-            root.attrs["event_channel_order"] = metadata_override.get(
-                "event_channel_order", "recent_to_oldest"
-            )
-            root.attrs["event_scaling"] = metadata_override.get(
-                "event_scaling", "signed_log1p_fixed_clip"
-            )
-            root.attrs["event_clip_count"] = float(metadata_override.get("event_clip_count", 16.0))
-            root.attrs["event_neutral_u8"] = int(metadata_override.get("event_neutral_u8", 128))
-            root.attrs["event_sampling_policy"] = metadata_override.get(
-                "event_sampling_policy", "latest_packet_at_or_before_grid_time"
-            )
+        if mode in ("event", "xyt"):
+            if mode == "xyt":
+                xyt_metadata = {
+                    "event_representation": "xyt_signed_voxel_v1",
+                    "event_horizon_ms": 200.0,
+                    "event_temporal_bins": 9,
+                    "event_bin_width_ms": 200.0 / 9.0,
+                    "event_spatial_height": 320,
+                    "event_spatial_width": 320,
+                    "event_channel_order": "oldest_to_newest",
+                    "event_polarity_encoding": "signed",
+                    "event_scaling": "signed_log1p_fixed_clip",
+                    "event_clip_count": 16.0,
+                    "event_neutral_u8": 128,
+                    "event_sampling_policy": "latest_packet_at_or_before_grid_time",
+                    "visual_history_frames": 1,
+                    "visual_history_offsets": np.asarray([0], dtype=np.int32),
+                    "qpos_history_frames": 3,
+                    "qpos_history_offsets": np.asarray([-6, -3, 0], dtype=np.int32),
+                    "channels_per_visual_frame": 9,
+                    "image_channels": 9,
+                }
+                xyt_metadata.update(metadata_override)
+                for key, value in xyt_metadata.items():
+                    root.attrs[key] = value
+            else:
+                root.attrs["event_representation"] = metadata_override.get(
+                    "event_representation", "shifted_3chef_signed"
+                )
+                root.attrs["event_frame_mode"] = metadata_override.get("event_frame_mode", "shifted")
+                root.attrs["event_frame_windows_ms"] = np.asarray(
+                    metadata_override.get("event_frame_windows_ms", INTERCEPT_EVENT_WINDOWS_MS_DEFAULT),
+                    dtype=np.float64,
+                )
+                root.attrs["event_channel_order"] = metadata_override.get(
+                    "event_channel_order", "recent_to_oldest"
+                )
+                root.attrs["event_scaling"] = metadata_override.get(
+                    "event_scaling", "signed_log1p_fixed_clip"
+                )
+                root.attrs["event_clip_count"] = float(metadata_override.get("event_clip_count", 16.0))
+                root.attrs["event_neutral_u8"] = int(metadata_override.get("event_neutral_u8", 128))
+                root.attrs["event_sampling_policy"] = metadata_override.get(
+                    "event_sampling_policy", "latest_packet_at_or_before_grid_time"
+                )
 
         root.create_dataset("/observations/qpos", data=qpos)
         root.create_dataset("/action", data=action_abs)
         root.create_dataset("/observations/timestamps", data=timestamps)
         root.create_dataset("/observations/images/rgb", data=rgb)
-        if mode == "event":
+        if mode in ("event", "xyt"):
             root.create_dataset("/observations/images/event", data=event)
             root.create_dataset("/event_source_timestamps", data=event_source_timestamps)
             root.create_dataset("/event_source_age_sec", data=event_source_age_sec)
@@ -310,7 +338,7 @@ def test_get_intercept_norm_stats_event_includes_metadata(tmp_path):
         event_metadata=event_meta,
     )
     assert stats["input_modality"] == "event"
-    assert stats["image_normalization"] == "shifted_3chef_centered"
+    assert stats["image_normalization"] == "signed_event_u8_centered"
     assert stats["event_representation"] == "shifted_3chef_signed"
 
 
@@ -320,6 +348,40 @@ def test_normalizer_shifted_3chef_centered_values():
     assert len(norm.std) == 9
     assert np.isclose(norm.mean[0], 128.0 / 255.0)
     assert np.isclose(norm.std[0], 127.0 / 255.0)
+
+
+def test_normalizer_generic_and_legacy_event_ids_match():
+    generic = _build_image_normalizer(9, normalization_mode="signed_event_u8_centered")
+    legacy = _build_image_normalizer(9, normalization_mode="shifted_3chef_centered")
+    assert generic.mean == legacy.mean
+    assert generic.std == legacy.std
+
+
+def test_xyt_one_volume_and_three_qpos_samples(tmp_path):
+    for index in range(2):
+        _write_intercept_episode(str(tmp_path / f"episode_{index}.hdf5"), mode="xyt")
+    train, _, stats, _ = load_intercept_data(
+        str(tmp_path),
+        ["event"],
+        chunk_size=4,
+        batch_size_train=1,
+        batch_size_val=1,
+        visual_history_frames=1,
+        rgb_history_frames=1,
+        image_size=16,
+    )
+    image, qpos, action, is_pad = train.dataset[0]
+    assert tuple(image.shape) == (1, 9, 16, 16)
+    assert tuple(qpos.shape) == (21,)
+    assert stats["visual_history_frames"] == 1
+    assert stats["visual_history_offsets"] == [0]
+    assert stats["qpos_history_frames"] == 3
+    assert stats["qpos_history_offsets"] == [-6, -3, 0]
+    assert stats["channels_per_visual_frame"] == 9
+    assert stats["image_channels"] == 9
+    assert stats["event_representation"] == "xyt_signed_voxel_v1"
+    assert action.shape == (4, 1)
+    assert is_pad.shape == (4,)
 
 
 def test_normalizer_imagenet_repeats_for_nine_channels():

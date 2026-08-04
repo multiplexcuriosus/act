@@ -14,6 +14,7 @@ if ACT_ROOT not in sys.path:
 from intercept_rollout_contract import (  # noqa: E402
     EXPECTED_INTERCEPT_EVENT_METADATA,
     EXPECTED_INTERCEPT_RGB_METADATA,
+    EXPECTED_INTERCEPT_XYT_METADATA,
     AggregationSelection,
     TemporalAbsoluteAggregator,
     absolute_s_from_anchor,
@@ -190,6 +191,30 @@ class InterceptRolloutContractTests(unittest.TestCase):
         cfg = self.make_policy_config("event")
         out = validate_intercept_stats_and_config(stats, cfg, expected_chunk_size=30)
         self.assertIn("qpos_mean", out)
+
+    def test_xyt_one_volume_with_independent_qpos_history(self):
+        stats = dict(EXPECTED_INTERCEPT_XYT_METADATA)
+        stats.update(
+            qpos_mean=np.zeros(21, dtype=np.float32),
+            qpos_std=np.ones(21, dtype=np.float32),
+            action_mean=np.zeros(1, dtype=np.float32),
+            action_std=np.ones(1, dtype=np.float32),
+        )
+        cfg = self.make_policy_config("event")
+        cfg.update(
+            rgb_history_frames=1,
+            visual_history_frames=1,
+            visual_history_offsets=[0],
+            channels_per_visual_frame=9,
+            image_normalization="signed_event_u8_centered",
+        )
+        out = validate_intercept_stats_and_config(stats, cfg, expected_chunk_size=30)
+        self.assertEqual(out["qpos_mean"].shape, (21,))
+        frame = np.arange(9, dtype=np.uint8)[None, None, :]
+        frame = np.tile(frame, (2, 2, 1))
+        image = build_visual_history_tensor([frame], image_size=2, modality="event")
+        self.assertEqual(image.shape, (1, 1, 9, 2, 2))
+        np.testing.assert_allclose(image[0, 0, :, 0, 0] * 255.0, np.arange(9), atol=1e-6)
 
     def test_event_metadata_mismatch_rejected(self):
         mismatch_keys = [

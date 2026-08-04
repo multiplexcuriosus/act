@@ -19,7 +19,7 @@ import time
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils import load_intercept_data, load_joint_data, load_pose_data # data functions
+from utils import infer_intercept_visual_config, load_intercept_data, load_joint_data, load_pose_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from utils import INTERCEPT_HISTORY_OFFSETS_DEFAULT
@@ -74,6 +74,7 @@ def validate_visual_history_settings(
     visual_history_frames,
     rgb_history_frames_alias,
     event_channel_selection,
+    expected_intercept_frames=3,
 ):
     if visual_history_frames is not None and rgb_history_frames_alias is not None:
         if int(visual_history_frames) != int(rgb_history_frames_alias):
@@ -86,12 +87,13 @@ def validate_visual_history_settings(
         if rgb_history_frames_alias is not None:
             visual_history_frames = int(rgb_history_frames_alias)
         else:
-            visual_history_frames = 3 if data_mode == 'intercept' else 1
+            visual_history_frames = int(expected_intercept_frames) if data_mode == 'intercept' else 1
 
     visual_history_frames = int(visual_history_frames)
-    if data_mode == 'intercept' and visual_history_frames != 3:
+    if data_mode == 'intercept' and visual_history_frames != int(expected_intercept_frames):
         raise ValueError(
-            f"Interception mode requires visual_history_frames=3 with offsets {list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)}, got {visual_history_frames}"
+            "Interception visual history does not match dataset metadata: "
+            f"expected {expected_intercept_frames}, got {visual_history_frames}"
         )
     if data_mode == 'intercept':
         if camera_names not in (['rgb'], ['event']):
@@ -192,14 +194,20 @@ def _validate_eval_image_config(config, stats):
 
     policy_config['input_modality'] = configured_input_modality
     policy_config['visual_history_frames'] = configured_visual_history_frames
-    policy_config['visual_history_offsets'] = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)
+    policy_config['visual_history_offsets'] = list(
+        stats.get('visual_history_offsets', INTERCEPT_HISTORY_OFFSETS_DEFAULT)
+    )
     policy_config['visual_frame_order'] = 'oldest_to_newest'
-    policy_config['channels_per_visual_frame'] = 3
+    policy_config['channels_per_visual_frame'] = int(
+        stats.get('channels_per_visual_frame', 3)
+    )
     policy_config['image_channels'] = configured_image_channels
-    if configured_input_modality == 'event':
-        policy_config['image_normalization'] = 'shifted_3chef_centered'
-    else:
-        policy_config['image_normalization'] = 'imagenet'
+    policy_config['image_normalization'] = str(
+        stats.get(
+            'image_normalization',
+            'signed_event_u8_centered' if configured_input_modality == 'event' else 'imagenet',
+        )
+    )
 
 
 def _validate_intercept_checkpoint_metadata(config, stats):
@@ -218,14 +226,18 @@ def _validate_intercept_checkpoint_metadata(config, stats):
             'Legacy fallback is only supported when camera_names == [\'rgb\'].'
         )
 
+    is_xyt = stats.get('event_representation') == 'xyt_signed_voxel_v1'
+    expected_visual_frames = 1 if is_xyt else 3
+    expected_visual_offsets = [0] if is_xyt else list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)
+    expected_channels_per_frame = 9 if is_xyt else 3
     required_equal = {
         'data_mode': 'intercept',
         'raw_qpos_dim': 7,
         'state_dim': 21,
         'action_dim': 1,
-        'visual_history_frames': 3,
-        'visual_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
-        'channels_per_visual_frame': 3,
+        'visual_history_frames': expected_visual_frames,
+        'visual_history_offsets': expected_visual_offsets,
+        'channels_per_visual_frame': expected_channels_per_frame,
         'visual_frame_order': 'oldest_to_newest',
         'qpos_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
         'qpos_flatten_order': 'oldest_to_newest',
@@ -275,23 +287,40 @@ def _validate_intercept_checkpoint_metadata(config, stats):
             f'camera_names={configured_camera_names}, modality={configured_input_modality}'
         )
 
-    expected_image_norm = 'shifted_3chef_centered' if configured_input_modality == 'event' else 'imagenet'
+    expected_image_norm = 'signed_event_u8_centered' if configured_input_modality == 'event' else 'imagenet'
     saved_image_norm = stats.get('image_normalization', expected_image_norm)
-    if saved_image_norm != expected_image_norm:
+    accepted_norms = {expected_image_norm}
+    if configured_input_modality == 'event':
+        accepted_norms.add('shifted_3chef_centered')
+    if saved_image_norm not in accepted_norms:
         raise ValueError(
             f"Interception checkpoint image_normalization mismatch: expected {expected_image_norm!r}, found {saved_image_norm!r}"
         )
 
     if configured_input_modality == 'event':
-        required_event_meta = {
-            'event_representation': 'shifted_3chef_signed',
-            'event_frame_mode': 'shifted',
-            'event_frame_windows_ms': [50.0, 100.0, 200.0],
-            'event_channel_order': 'recent_to_oldest',
-            'event_scaling': 'signed_log1p_fixed_clip',
-            'event_neutral_u8': 128,
-            'event_sampling_policy': 'latest_packet_at_or_before_grid_time',
-        }
+        if is_xyt:
+            required_event_meta = {
+                'event_representation': 'xyt_signed_voxel_v1',
+                'event_horizon_ms': 200.0,
+                'event_temporal_bins': 9,
+                'event_spatial_height': 320,
+                'event_spatial_width': 320,
+                'event_channel_order': 'oldest_to_newest',
+                'event_polarity_encoding': 'signed',
+                'event_scaling': 'signed_log1p_fixed_clip',
+                'event_neutral_u8': 128,
+                'event_sampling_policy': 'latest_packet_at_or_before_grid_time',
+            }
+        else:
+            required_event_meta = {
+                'event_representation': 'shifted_3chef_signed',
+                'event_frame_mode': 'shifted',
+                'event_frame_windows_ms': [50.0, 100.0, 200.0],
+                'event_channel_order': 'recent_to_oldest',
+                'event_scaling': 'signed_log1p_fixed_clip',
+                'event_neutral_u8': 128,
+                'event_sampling_policy': 'latest_packet_at_or_before_grid_time',
+            }
         for key, expected in required_event_meta.items():
             if key not in stats:
                 raise ValueError(f"Missing interception event metadata in dataset_stats.pkl: {key}")
@@ -313,9 +342,9 @@ def _validate_intercept_checkpoint_metadata(config, stats):
         raise ValueError(f"Interception policy action_dim must be 1, got {policy_config.get('action_dim')}")
     if int(policy_config.get('image_channels')) != 9:
         raise ValueError(f"Interception policy image_channels must be 9, got {policy_config.get('image_channels')}")
-    if int(policy_config.get('visual_history_frames', 3)) != 3:
+    if int(policy_config.get('visual_history_frames', expected_visual_frames)) != expected_visual_frames:
         raise ValueError(
-            f"Interception policy visual_history_frames must be 3, got {policy_config.get('visual_history_frames')}"
+            f"Interception policy visual_history_frames must be {expected_visual_frames}, got {policy_config.get('visual_history_frames')}"
         )
     if bool(policy_config.get('use_bce_last_action_dim')):
         raise ValueError('Interception checkpoints must not enable use_bce_last_action_dim.')
@@ -343,20 +372,42 @@ def main(args):
     camera_names = args['camera_names']
     camera_names = validate_camera_names(camera_names)
     data_mode = args['data_mode']
+    intercept_visual_config = None
+    if data_mode == 'intercept':
+        intercept_visual_config = infer_intercept_visual_config(
+            dataset_source, camera_names
+        )
     visual_history_frames = validate_visual_history_settings(
         camera_names,
         data_mode,
         args.get('visual_history_frames'),
         args['rgb_history_frames'],
         args['event_channel_selection'],
+        expected_intercept_frames=(
+            intercept_visual_config['visual_history_frames']
+            if intercept_visual_config is not None
+            else 3
+        ),
     )
     rgb_history_frames = visual_history_frames  # legacy alias kept for compatibility
     event_channel_selection = args['event_channel_selection']
     input_modality = 'event' if camera_names == ['event'] else 'rgb'
-    visual_history_offsets = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT) if visual_history_frames == 3 else [0]
+    visual_history_offsets = (
+        list(intercept_visual_config['visual_history_offsets'])
+        if intercept_visual_config is not None
+        else (list(INTERCEPT_HISTORY_OFFSETS_DEFAULT) if visual_history_frames == 3 else [0])
+    )
     visual_frame_order = 'oldest_to_newest'
-    channels_per_visual_frame = 3
-    image_normalization = 'shifted_3chef_centered' if input_modality == 'event' else 'imagenet'
+    channels_per_visual_frame = (
+        int(intercept_visual_config['channels_per_visual_frame'])
+        if intercept_visual_config is not None
+        else 3
+    )
+    image_normalization = (
+        str(intercept_visual_config['image_normalization'])
+        if intercept_visual_config is not None
+        else ('signed_event_u8_centered' if input_modality == 'event' else 'imagenet')
+    )
     if event_channel_selection is not None:
         if camera_names != ['event']:
             raise NotImplementedError(
@@ -415,16 +466,15 @@ def main(args):
             if action_dim != 1:
                 raise ValueError(f"--action_dim must be 1 when --data_mode intercept, got {action_dim}")
 
-        if visual_history_frames != 3:
-            raise ValueError(
-                f"--visual_history_frames must resolve to 3 when --data_mode intercept, got {visual_history_frames}"
-            )
         if camera_names not in (['rgb'], ['event']):
             raise ValueError(f"--data_mode intercept requires --camera_names rgb or event, got {camera_names}")
         if event_channel_selection is not None:
             raise ValueError('--event_channel_selection is not supported for interception mode.')
-        if image_channels != 9:
-            raise ValueError(f"Interception image_channels must be 9, got {image_channels}")
+        if image_channels != int(intercept_visual_config['image_channels']):
+            raise ValueError(
+                "Interception image_channels mismatch: "
+                f"derived={image_channels}, metadata={intercept_visual_config['image_channels']}"
+            )
     elif data_mode == 'pose':
         # Keep existing ACTTask pose default while allowing override.
         state_dim = args['state_dim'] if args['state_dim'] is not None else 10
@@ -683,6 +733,7 @@ def main(args):
         stats['raw_qpos_dim'] = 7
         stats['state_dim'] = 21
         stats['action_dim'] = 1
+        stats['qpos_history_frames'] = 3
         stats['qpos_history_offsets'] = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)
         stats['qpos_flatten_order'] = 'oldest_to_newest'
         stats['action_type'] = 'measured_tcp_s_delta'

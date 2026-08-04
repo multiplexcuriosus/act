@@ -12,7 +12,7 @@ from roma.mappings import special_gramschmidt
 
 def _build_image_normalizer(image_channels, normalization_mode='imagenet'):
     normalization_mode = str(normalization_mode)
-    if normalization_mode == 'shifted_3chef_centered':
+    if normalization_mode in ('signed_event_u8_centered', 'shifted_3chef_centered'):
         if image_channels <= 0:
             raise ValueError(f"image_channels must be positive, got {image_channels}")
         mean = [128.0 / 255.0] * image_channels

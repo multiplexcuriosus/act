@@ -42,6 +42,24 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    with open(os.path.join(args.ckpt_dir, "dataset_stats.pkl"), "rb") as f:
+        stats = pickle.load(f)
+    is_xyt = stats.get("event_representation") == "xyt_signed_voxel_v1"
+    visual_history_frames = int(stats.get("visual_history_frames", 3))
+    visual_history_offsets = list(
+        stats.get("visual_history_offsets", [0] if is_xyt else INTERCEPT_HISTORY_OFFSETS)
+    )
+    channels_per_visual_frame = int(stats.get("channels_per_visual_frame", 3))
+    image_channels = int(
+        stats.get("image_channels", visual_history_frames * channels_per_visual_frame)
+    )
+    image_normalization = str(
+        stats.get(
+            "image_normalization",
+            "shifted_3chef_centered" if args.camera_name == "event" else "imagenet",
+        )
+    )
+
     cfg = {
         "lr": args.lr,
         "num_queries": args.chunk_size,
@@ -58,13 +76,13 @@ def main():
         "state_dim": args.state_dim,
         "action_dim": args.action_dim,
         "use_bce_last_action_dim": False,
-        "rgb_history_frames": 3,
-        "visual_history_frames": 3,
-        "visual_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
-        "channels_per_visual_frame": 3,
+        "rgb_history_frames": visual_history_frames,
+        "visual_history_frames": visual_history_frames,
+        "visual_history_offsets": visual_history_offsets,
+        "channels_per_visual_frame": channels_per_visual_frame,
         "visual_frame_order": "oldest_to_newest",
-        "image_normalization": "shifted_3chef_centered" if args.camera_name == "event" else "imagenet",
-        "image_channels": 9,
+        "image_normalization": image_normalization,
+        "image_channels": image_channels,
         "image_size": args.image_size,
     }
 
@@ -72,12 +90,10 @@ def main():
     policy.load_state_dict(torch.load(os.path.join(args.ckpt_dir, "policy_val_best.ckpt"), map_location=device))
     policy.to(device).eval()
 
-    with open(os.path.join(args.ckpt_dir, "dataset_stats.pkl"), "rb") as f:
-        stats = pickle.load(f)
     stats_arrays = validate_intercept_stats_and_config(stats, cfg, expected_chunk_size=args.chunk_size)
 
     with h5py.File(args.hdf5, "r") as f:
-        rgb = np.asarray(f[f"/observations/images/{args.camera_name}"][()], dtype=np.uint8)
+        visual = np.asarray(f[f"/observations/images/{args.camera_name}"][()], dtype=np.uint8)
         qpos = np.asarray(f["/observations/qpos"][()], dtype=np.float32)
         tcp_s_abs = np.asarray(f["/action"][()], dtype=np.float32).reshape(-1)
 
@@ -85,14 +101,15 @@ def main():
     with torch.inference_mode():
         max_t = min(len(tcp_s_abs) - 1, 120)
         for t in range(6, max_t):
-            history_indices = compute_history_indices(t, INTERCEPT_HISTORY_OFFSETS)
+            qpos_history_indices = compute_history_indices(t, INTERCEPT_HISTORY_OFFSETS)
+            visual_history_indices = compute_history_indices(t, visual_history_offsets)
 
-            q_hist = qpos[history_indices].reshape(-1)
+            q_hist = qpos[qpos_history_indices].reshape(-1)
             q_norm = (q_hist - stats_arrays["qpos_mean"]) / stats_arrays["qpos_std"]
             q_tensor = torch.from_numpy(q_norm).float().to(device).unsqueeze(0)
 
-            rgb_frames = [rgb[index] for index in history_indices]
-            image_np = build_visual_history_tensor(rgb_frames, args.image_size, modality=args.camera_name)
+            visual_frames = [visual[index] for index in visual_history_indices]
+            image_np = build_visual_history_tensor(visual_frames, args.image_size, modality=args.camera_name)
             image_tensor = torch.from_numpy(image_np).float().to(device)
 
             raw = policy(q_tensor, image_tensor)

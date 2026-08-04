@@ -23,10 +23,7 @@ EXPECTED_INTERCEPT_COMMON_METADATA = {
     "raw_qpos_dim": 7,
     "state_dim": 21,
     "action_dim": 1,
-    "rgb_history_frames": 3,
-    "rgb_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
     "qpos_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
-    "rgb_frame_order": "oldest_to_newest",
     "qpos_flatten_order": "oldest_to_newest",
     "image_channels": 9,
     "action_type": "measured_tcp_s_delta",
@@ -46,6 +43,9 @@ EXPECTED_INTERCEPT_RGB_METADATA = {
     "channels_per_visual_frame": 3,
     "visual_frame_order": "oldest_to_newest",
     "image_normalization": "imagenet",
+    "rgb_history_frames": 3,
+    "rgb_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+    "rgb_frame_order": "oldest_to_newest",
 }
 
 EXPECTED_INTERCEPT_EVENT_METADATA = {
@@ -57,6 +57,9 @@ EXPECTED_INTERCEPT_EVENT_METADATA = {
     "channels_per_visual_frame": 3,
     "visual_frame_order": "oldest_to_newest",
     "image_normalization": "shifted_3chef_centered",
+    "rgb_history_frames": 3,
+    "rgb_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+    "rgb_frame_order": "oldest_to_newest",
     "event_representation": "shifted_3chef_signed",
     "event_frame_mode": "shifted",
     "event_frame_windows_ms": [50.0, 100.0, 200.0],
@@ -65,6 +68,33 @@ EXPECTED_INTERCEPT_EVENT_METADATA = {
     "event_clip_count": 16.0,
     "event_neutral_u8": 128,
     "event_sampling_policy": "latest_packet_at_or_before_grid_time",
+}
+
+EXPECTED_INTERCEPT_XYT_METADATA = {
+    **EXPECTED_INTERCEPT_COMMON_METADATA,
+    "input_modality": "event",
+    "camera_names": ["event"],
+    "visual_history_frames": 1,
+    "visual_history_offsets": [0],
+    "channels_per_visual_frame": 9,
+    "visual_frame_order": "oldest_to_newest",
+    "rgb_history_frames": 1,
+    "rgb_history_offsets": [0],
+    "rgb_frame_order": "oldest_to_newest",
+    "image_normalization": "signed_event_u8_centered",
+    "event_representation": "xyt_signed_voxel_v1",
+    "event_horizon_ms": 200.0,
+    "event_temporal_bins": 9,
+    "event_bin_width_ms": 200.0 / 9.0,
+    "event_spatial_height": 320,
+    "event_spatial_width": 320,
+    "event_channel_order": "oldest_to_newest",
+    "event_polarity_encoding": "signed",
+    "event_scaling": "signed_log1p_fixed_clip",
+    "event_clip_count": 16.0,
+    "event_neutral_u8": 128,
+    "event_sampling_policy": "latest_packet_at_or_before_grid_time",
+    "qpos_history_frames": 3,
 }
 
 
@@ -301,8 +331,8 @@ def build_visual_history_tensor(
     image_size: int,
     modality: str,
 ) -> np.ndarray:
-    if len(visual_frames) != 3:
-        raise ValueError(f"Expected 3 visual frames for temporal history, got {len(visual_frames)}")
+    if len(visual_frames) <= 0:
+        raise ValueError("Expected at least one visual frame")
 
     target = int(image_size)
     if target <= 0:
@@ -313,19 +343,34 @@ def build_visual_history_tensor(
         raise ValueError(f"Unsupported visual modality: {modality!r}")
 
     processed = []
+    total_channels = 0
     for frame in visual_frames:
         arr = np.asarray(frame)
-        if arr.ndim != 3 or arr.shape[2] != 3:
-            raise ValueError(f"Each visual frame must be HWC3, got {arr.shape}")
+        if arr.ndim != 3 or arr.shape[2] <= 0:
+            raise ValueError(f"Each visual frame must be HWC, got {arr.shape}")
         if modality == "event" and arr.dtype != np.uint8:
             raise ValueError(
                 f"Event frame dtype must be uint8 before policy preprocessing, got {arr.dtype}"
             )
-        resized = cv2.resize(arr, (target, target), interpolation=cv2.INTER_AREA)
+        if arr.shape[:2] == (target, target):
+            resized = arr
+        else:
+            resized = np.stack(
+                [
+                    cv2.resize(
+                        arr[..., channel],
+                        (target, target),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    for channel in range(arr.shape[2])
+                ],
+                axis=-1,
+            )
         processed.append(resized)
+        total_channels += int(resized.shape[2])
 
     image_hwc = np.concatenate(processed, axis=2)
-    if image_hwc.shape != (target, target, 9):
+    if total_channels != 9 or image_hwc.shape != (target, target, 9):
         raise AssertionError(
             f"Temporal visual concat mismatch: expected {(target, target, 9)}, got {image_hwc.shape}"
         )
@@ -412,10 +457,15 @@ def validate_intercept_stats_and_config(
             f"checkpoint={checkpoint_modality}, rollout={rollout_modality}"
         )
 
+    is_xyt = stats.get("event_representation") == "xyt_signed_voxel_v1"
     expected_metadata = (
-        EXPECTED_INTERCEPT_EVENT_METADATA
-        if rollout_modality == "event"
-        else EXPECTED_INTERCEPT_RGB_METADATA
+        EXPECTED_INTERCEPT_XYT_METADATA
+        if is_xyt
+        else (
+            EXPECTED_INTERCEPT_EVENT_METADATA
+            if rollout_modality == "event"
+            else EXPECTED_INTERCEPT_RGB_METADATA
+        )
     )
 
     for key, expected in expected_metadata.items():
@@ -424,6 +474,12 @@ def validate_intercept_stats_and_config(
                 # Legacy RGB checkpoints are allowed to miss newer metadata keys.
                 continue
             raise ValueError(f"Missing interception checkpoint metadata in dataset_stats.pkl: {key}")
+        if (
+            key == "image_normalization"
+            and rollout_modality == "event"
+            and stats[key] in ("signed_event_u8_centered", "shifted_3chef_centered")
+        ):
+            continue
         if stats[key] != expected:
             raise ValueError(
                 f"Interception checkpoint metadata mismatch for {key}: "
@@ -434,9 +490,9 @@ def validate_intercept_stats_and_config(
         "state_dim": 21,
         "action_dim": 1,
         "num_queries": int(expected_chunk_size),
-        "rgb_history_frames": 3,
-        "visual_history_frames": 3,
-        "channels_per_visual_frame": 3,
+        "rgb_history_frames": 1 if is_xyt else 3,
+        "visual_history_frames": 1 if is_xyt else 3,
+        "channels_per_visual_frame": 9 if is_xyt else 3,
         "image_channels": 9,
     }
     for key, expected in required_config.items():
@@ -449,14 +505,18 @@ def validate_intercept_stats_and_config(
     if bool(policy_config.get("use_bce_last_action_dim", False)):
         raise ValueError("Interception rollout requires use_bce_last_action_dim=false")
 
-    expected_norm = "shifted_3chef_centered" if rollout_modality == "event" else "imagenet"
-    if str(policy_config.get("image_normalization", "")) != expected_norm:
+    expected_norm = "signed_event_u8_centered" if rollout_modality == "event" else "imagenet"
+    actual_norm = str(policy_config.get("image_normalization", ""))
+    accepted_norms = {expected_norm}
+    if rollout_modality == "event" and not is_xyt:
+        accepted_norms.add("shifted_3chef_centered")
+    if actual_norm not in accepted_norms:
         raise ValueError(
             "Interception policy config mismatch for image_normalization: "
             f"expected {expected_norm!r}, found {policy_config.get('image_normalization')!r}"
         )
 
-    expected_offsets = list(INTERCEPT_HISTORY_OFFSETS)
+    expected_offsets = [0] if is_xyt else list(INTERCEPT_HISTORY_OFFSETS)
     if list(policy_config.get("visual_history_offsets", expected_offsets)) != expected_offsets:
         raise ValueError(
             "Interception policy config mismatch for visual_history_offsets: "
