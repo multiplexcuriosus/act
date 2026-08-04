@@ -353,6 +353,55 @@ class RawEventHdf5Tests(unittest.TestCase):
         self.assertEqual(shifted.shape, (1, 2, 3))
         self.assertEqual(cumulative.shape, (1, 2, 3))
 
+    def test_xyt_temporal_boundaries_causality_and_order(self):
+        timestamps = np.asarray([-1, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 91])
+        volume, counts = reh5.render_xyt_signed_voxel_from_raw_arrays(
+            event_type=np.ones(timestamps.shape, dtype=np.uint8),
+            event_x=np.zeros(timestamps.shape, dtype=np.int16),
+            event_y=np.zeros(timestamps.shape, dtype=np.int16),
+            event_t_us=timestamps,
+            anchor_t_us=90,
+            horizon_ms=0.09,
+            temporal_bins=9,
+            source_width=1,
+            source_height=1,
+            output_width=1,
+            output_height=1,
+            event_clip_count=16.0,
+        )
+        self.assertEqual(volume.shape, (1, 1, 9))
+        self.assertEqual(volume.dtype, np.uint8)
+        np.testing.assert_array_equal(counts, [1, 1, 1, 1, 1, 1, 1, 1, 2])
+        self.assertEqual(int(volume[0, 0, 0]), 159)
+        self.assertGreater(int(volume[0, 0, 8]), int(volume[0, 0, 0]))
+
+    def test_xyt_byte_exact_spatial_cancellation_empty_and_clipping(self):
+        event_type = np.asarray([1, 0, 1] + [1] * 16 + [0] * 16, dtype=np.uint8)
+        event_x = np.asarray([0, 0, 3] + [2] * 16 + [1] * 16, dtype=np.int16)
+        event_y = np.asarray([0, 0, 3] + [2] * 16 + [1] * 16, dtype=np.int16)
+        event_t = np.asarray([0, 0, 90] + [45] * 16 + [45] * 16, dtype=np.int64)
+        volume, counts = reh5.render_xyt_signed_voxel_from_raw_arrays(
+            event_type,
+            event_x,
+            event_y,
+            event_t,
+            anchor_t_us=90,
+            horizon_ms=0.09,
+            temporal_bins=9,
+            source_width=4,
+            source_height=4,
+            output_width=2,
+            output_height=2,
+            event_clip_count=16.0,
+        )
+        expected = np.full((2, 2, 9), 128, dtype=np.uint8)
+        expected[1, 1, 4] = 255
+        expected[0, 0, 4] = 1
+        expected[1, 1, 8] = 159
+        np.testing.assert_array_equal(volume, expected)
+        self.assertEqual(int(counts.sum()), len(event_type))
+        self.assertEqual(int(volume[0, 0, 0]), 128)  # polarity cancellation
+
 
 if __name__ == "__main__":
     unittest.main()

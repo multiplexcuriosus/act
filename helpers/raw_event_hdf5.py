@@ -161,6 +161,101 @@ def render_event_frame_from_raw_arrays(
     return u8
 
 
+def render_xyt_signed_voxel_from_raw_arrays(
+    event_type: np.ndarray,
+    event_x: np.ndarray,
+    event_y: np.ndarray,
+    event_t_us: np.ndarray,
+    *,
+    anchor_t_us: int,
+    horizon_ms: float = 200.0,
+    temporal_bins: int = 9,
+    source_width: int = 320,
+    source_height: int = 320,
+    output_width: int = 320,
+    output_height: int = 320,
+    event_clip_count: float = 16.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Render a causal signed XYT volume in oldest-to-newest HWC order.
+
+    The interval is ``[anchor-horizon, anchor]``. Temporal bins are left-closed
+    and right-open except for the newest bin, which includes the anchor. Thus an
+    event on an internal boundary belongs to the newer bin and every selected
+    event belongs to exactly one bin.
+    """
+    horizon_ms = float(horizon_ms)
+    temporal_bins = int(temporal_bins)
+    source_width = int(source_width)
+    source_height = int(source_height)
+    output_width = int(output_width)
+    output_height = int(output_height)
+    event_clip_count = float(event_clip_count)
+    if horizon_ms <= 0.0 or not np.isfinite(horizon_ms):
+        raise ValueError(f"horizon_ms must be positive and finite, got {horizon_ms}")
+    if temporal_bins <= 0:
+        raise ValueError(f"temporal_bins must be positive, got {temporal_bins}")
+    if min(source_width, source_height, output_width, output_height) <= 0:
+        raise ValueError("source and output spatial dimensions must be positive")
+    if event_clip_count <= 0.0 or not np.isfinite(event_clip_count):
+        raise ValueError(
+            f"event_clip_count must be positive and finite, got {event_clip_count}"
+        )
+
+    volume = np.full(
+        (output_height, output_width, temporal_bins), 128, dtype=np.uint8
+    )
+    counts = np.zeros((temporal_bins,), dtype=np.int32)
+
+    et = np.asarray(event_type).reshape(-1)
+    xs = np.asarray(event_x, dtype=np.int64).reshape(-1)
+    ys = np.asarray(event_y, dtype=np.int64).reshape(-1)
+    ts = np.asarray(event_t_us, dtype=np.int64).reshape(-1)
+    lengths = {et.size, xs.size, ys.size, ts.size}
+    if len(lengths) != 1:
+        raise ValueError("event_type, event_x, event_y, and event_t_us must have equal lengths")
+    if ts.size == 0:
+        return volume, counts
+
+    horizon_us = float(horizon_ms) * 1000.0
+    lo_us = float(anchor_t_us) - horizon_us
+    valid = (
+        (ts.astype(np.float64) >= lo_us)
+        & (ts <= int(anchor_t_us))
+        & (xs >= 0)
+        & (xs < source_width)
+        & (ys >= 0)
+        & (ys < source_height)
+    )
+    if not np.any(valid):
+        return volume, counts
+
+    et = et[valid]
+    xs = xs[valid]
+    ys = ys[valid]
+    ts_f = ts[valid].astype(np.float64)
+    bin_indices = np.floor((ts_f - lo_us) * temporal_bins / horizon_us).astype(
+        np.int64
+    )
+    # Only the right endpoint produces temporal_bins; it belongs to the newest bin.
+    bin_indices = np.minimum(bin_indices, temporal_bins - 1)
+    out_x = np.floor(xs.astype(np.float64) * output_width / source_width).astype(
+        np.int64
+    )
+    out_y = np.floor(ys.astype(np.float64) * output_height / source_height).astype(
+        np.int64
+    )
+
+    acc = np.zeros((output_height, output_width, temporal_bins), dtype=np.float32)
+    polarities = np.where(et == 1, 1.0, -1.0).astype(np.float32)
+    np.add.at(acc, (out_y, out_x, bin_indices), polarities)
+    counts[:] = np.bincount(bin_indices, minlength=temporal_bins).astype(np.int32)
+
+    z = np.sign(acc) * np.log1p(np.abs(acc)) / np.log1p(event_clip_count)
+    z = np.clip(z, -1.0, 1.0)
+    volume = np.rint(128.0 + 127.0 * z).astype(np.uint8)
+    return volume, counts
+
+
 class RawEventStore:
     def __init__(self, h5_path: str, logger: LogFn = None):
         if logger is None:
@@ -557,3 +652,55 @@ class RawEventStore:
             event_clip_count=event_clip_count,
         )
         return frame
+
+    def xyt_signed_voxel_with_metadata_at_bag_time(
+        self,
+        bag_t_sec: float,
+        *,
+        horizon_ms: float = 200.0,
+        temporal_bins: int = 9,
+        output_height: int = 320,
+        output_width: int = 320,
+        packet_margin_ms: float = 50.0,
+        event_clip_count: float = 16.0,
+    ) -> Tuple[np.ndarray, Optional[int], np.ndarray]:
+        result = self._causal_event_slice_by_bag_time(
+            bag_t_sec=bag_t_sec,
+            max_window_ms=float(horizon_ms),
+            packet_margin_ms=packet_margin_ms,
+        )
+        neutral = np.full(
+            (int(output_height), int(output_width), int(temporal_bins)),
+            128,
+            dtype=np.uint8,
+        )
+        if result["empty"]:
+            return (
+                neutral,
+                result["source_packet_ros_t_ns"],
+                np.zeros((int(temporal_bins),), dtype=np.int32),
+            )
+
+        event_t_us = result["ev_t_us"]
+        anchor_t_us = int(np.max(event_t_us))
+        volume, counts = render_xyt_signed_voxel_from_raw_arrays(
+            event_type=result["ev_type"],
+            event_x=result["ev_x"],
+            event_y=result["ev_y"],
+            event_t_us=event_t_us,
+            anchor_t_us=anchor_t_us,
+            horizon_ms=horizon_ms,
+            temporal_bins=temporal_bins,
+            source_width=self.width,
+            source_height=self.height,
+            output_width=output_width,
+            output_height=output_height,
+            event_clip_count=event_clip_count,
+        )
+        return volume, result["source_packet_ros_t_ns"], counts
+
+    def xyt_signed_voxel_at_bag_time(self, bag_t_sec: float, **kwargs) -> np.ndarray:
+        volume, _, _ = self.xyt_signed_voxel_with_metadata_at_bag_time(
+            bag_t_sec, **kwargs
+        )
+        return volume

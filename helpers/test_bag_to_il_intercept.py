@@ -467,6 +467,66 @@ class BagToIlInterceptTests(unittest.TestCase):
         self.assertTrue(np.all(arrays["event_source_age_sec"] >= 0.0))
         self.assertEqual(arrays["event_count_per_channel"].shape, (3, 3))
 
+    def test_xyt_sidecar_storage_and_metadata(self):
+        data = self.make_sampling_data(
+            tcp_times=[1.0, 1.1, 1.2],
+            tcp_values=[-0.5, 0.25, 0.75],
+            base_time=1.0,
+        )
+        episode = self.make_episode(start=1.0, end=1.4)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = os.path.join(tmpdir, "raw_events.h5")
+            self.make_raw_events_h5(sidecar_path)
+            store = self.mod.RawEventStore(sidecar_path, logger=lambda *_: None)
+            try:
+                arrays = self.mod.sample_episode(
+                    data=data,
+                    episode=episode,
+                    fps=10.0,
+                    max_current_tcp_s_age_sec=0.2,
+                    raw_event_store=store,
+                    event_representation="xyt_signed_voxel_v1",
+                    event_horizon_ms=200.0,
+                    event_temporal_bins=9,
+                    event_output_height=2,
+                    event_output_width=3,
+                    event_clip_count=16.0,
+                )
+            finally:
+                store.close()
+
+            self.assertEqual(arrays["event"].shape, (3, 2, 3, 9))
+            self.assertEqual(arrays["event"].dtype, np.uint8)
+            self.assertEqual(arrays["event_count_per_channel"].shape, (3, 9))
+
+            out_path = os.path.join(tmpdir, "episode_0.hdf5")
+            self.mod.write_episode(
+                output_path=out_path,
+                arrays=arrays,
+                episode=episode,
+                topics=self.make_topics(),
+                fps=10.0,
+                compression="none",
+                overwrite=False,
+                raw_events_h5=sidecar_path,
+                event_clip_count=16.0,
+                event_representation="xyt_signed_voxel_v1",
+                event_horizon_ms=200.0,
+                event_temporal_bins=9,
+                event_output_height=2,
+                event_output_width=3,
+            )
+            with h5py.File(out_path, "r") as h5:
+                self.assertEqual(h5["observations/images/event"].shape, (3, 2, 3, 9))
+                self.assertEqual(h5.attrs["event_representation"], "xyt_signed_voxel_v1")
+                self.assertAlmostEqual(h5.attrs["event_bin_width_ms"], 200.0 / 9.0)
+                self.assertEqual(h5.attrs["event_channel_order"], "oldest_to_newest")
+                self.assertEqual(h5.attrs["event_spatial_height"], 2)
+                self.assertEqual(h5.attrs["event_spatial_width"], 3)
+                np.testing.assert_array_equal(h5.attrs["visual_history_offsets"], [0])
+                np.testing.assert_array_equal(h5.attrs["qpos_history_offsets"], [-6, -3, 0])
+                self.assertEqual(h5.attrs["image_channels"], 9)
+
     def test_event_empty_window_produces_neutral_128(self):
         data = self.make_sampling_data(
             tcp_times=[1.0, 1.1, 1.2],
@@ -777,6 +837,36 @@ class BagToIlInterceptTests(unittest.TestCase):
             ]
             with self.assertRaises(SystemExit):
                 self.mod.parse_args()
+        finally:
+            sys.argv = argv
+
+    def test_xyt_representation_arguments_are_accepted(self):
+        argv = list(sys.argv)
+        try:
+            sys.argv = [
+                "bag_to_il_intercept.py",
+                "--bag",
+                "/tmp/bag",
+                "--out_dir",
+                "/tmp/out",
+                "--event_representation",
+                "xyt_signed_voxel_v1",
+                "--event_horizon_ms",
+                "200",
+                "--event_temporal_bins",
+                "9",
+                "--event_output_height",
+                "320",
+                "--event_output_width",
+                "320",
+                "--event_clip_count",
+                "16",
+            ]
+            args = self.mod.parse_args()
+            self.assertEqual(args.event_representation, "xyt_signed_voxel_v1")
+            self.assertEqual(args.event_temporal_bins, 9)
+            self.assertEqual(args.event_output_height, 320)
+            self.assertEqual(args.event_output_width, 320)
         finally:
             sys.argv = argv
 

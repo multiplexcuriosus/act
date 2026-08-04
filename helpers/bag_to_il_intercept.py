@@ -56,6 +56,10 @@ ARM_JOINT_NAMES = (
     "right_fr3_joint7",
 )
 
+SHIFTED_3CHEF_REPRESENTATION = "shifted_3chef_signed"
+XYT_REPRESENTATION = "xyt_signed_voxel_v1"
+XYT_RUN_TAG = "xyt200_s320_t9_signed"
+
 
 @dataclass
 class Topics:
@@ -473,6 +477,11 @@ def finalize_episode(
     event_frame_mode: str = "shifted",
     event_clip_count: Optional[float] = None,
     event_packet_margin_ms: float = 50.0,
+    event_representation: str = SHIFTED_3CHEF_REPRESENTATION,
+    event_horizon_ms: float = 200.0,
+    event_temporal_bins: int = 9,
+    event_output_height: int = 320,
+    event_output_width: int = 320,
 ) -> int:
     collect_sec = max(0.0, time.perf_counter() - collect_started_wall)
 
@@ -504,6 +513,11 @@ def finalize_episode(
         event_frame_mode=event_frame_mode,
         event_clip_count=event_clip_count,
         event_packet_margin_ms=event_packet_margin_ms,
+        event_representation=event_representation,
+        event_horizon_ms=event_horizon_ms,
+        event_temporal_bins=event_temporal_bins,
+        event_output_height=event_output_height,
+        event_output_width=event_output_width,
     )
     sample_sec = max(0.0, time.perf_counter() - sample_start)
 
@@ -521,6 +535,11 @@ def finalize_episode(
         event_frame_windows_ms=event_frame_windows_ms,
         event_frame_mode=event_frame_mode,
         event_clip_count=event_clip_count,
+        event_representation=event_representation,
+        event_horizon_ms=event_horizon_ms,
+        event_temporal_bins=event_temporal_bins,
+        event_output_height=event_output_height,
+        event_output_width=event_output_width,
     )
     write_sec = max(0.0, time.perf_counter() - write_start)
     total_sec = collect_sec + sample_sec + write_sec
@@ -595,6 +614,11 @@ def sample_episode(
     event_frame_mode: str = "shifted",
     event_clip_count: Optional[float] = None,
     event_packet_margin_ms: float = 50.0,
+    event_representation: str = SHIFTED_3CHEF_REPRESENTATION,
+    event_horizon_ms: float = 200.0,
+    event_temporal_bins: int = 9,
+    event_output_height: int = 320,
+    event_output_width: int = 320,
 ) -> Dict[str, np.ndarray]:
     """Causally sample observations and measured current_tcp_s action."""
     rgb_times = np.asarray(data["rgb_t"], dtype=np.float64)
@@ -692,12 +716,25 @@ def sample_episode(
                 "event_clip_count must be explicitly provided and positive when "
                 "raw-event sidecar conversion is enabled"
             )
-        if event_frame_mode != "shifted":
+        if event_representation == SHIFTED_3CHEF_REPRESENTATION and event_frame_mode != "shifted":
             raise RuntimeError(
                 "Interception event conversion supports only shifted mode"
             )
 
-        max_window_ns = int(np.rint(max(event_frame_windows_ms) * 1e6))
+        if event_representation not in (
+            SHIFTED_3CHEF_REPRESENTATION,
+            XYT_REPRESENTATION,
+        ):
+            raise RuntimeError(
+                f"Unsupported event_representation: {event_representation}"
+            )
+
+        max_window_ms = (
+            max(event_frame_windows_ms)
+            if event_representation == SHIFTED_3CHEF_REPRESENTATION
+            else float(event_horizon_ms)
+        )
+        max_window_ns = int(np.rint(max_window_ms * 1e6))
         required_start_ns = int(grid_ns[0] - max_window_ns)
         required_end_ns = int(grid_ns[-1])
         required_start_sec = required_start_ns * 1e-9
@@ -722,18 +759,36 @@ def sample_episode(
 
         event_frames: List[np.ndarray] = []
         event_source_ns = np.empty((grid.size,), dtype=np.int64)
-        event_counts = np.empty((grid.size, 3), dtype=np.int32)
+        event_channel_count = (
+            3
+            if event_representation == SHIFTED_3CHEF_REPRESENTATION
+            else int(event_temporal_bins)
+        )
+        event_counts = np.empty((grid.size, event_channel_count), dtype=np.int32)
         for index, t_g in enumerate(grid):
-            frame_u8, source_packet_ros_t_ns, counts = (
-                raw_event_store.frame_3chef_with_metadata_at_bag_time(
-                    bag_t_sec=float(t_g),
-                    windows_ms=event_frame_windows_ms,
-                    mode=event_frame_mode,
-                    packet_margin_ms=event_packet_margin_ms,
-                    scaling_mode="signed_log1p_fixed_clip",
-                    event_clip_count=float(event_clip_count),
+            if event_representation == SHIFTED_3CHEF_REPRESENTATION:
+                frame_u8, source_packet_ros_t_ns, counts = (
+                    raw_event_store.frame_3chef_with_metadata_at_bag_time(
+                        bag_t_sec=float(t_g),
+                        windows_ms=event_frame_windows_ms,
+                        mode=event_frame_mode,
+                        packet_margin_ms=event_packet_margin_ms,
+                        scaling_mode="signed_log1p_fixed_clip",
+                        event_clip_count=float(event_clip_count),
+                    )
                 )
-            )
+            else:
+                frame_u8, source_packet_ros_t_ns, counts = (
+                    raw_event_store.xyt_signed_voxel_with_metadata_at_bag_time(
+                    bag_t_sec=float(t_g),
+                    horizon_ms=event_horizon_ms,
+                    temporal_bins=event_temporal_bins,
+                    output_height=event_output_height,
+                    output_width=event_output_width,
+                    packet_margin_ms=event_packet_margin_ms,
+                    event_clip_count=float(event_clip_count),
+                    )
+                )
 
             event_frames.append(frame_u8)
             event_counts[index, :] = counts
@@ -826,6 +881,11 @@ def write_episode(
     event_frame_windows_ms: Tuple[float, float, float] = (50.0, 100.0, 200.0),
     event_frame_mode: str = "shifted",
     event_clip_count: Optional[float] = None,
+    event_representation: str = SHIFTED_3CHEF_REPRESENTATION,
+    event_horizon_ms: float = 200.0,
+    event_temporal_bins: int = 9,
+    event_output_height: int = 320,
+    event_output_width: int = 320,
 ) -> None:
     if os.path.exists(output_path) and not overwrite:
         raise RuntimeError(
@@ -879,18 +939,44 @@ def write_episode(
                     raise RuntimeError(
                         "event data present but event_clip_count is missing"
                     )
-                if event_frame_mode != "shifted":
+                if (
+                    event_representation == SHIFTED_3CHEF_REPRESENTATION
+                    and event_frame_mode != "shifted"
+                ):
                     raise RuntimeError(
                         "Inconsistent event metadata: interception event sidecar "
                         "must use event_frame_mode='shifted'"
                     )
-                h5.attrs["event_representation"] = "shifted_3chef_signed"
-                h5.attrs["event_frame_windows_ms"] = np.asarray(
-                    event_frame_windows_ms,
-                    dtype=np.float32,
-                )
-                h5.attrs["event_frame_mode"] = event_frame_mode
-                h5.attrs["event_channel_order"] = "recent_to_oldest"
+                h5.attrs["event_representation"] = event_representation
+                if event_representation == SHIFTED_3CHEF_REPRESENTATION:
+                    h5.attrs["event_frame_windows_ms"] = np.asarray(
+                        event_frame_windows_ms,
+                        dtype=np.float32,
+                    )
+                    h5.attrs["event_frame_mode"] = event_frame_mode
+                    h5.attrs["event_channel_order"] = "recent_to_oldest"
+                elif event_representation == XYT_REPRESENTATION:
+                    h5.attrs["event_horizon_ms"] = float(event_horizon_ms)
+                    h5.attrs["event_temporal_bins"] = int(event_temporal_bins)
+                    h5.attrs["event_bin_width_ms"] = float(event_horizon_ms) / int(
+                        event_temporal_bins
+                    )
+                    h5.attrs["event_spatial_height"] = int(event_output_height)
+                    h5.attrs["event_spatial_width"] = int(event_output_width)
+                    h5.attrs["event_channel_order"] = "oldest_to_newest"
+                    h5.attrs["event_polarity_encoding"] = "signed"
+                    h5.attrs["visual_history_frames"] = 1
+                    h5.attrs["visual_history_offsets"] = np.asarray([0], dtype=np.int32)
+                    h5.attrs["qpos_history_frames"] = 3
+                    h5.attrs["qpos_history_offsets"] = np.asarray(
+                        [-6, -3, 0], dtype=np.int32
+                    )
+                    h5.attrs["channels_per_visual_frame"] = int(event_temporal_bins)
+                    h5.attrs["image_channels"] = int(event_temporal_bins)
+                else:
+                    raise RuntimeError(
+                        f"Unsupported event_representation: {event_representation}"
+                    )
                 h5.attrs["event_scaling"] = "signed_log1p_fixed_clip"
                 h5.attrs["event_clip_count"] = float(event_clip_count)
                 h5.attrs["event_neutral_u8"] = 128
@@ -992,9 +1078,14 @@ def output_dir_name(args: argparse.Namespace, bag_path: str) -> str:
         rec_dir = os.path.abspath(os.path.expanduser(args.rec_dir))
         rec_name = os.path.basename(os.path.normpath(rec_dir))
         if rec_name.startswith("recording_"):
-            return "hdf5_" + rec_name[len("recording_") :]
-        return rec_name
-    return recording_name(bag_path)
+            base_name = "hdf5_" + rec_name[len("recording_") :]
+        else:
+            base_name = rec_name
+    else:
+        base_name = recording_name(bag_path)
+    if getattr(args, "event_representation", SHIFTED_3CHEF_REPRESENTATION) == XYT_REPRESENTATION:
+        return f"{base_name}_{XYT_RUN_TAG}"
+    return base_name
 
 
 def resolve_input_paths(
@@ -1086,6 +1177,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--event_representation",
+        choices=(SHIFTED_3CHEF_REPRESENTATION, XYT_REPRESENTATION),
+        default=SHIFTED_3CHEF_REPRESENTATION,
+        help=(
+            "Raw-event representation. The default preserves shifted-3Chef; "
+            "xyt_signed_voxel_v1 writes one causal HWC temporal volume per observation."
+        ),
+    )
+    parser.add_argument("--event_horizon_ms", type=float, default=200.0)
+    parser.add_argument("--event_temporal_bins", type=int, default=9)
+    parser.add_argument("--event_output_height", type=int, default=320)
+    parser.add_argument("--event_output_width", type=int, default=320)
+    parser.add_argument(
         "--event_frame_windows_ms",
         type=float,
         nargs=3,
@@ -1146,16 +1250,43 @@ def parse_args() -> argparse.Namespace:
         parser.error("--event_clip_count must be positive when provided")
     if args.event_packet_margin_ms < 0.0:
         parser.error("--event_packet_margin_ms must be non-negative")
-    if args.event_frame_mode != "shifted":
+    if (
+        args.event_representation == SHIFTED_3CHEF_REPRESENTATION
+        and args.event_frame_mode != "shifted"
+    ):
         parser.error(
             "--event_frame_mode must be 'shifted' for interception conversion"
         )
+    if args.event_horizon_ms <= 0.0:
+        parser.error("--event_horizon_ms must be positive")
+    if args.event_temporal_bins <= 0:
+        parser.error("--event_temporal_bins must be positive")
+    if args.event_output_height <= 0 or args.event_output_width <= 0:
+        parser.error("--event_output_height and --event_output_width must be positive")
+    if args.event_representation == XYT_REPRESENTATION:
+        if not np.isclose(args.event_horizon_ms, 200.0):
+            parser.error("xyt_signed_voxel_v1 requires --event_horizon_ms 200")
+        if args.event_temporal_bins != 9:
+            parser.error("xyt_signed_voxel_v1 requires --event_temporal_bins 9")
+        if args.event_clip_count is None or not np.isclose(args.event_clip_count, 16.0):
+            parser.error("xyt_signed_voxel_v1 requires --event_clip_count 16")
     return args
 
 
 def main() -> None:
     conversion_start_wall = time.perf_counter()
     args = parse_args()
+    # Preserve compatibility with programmatic callers/tests that provide a
+    # pre-XYT argparse namespace.
+    for name, default in (
+        ("event_representation", SHIFTED_3CHEF_REPRESENTATION),
+        ("event_horizon_ms", 200.0),
+        ("event_temporal_bins", 9),
+        ("event_output_height", 320),
+        ("event_output_width", 320),
+    ):
+        if not hasattr(args, name):
+            setattr(args, name, default)
     bag_path, raw_events_h5 = resolve_input_paths(args)
     output_parent = os.path.abspath(os.path.expanduser(args.out_dir))
     if not os.path.exists(bag_path):
@@ -1311,6 +1442,11 @@ def main() -> None:
                         event_frame_mode=args.event_frame_mode,
                         event_clip_count=args.event_clip_count,
                         event_packet_margin_ms=args.event_packet_margin_ms,
+                        event_representation=args.event_representation,
+                        event_horizon_ms=args.event_horizon_ms,
+                        event_temporal_bins=args.event_temporal_bins,
+                        event_output_height=args.event_output_height,
+                        event_output_width=args.event_output_width,
                     )
                 )
                 completed_episodes += 1
@@ -1366,6 +1502,11 @@ def main() -> None:
                     event_frame_mode=args.event_frame_mode,
                     event_clip_count=args.event_clip_count,
                     event_packet_margin_ms=args.event_packet_margin_ms,
+                    event_representation=args.event_representation,
+                    event_horizon_ms=args.event_horizon_ms,
+                    event_temporal_bins=args.event_temporal_bins,
+                    event_output_height=args.event_output_height,
+                    event_output_width=args.event_output_width,
                 )
             )
             completed_episodes += 1
