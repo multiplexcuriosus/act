@@ -80,6 +80,23 @@ def first_event_frame_to_3chef(frame: np.ndarray) -> Tuple[np.ndarray, List[np.n
     return composite_rgb_u8, channels
 
 
+def first_event_frame_to_channels(frame: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
+    """Return an HWC event tensor and its ordered grayscale channels."""
+    arr = np.asarray(frame)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected an HWC or CHW event tensor, got {arr.shape}")
+    if arr.shape[-1] in (3, 9):
+        hwc = arr
+    elif arr.shape[0] in (3, 9):
+        hwc = np.transpose(arr, (1, 2, 0))
+    else:
+        raise ValueError(
+            f"Expected 3Chef (3 channels) or XYT (9 channels), got {arr.shape}"
+        )
+    hwc_u8 = to_uint8(hwc)
+    return hwc_u8, [hwc_u8[..., idx] for idx in range(hwc_u8.shape[-1])]
+
+
 def collect_hdf5_files(top_dirs: List[Path]) -> List[Path]:
     """Recursively collect HDF5 files under multiple top-level directories."""
     files: set[Path] = set()
@@ -122,7 +139,7 @@ def save_first_images(
     skipped_files = 0
 
     if event_mode:
-        mode_output_root = output_dir / "event_3chef"
+        mode_output_root = output_dir / "event_channels"
     else:
         mode_output_root = output_dir
 
@@ -140,7 +157,7 @@ def save_first_images(
 
         if event_mode:
             try:
-                composite_rgb, channels = first_event_frame_to_3chef(frame)
+                event_hwc, channels = first_event_frame_to_channels(frame)
             except Exception as exc:
                 shape = tuple(np.asarray(frame).shape)
                 print(
@@ -154,7 +171,7 @@ def save_first_images(
 
             wrote_ok = True
             for idx, channel in enumerate(channels):
-                channel_path = sample_output_dir / f"chef_{idx}.png"
+                channel_path = sample_output_dir / f"bin_{idx:02d}.png"
                 if not cv2.imwrite(str(channel_path), channel):
                     print(
                         f"Skipping file={file_path}, key={image_key}: "
@@ -167,7 +184,18 @@ def save_first_images(
                 skipped_files += 1
                 continue
 
-            composite_path = sample_output_dir / "composite_rgb.png"
+            if len(channels) == 3:
+                composite_rgb = event_hwc
+            else:
+                rows = []
+                for row_start in range(0, len(channels), 3):
+                    row = channels[row_start:row_start + 3]
+                    while len(row) < 3:
+                        row.append(np.full_like(channels[0], 128))
+                    rows.append(np.concatenate(row, axis=1))
+                montage = np.concatenate(rows, axis=0)
+                composite_rgb = cv2.cvtColor(montage, cv2.COLOR_GRAY2RGB)
+            composite_path = sample_output_dir / "ordered_channels.png"
             composite_bgr = cv2.cvtColor(composite_rgb, cv2.COLOR_RGB2BGR)
             if not cv2.imwrite(str(composite_path), composite_bgr):
                 print(
@@ -177,7 +205,7 @@ def save_first_images(
                 skipped_files += 1
                 continue
 
-            saved_event_channel_images += 3
+            saved_event_channel_images += len(channels)
             saved_event_composites += 1
             continue
 
@@ -203,7 +231,7 @@ def save_first_images(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Save first frames from HDF5 files (RGB mode or event-3chef mode).",
+        description="Save first frames from HDF5 files (RGB, 3Chef, or XYT event mode).",
     )
 
     parser.add_argument(

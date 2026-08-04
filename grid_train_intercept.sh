@@ -2,8 +2,8 @@
 set -euo pipefail
 
 DATASETS=(
-  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260728_225008"
-  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260727_215525"
+  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260728_225008_xyt200_s320_t9_signed"
+  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260727_215525_xyt200_s320_t9_signed"
 )
 
 # HDF5 qpos remains (T, 7), but the loader concatenates:
@@ -12,7 +12,7 @@ RAW_QPOS_DIM=7
 STATE_DIM=21
 ACTION_DIM=1
 
-VISUAL_HISTORY_FRAMES=3
+VISUAL_HISTORY_FRAMES=1
 CHUNK_SIZE=30
 
 DATASET_NAME="$(basename "${DATASETS[0]}")"
@@ -39,7 +39,7 @@ for IMAGE_SIZE in 320; do
               ;;
             event)
               CAM_NAMES=(event)
-              CAM_TAG="event_3chef_hist3"
+              CAM_TAG="xyt200_s320_t9_signed"
               ;;
             *)
               echo "Unsupported CAM_MODE: $CAM_MODE" >&2
@@ -58,7 +58,8 @@ for IMAGE_SIZE in 320; do
           echo "Raw qpos dim: ${RAW_QPOS_DIM}"
           echo "Model state dim: ${STATE_DIM}"
           echo "Action dim: ${ACTION_DIM}"
-          echo "RGB/qpos history offsets: [-6, -3, 0]"
+          echo "Visual history offsets: [0]"
+          echo "Qpos history offsets: [-6, -3, 0]"
           echo "Action: delta_s[k] = tcp_s(t+k+1) - tcp_s(t)"
           echo "Chunk size: ${CHUNK_SIZE}"
           echo "LR: ${LR}, BS: ${BS}, KL: ${KL}, IMAGE_SIZE: ${IMAGE_SIZE}"

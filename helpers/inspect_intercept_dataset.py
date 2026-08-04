@@ -175,6 +175,7 @@ def main() -> None:
     episode_mean_delta_s = []
     episode_net_delta_s = []
     legacy_flags = []
+    representation_counts = {}
 
     current_files = 0
     legacy_files = 0
@@ -188,6 +189,12 @@ def main() -> None:
                     or (args.structure == "first" and file_index == 0)
                 ):
                     print_hdf5_structure(path, f)
+
+                representation = f.attrs.get("event_representation", "rgb_or_unspecified")
+                if isinstance(representation, bytes):
+                    representation = representation.decode("utf-8", errors="replace")
+                representation = str(representation)
+                representation_counts[representation] = representation_counts.get(representation, 0) + 1
 
                 if "action" not in f:
                     print(f"[WARN] skipping action analysis for {path}: missing /action")
@@ -254,6 +261,9 @@ def main() -> None:
     print(f"current delta-s files:        {current_files}")
     print(f"legacy commanded-flag files: {legacy_files}")
     print(f"skipped/unsupported files:    {skipped_files}")
+    print("representations:")
+    for representation, count in sorted(representation_counts.items()):
+        print(f"  {representation}: {count}")
 
     if delta_s_values:
         delta_s = np.concatenate(delta_s_values)
