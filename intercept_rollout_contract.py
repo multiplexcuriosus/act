@@ -99,16 +99,110 @@ EXPECTED_INTERCEPT_XYT_METADATA = {
 
 
 @dataclass(frozen=True)
+class InterceptVisualContract:
+    representation: str
+    input_modality: str
+    visual_history_offsets: Tuple[int, ...]
+    qpos_history_offsets: Tuple[int, int, int]
+    channels_per_visual_frame: int
+    image_channels: int
+    image_normalization: str
+    expected_encoding: str
+    expected_height: int
+    expected_width: int
+
+
+def resolve_intercept_visual_contract(
+    stats: Dict[str, object],
+    *,
+    cli_camera_name: Optional[str] = None,
+    cli_event_representation: Optional[str] = None,
+    cli_visual_history_frames: Optional[int] = None,
+) -> InterceptVisualContract:
+    """Resolve the live visual layout from checkpoint metadata and CLI assertions."""
+    checkpoint_modality = _stats_modality(stats)
+    representation = stats.get("event_representation")
+
+    if checkpoint_modality in (None, "rgb") and representation is None:
+        checkpoint_modality = "rgb"
+        resolved_representation = "rgb_history"
+        expected = EXPECTED_INTERCEPT_RGB_METADATA
+        expected_encoding = "rgb8"
+        expected_height = int(stats.get("image_size", 320))
+        expected_width = expected_height
+    elif checkpoint_modality == "event" and representation == "shifted_3chef_signed":
+        resolved_representation = "shifted_3chef_signed"
+        expected = EXPECTED_INTERCEPT_EVENT_METADATA
+        expected_encoding = "8UC3/bgr8/rgb8"
+        expected_height = int(stats.get("image_size", 320))
+        expected_width = expected_height
+    elif checkpoint_modality == "event" and representation == "xyt_signed_voxel_v1":
+        resolved_representation = "xyt_signed_voxel_v1"
+        expected = EXPECTED_INTERCEPT_XYT_METADATA
+        expected_encoding = "8UC9"
+        expected_height = 320
+        expected_width = 320
+    else:
+        raise ValueError(
+            "Unsupported or incomplete checkpoint visual representation: "
+            f"input_modality={checkpoint_modality!r}, "
+            f"event_representation={representation!r}"
+        )
+
+    expected_camera = str(expected["input_modality"])
+    if cli_camera_name is not None and str(cli_camera_name) != expected_camera:
+        raise ValueError(
+            "Checkpoint/CLI camera mismatch: "
+            f"checkpoint={expected_camera!r}, CLI={cli_camera_name!r}"
+        )
+    if cli_event_representation is not None:
+        asserted = str(cli_event_representation)
+        if asserted != resolved_representation:
+            raise ValueError(
+                "Checkpoint/CLI representation mismatch: "
+                f"checkpoint={resolved_representation!r}, CLI={asserted!r}"
+            )
+
+    visual_offsets = tuple(int(value) for value in expected["visual_history_offsets"])
+    if (
+        cli_visual_history_frames is not None
+        and int(cli_visual_history_frames) != len(visual_offsets)
+    ):
+        raise ValueError(
+            "Checkpoint/CLI visual history mismatch: "
+            f"checkpoint={len(visual_offsets)}, CLI={cli_visual_history_frames}"
+        )
+
+    qpos_offsets = tuple(int(value) for value in expected["qpos_history_offsets"])
+    if len(qpos_offsets) != 3:
+        raise ValueError(f"Expected three qpos offsets, got {qpos_offsets}")
+
+    return InterceptVisualContract(
+        representation=resolved_representation,
+        input_modality=expected_camera,
+        visual_history_offsets=visual_offsets,
+        qpos_history_offsets=qpos_offsets,
+        channels_per_visual_frame=int(expected["channels_per_visual_frame"]),
+        image_channels=int(expected["image_channels"]),
+        image_normalization=str(expected["image_normalization"]),
+        expected_encoding=expected_encoding,
+        expected_height=expected_height,
+        expected_width=expected_width,
+    )
+
+
+@dataclass(frozen=True)
 class SyncSelection:
-    history_indices: Tuple[int, int, int]
-    visual_timestamps: Tuple[float, float, float]
+    history_indices: Tuple[int, ...]
+    visual_timestamps: Tuple[float, ...]
+    qpos_target_timestamps: Tuple[float, float, float]
     qpos_timestamps: Tuple[float, float, float]
     anchor_tcp_s: float
     anchor_tcp_s_timestamp: float
     qpos_history: np.ndarray
 
     @property
-    def rgb_timestamps(self) -> Tuple[float, float, float]:
+    def rgb_timestamps(self) -> Tuple[float, ...]:
         # Backward-compatible alias used by existing rollout code/tests.
         return self.visual_timestamps
 
@@ -330,6 +424,7 @@ def build_visual_history_tensor(
     visual_frames: Sequence[np.ndarray],
     image_size: int,
     modality: str,
+    expected_channels: int = 9,
 ) -> np.ndarray:
     if len(visual_frames) <= 0:
         raise ValueError("Expected at least one visual frame")
@@ -369,23 +464,95 @@ def build_visual_history_tensor(
         processed.append(resized)
         total_channels += int(resized.shape[2])
 
+    channels = int(expected_channels)
+    if channels <= 0:
+        raise ValueError(f"expected_channels must be positive, got {channels}")
+
     image_hwc = np.concatenate(processed, axis=2)
-    if total_channels != 9 or image_hwc.shape != (target, target, 9):
+    if total_channels != channels or image_hwc.shape != (target, target, channels):
         raise AssertionError(
-            f"Temporal visual concat mismatch: expected {(target, target, 9)}, got {image_hwc.shape}"
+            "Temporal visual concat mismatch: "
+            f"expected {(target, target, channels)}, got {image_hwc.shape}"
         )
 
     image = np.transpose(image_hwc, (2, 0, 1))[None, None, ...].astype(np.float32) / 255.0
-    if image.shape != (1, 1, 9, target, target):
+    if image.shape != (1, 1, channels, target, target):
         raise AssertionError(
             "Temporal visual tensor shape mismatch: "
-            f"expected {(1, 1, 9, target, target)}, got {image.shape}"
+            f"expected {(1, 1, channels, target, target)}, got {image.shape}"
         )
     return image
 
 
 def build_rgb_history_tensor(rgb_frames: Sequence[np.ndarray], image_size: int) -> np.ndarray:
     return build_visual_history_tensor(rgb_frames, image_size=image_size, modality="rgb")
+
+
+def decode_uint8_hwc_image_message(
+    message,
+    *,
+    expected_encoding: str,
+    expected_height: int,
+    expected_width: int,
+    expected_channels: int,
+) -> np.ndarray:
+    """Decode a uint8 HWC ROS image, including messages with padded rows."""
+    height = int(message.height)
+    width = int(message.width)
+    step = int(message.step)
+    channels = int(expected_channels)
+    if height != int(expected_height) or width != int(expected_width):
+        raise ValueError(
+            "Image dimensions mismatch: "
+            f"expected {(expected_height, expected_width)}, got {(height, width)}"
+        )
+    if str(message.encoding) != str(expected_encoding):
+        raise ValueError(
+            f"Image encoding mismatch: expected {expected_encoding!r}, "
+            f"got {message.encoding!r}"
+        )
+
+    row_bytes = width * channels
+    if step < row_bytes:
+        raise ValueError(
+            f"Image step is too small: expected at least {row_bytes}, got {step}"
+        )
+    expected_data_length = height * step
+    if len(message.data) != expected_data_length:
+        raise ValueError(
+            "Image data length mismatch: "
+            f"expected {expected_data_length}, got {len(message.data)}"
+        )
+
+    raw = np.frombuffer(memoryview(message.data), dtype=np.uint8)
+    rows = raw.reshape(height, step)
+    packed = rows[:, :row_bytes].reshape(height, width, channels)
+    return np.ascontiguousarray(packed)
+
+
+def validate_xyt_orientation_parity(
+    live_rotation_degrees: Optional[int],
+    *,
+    parity_verified: bool,
+) -> str:
+    """Validate that live XYT orientation matches unrotated offline conversion."""
+    if live_rotation_degrees is None:
+        raise ValueError(
+            "Cannot verify XYT orientation because the OpenMV rotation parameter "
+            "is unavailable"
+        )
+    rotation = int(live_rotation_degrees)
+    if rotation not in (-90, 0, 90, 180):
+        raise ValueError(f"Unsupported live XYT rotation: {rotation}")
+    if rotation == 0:
+        return "zero_rotation"
+    if not parity_verified:
+        raise ValueError(
+            "Live XYT rotation differs from unrotated offline conversion: "
+            f"rotation={rotation}. Provide verified synthetic/recorded orientation "
+            "parity before rollout."
+        )
+    return "comparison_verified"
 
 
 def _resolve_policy_modality(policy_config: Dict[str, object]) -> str:
@@ -457,7 +624,13 @@ def validate_intercept_stats_and_config(
             f"checkpoint={checkpoint_modality}, rollout={rollout_modality}"
         )
 
-    is_xyt = stats.get("event_representation") == "xyt_signed_voxel_v1"
+    visual_contract = resolve_intercept_visual_contract(
+        stats,
+        cli_camera_name=str(policy_config.get("camera_names", [""])[0]),
+        cli_event_representation=policy_config.get("event_representation"),
+        cli_visual_history_frames=policy_config.get("visual_history_frames"),
+    )
+    is_xyt = visual_contract.representation == "xyt_signed_voxel_v1"
     expected_metadata = (
         EXPECTED_INTERCEPT_XYT_METADATA
         if is_xyt
@@ -474,12 +647,6 @@ def validate_intercept_stats_and_config(
                 # Legacy RGB checkpoints are allowed to miss newer metadata keys.
                 continue
             raise ValueError(f"Missing interception checkpoint metadata in dataset_stats.pkl: {key}")
-        if (
-            key == "image_normalization"
-            and rollout_modality == "event"
-            and stats[key] in ("signed_event_u8_centered", "shifted_3chef_centered")
-        ):
-            continue
         if stats[key] != expected:
             raise ValueError(
                 f"Interception checkpoint metadata mismatch for {key}: "
@@ -505,12 +672,9 @@ def validate_intercept_stats_and_config(
     if bool(policy_config.get("use_bce_last_action_dim", False)):
         raise ValueError("Interception rollout requires use_bce_last_action_dim=false")
 
-    expected_norm = "signed_event_u8_centered" if rollout_modality == "event" else "imagenet"
+    expected_norm = visual_contract.image_normalization
     actual_norm = str(policy_config.get("image_normalization", ""))
-    accepted_norms = {expected_norm}
-    if rollout_modality == "event" and not is_xyt:
-        accepted_norms.add("shifted_3chef_centered")
-    if actual_norm not in accepted_norms:
+    if actual_norm != expected_norm:
         raise ValueError(
             "Interception policy config mismatch for image_normalization: "
             f"expected {expected_norm!r}, found {policy_config.get('image_normalization')!r}"
@@ -588,6 +752,10 @@ def select_sync_observation(
     tcp_timestamps: Sequence[float],
     tcp_values: Sequence[float],
     history_offsets: Sequence[int] = INTERCEPT_HISTORY_OFFSETS,
+    qpos_history_offsets: Sequence[int] = INTERCEPT_HISTORY_OFFSETS,
+    frame_period_sec: Optional[float] = None,
+    qpos_relative_to_anchor: bool = False,
+    max_qpos_age_sec: Optional[float] = None,
 ) -> SyncSelection:
     if not rgb_timestamps:
         raise ValueError("No visual samples available")
@@ -601,21 +769,48 @@ def select_sync_observation(
 
     selected_rgb_ts = [float(rgb_timestamps[idx]) for idx in history_indices]
 
+    anchor_ts = selected_rgb_ts[-1]
+    if qpos_relative_to_anchor:
+        if frame_period_sec is None or float(frame_period_sec) <= 0.0:
+            raise ValueError(
+                "frame_period_sec must be positive for anchor-relative qpos history"
+            )
+        qpos_targets = [
+            anchor_ts + int(offset) * float(frame_period_sec)
+            for offset in qpos_history_offsets
+        ]
+    else:
+        qpos_targets = list(selected_rgb_ts)
+    if len(qpos_targets) != 3:
+        raise ValueError(f"Expected exactly three qpos target times, got {qpos_targets}")
+
     selected_qpos = []
     selected_qpos_ts = []
-    for rgb_ts in selected_rgb_ts:
-        joint_idx = select_latest_index_at_or_before(joint_timestamps, rgb_ts)
+    for target_ts in qpos_targets:
+        joint_idx = select_latest_index_at_or_before(joint_timestamps, target_ts)
         if joint_idx is None:
             raise ValueError(
-                "No causal JointState sample available at or before visual timestamp "
-                f"{rgb_ts:.6f}"
+                "No causal JointState sample available at or before qpos target "
+                f"timestamp {target_ts:.6f}"
             )
-        selected_qpos_ts.append(float(joint_timestamps[joint_idx]))
+        selected_timestamp = float(joint_timestamps[joint_idx])
+        age = float(target_ts) - selected_timestamp
+        if age < 0.0:
+            raise ValueError("Causal qpos synchronization selected a future sample")
+        if (
+            max_qpos_age_sec is not None
+            and float(max_qpos_age_sec) > 0.0
+            and age > float(max_qpos_age_sec)
+        ):
+            raise ValueError(
+                "JointState sample is stale for qpos target: "
+                f"age={age:.6f}s exceeds max {float(max_qpos_age_sec):.6f}s"
+            )
+        selected_qpos_ts.append(selected_timestamp)
         selected_qpos.append(joint_qpos_samples[joint_idx])
 
     qpos_history = build_qpos_history(selected_qpos)
 
-    anchor_ts = selected_rgb_ts[-1]
     tcp_idx = select_latest_index_at_or_before(tcp_timestamps, anchor_ts)
     if tcp_idx is None:
         raise ValueError(
@@ -632,6 +827,7 @@ def select_sync_observation(
     return SyncSelection(
         history_indices=tuple(history_indices),
         visual_timestamps=tuple(selected_rgb_ts),
+        qpos_target_timestamps=tuple(qpos_targets),
         qpos_timestamps=tuple(selected_qpos_ts),
         anchor_tcp_s=anchor_tcp_s,
         anchor_tcp_s_timestamp=anchor_tcp_ts,
