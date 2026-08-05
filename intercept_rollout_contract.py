@@ -6,7 +6,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from image_preprocessing import mask_and_center_crop_square_rotated_event_image
+
 INTERCEPT_HISTORY_OFFSETS = (-6, -3, 0)
+RAW_EVENT_FRAME_SHAPE = (320, 320, 3)
 ARM_JOINT_NAMES = (
     "right_fr3_joint1",
     "right_fr3_joint2",
@@ -16,6 +19,117 @@ ARM_JOINT_NAMES = (
     "right_fr3_joint6",
     "right_fr3_joint7",
 )
+
+
+@dataclass(frozen=True)
+class EventSpatialPreprocessingConfig:
+    mask_x: Tuple[int, int]
+    crop_square: int
+    fill_value: int = 128
+
+
+def add_event_spatial_preprocessing_arguments(parser) -> None:
+    """Add opt-in live-event spatial preprocessing arguments to a CLI parser."""
+    parser.add_argument(
+        "--event-mask-x",
+        nargs=2,
+        type=int,
+        metavar=("XTOP", "XBOTTOM"),
+        default=None,
+    )
+    parser.add_argument(
+        "--event-crop-square",
+        type=int,
+        metavar="SIDE",
+        default=None,
+    )
+    parser.add_argument(
+        "--event-mask-fill-value",
+        type=int,
+        metavar="VALUE",
+        default=128,
+    )
+
+
+def resolve_event_spatial_preprocessing(
+    *,
+    modality: str,
+    mask_x: Optional[Sequence[int]],
+    crop_square: Optional[int],
+    fill_value: int = 128,
+) -> Optional[EventSpatialPreprocessingConfig]:
+    """Validate and resolve the optional live-event spatial transform."""
+    resolved_fill = int(fill_value)
+    if not 0 <= resolved_fill <= 255:
+        raise ValueError(
+            "--event-mask-fill-value must satisfy 0 <= VALUE <= 255, "
+            f"got {resolved_fill}"
+        )
+
+    has_mask = mask_x is not None
+    has_crop = crop_square is not None
+    if has_mask != has_crop:
+        raise ValueError("--event-mask-x and --event-crop-square must be supplied together")
+    if not has_mask:
+        return None
+
+    if str(modality).strip().lower() != "event":
+        raise ValueError("Event spatial preprocessing is only valid with --camera_name event")
+    if len(mask_x) != 2:
+        raise ValueError(f"--event-mask-x requires XTOP XBOTTOM, got {mask_x!r}")
+
+    resolved_mask = (int(mask_x[0]), int(mask_x[1]))
+    for name, value in zip(("XTOP", "XBOTTOM"), resolved_mask):
+        if not 0 <= value < RAW_EVENT_FRAME_SHAPE[1]:
+            raise ValueError(
+                f"--event-mask-x {name} must satisfy 0 <= value < 320, got {value}"
+            )
+
+    resolved_crop = int(crop_square)
+    if not 0 < resolved_crop <= RAW_EVENT_FRAME_SHAPE[1]:
+        raise ValueError(
+            "--event-crop-square must satisfy 0 < SIDE <= 320, "
+            f"got {resolved_crop}"
+        )
+
+    return EventSpatialPreprocessingConfig(
+        mask_x=resolved_mask,
+        crop_square=resolved_crop,
+        fill_value=resolved_fill,
+    )
+
+
+def preprocess_event_history_frames(
+    visual_frames: Sequence[np.ndarray],
+    config: Optional[EventSpatialPreprocessingConfig],
+) -> List[np.ndarray]:
+    """Apply the configured training spatial transform to selected event frames."""
+    if config is None:
+        return list(visual_frames)
+
+    transformed = []
+    for index, frame in enumerate(visual_frames):
+        array = np.asarray(frame)
+        if array.dtype != np.uint8:
+            raise ValueError(
+                "Event spatial preprocessing requires raw frame dtype uint8; "
+                f"history frame {index} has dtype {array.dtype}"
+            )
+        if array.shape != RAW_EVENT_FRAME_SHAPE:
+            raise ValueError(
+                "Event spatial preprocessing requires raw frame shape (320, 320, 3); "
+                f"history frame {index} has shape {array.shape}. The image topic may "
+                "already be cropped or otherwise incompatible."
+            )
+        transformed.append(
+            mask_and_center_crop_square_rotated_event_image(
+                array,
+                mask_x=config.mask_x,
+                square_side=config.crop_square,
+                fill_value=config.fill_value,
+            )
+        )
+    return transformed
 
 
 EXPECTED_INTERCEPT_COMMON_METADATA = {
