@@ -83,9 +83,17 @@ class ACTPolicy(nn.Module):
         _assert_backbone_channels(self.model, self.image_channels)
         print(f'KL Weight {self.kl_weight}')
 
+    def preprocess_image(self, image):
+        return self.normalize(image)
+
+    def forward_inference(self, qpos, normalized_image):
+        env_state = None
+        a_hat, _, (_, _) = self.model(qpos, normalized_image, env_state)
+        return a_hat
+
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None
-        image = self.normalize(image)
+        image = self.preprocess_image(image)
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
@@ -114,8 +122,7 @@ class ACTPolicy(nn.Module):
             # loss_dict['loss'] = loss_dict['l1'] # train without CVAE encoder
             return loss_dict
         else: # inference time
-            a_hat, _, (_, _) = self.model(qpos, image, env_state) # no action, sample from prior
-            return a_hat
+            return self.forward_inference(qpos, image) # no action, sample from prior
 
     def configure_optimizers(self):
         return self.optimizer
