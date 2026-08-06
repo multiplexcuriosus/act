@@ -5,7 +5,7 @@ import argparse
 import pickle
 import threading
 from collections import deque
-from typing import Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,6 +34,7 @@ from intercept_rollout_contract import (
     validate_intercept_stats_and_config,
 )
 from policy import ACTPolicy
+from rollout_latency_trace import RolloutLatencyTracer
 from sparse_ball import (
     SparsePoint, construct_causal_sparse_history,
     SPARSE_HISTORY_OFFSETS_SEC, default_sparse_topic,
@@ -70,6 +71,7 @@ class FrankaActRolloutNode(Node):
         self.prediction_current_topic = args.prediction_current_topic
         self.temporal_agg_reset_service = args.temporal_agg_reset_service
         self.publish_current_scalar = bool(args.publish_current_scalar)
+        self.latency_trace_cuda_sync = bool(args.latency_trace_cuda_sync)
 
         self.policy_rate_hz = validate_policy_rate(args.policy_rate_hz)
         self.fps = float(args.fps)
@@ -103,7 +105,7 @@ class FrankaActRolloutNode(Node):
         self.diag_log_period_sec = float(args.diag_log_period_sec)
         self.reject_log_period_sec = float(args.reject_log_period_sec)
 
-        self.visual_buffer: Deque[Tuple[float, Image]] = deque(maxlen=self.max_source_buffer)
+        self.visual_buffer: Deque[Tuple[float, Any]] = deque(maxlen=self.max_source_buffer)
         self.joint_buffer: Deque[Tuple[float, np.ndarray]] = deque(maxlen=self.max_source_buffer)
         self.tcp_buffer: Deque[Tuple[float, float]] = deque(maxlen=self.max_source_buffer)
 
@@ -236,10 +238,29 @@ class FrankaActRolloutNode(Node):
                 10,
             )
 
+        self.latency_tracer = RolloutLatencyTracer(
+            self,
+            enabled=bool(args.enable_latency_trace),
+            topic=str(args.latency_trace_topic),
+            run_id=str(args.latency_run_id),
+            modality=self.input_modality,
+        )
+        self._active_latency_trace = None
+
         if self.input_modality == "sparse_ball":
-            self.create_subscription(PointStamped, self.sparse_topic, self.sparse_cb, 10)
+            self.create_subscription(
+                PointStamped,
+                self.sparse_topic,
+                self.sparse_cb,
+                10,
+            )
         else:
-            self.create_subscription(Image, self.image_topic, self.image_cb, 10)
+            self.create_subscription(
+                Image,
+                self.image_topic,
+                self.image_cb,
+                10,
+            )
         self.create_subscription(JointState, self.joint_topic, self.joint_cb, 10)
         current_tcp_s_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(
@@ -360,15 +381,43 @@ class FrankaActRolloutNode(Node):
         self._last_throttled_log_sec[key] = now
         self.get_logger().warn(message)
 
+    def _trace_mark(self, stage: str, **detail) -> None:
+        tracer = getattr(self, "latency_tracer", None)
+        if tracer is not None:
+            tracer.mark(getattr(self, "_active_latency_trace", None), stage, **detail)
+
     def _run_policy_forward(self, qpos: torch.Tensor, image: torch.Tensor) -> Tuple[torch.Tensor, float]:
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        start = time.time()
         with torch.inference_mode():
-            raw_output = self.policy(qpos, image)
-        if self.device.type == "cuda":
+            normalized_image = self.policy.preprocess_image(image)
+        self._trace_mark(
+            "tensor_construction_and_preprocessing",
+            qpos_shape=list(qpos.shape),
+            image_shape=list(image.shape),
+        )
+        cuda_timing = self.device.type == "cuda" and self.latency_trace_cuda_sync
+        if cuda_timing:
+            sync_start = time.perf_counter()
             torch.cuda.synchronize()
-        inference_ms = (time.time() - start) * 1000.0
+            self._trace_mark(
+                "cuda_sync_before_forward",
+                cuda_sync_before_ms=(time.perf_counter() - sync_start) * 1000.0,
+            )
+        start = time.perf_counter()
+        with torch.inference_mode():
+            raw_output = self.policy.forward_inference(qpos, normalized_image)
+        if cuda_timing:
+            sync_start = time.perf_counter()
+            torch.cuda.synchronize()
+            self._trace_mark(
+                "cuda_sync_after_forward",
+                cuda_sync_after_ms=(time.perf_counter() - sync_start) * 1000.0,
+            )
+        inference_ms = (time.perf_counter() - start) * 1000.0
+        self._trace_mark(
+            "model_forward_pass",
+            model_forward_ms=inference_ms,
+            cuda_synchronized=bool(cuda_timing),
+        )
         return raw_output, inference_ms
 
     def _warm_up_model_once(self) -> None:
@@ -471,6 +520,16 @@ class FrankaActRolloutNode(Node):
             tcp_values=tcp_values,
             history_offsets=self.qpos_history_offsets,
         )
+        self._trace_mark(
+            "input_history_selection",
+            selected_visual_timestamps_ns=[
+                int(round(ts * 1e9)) for ts in sync.visual_timestamps
+            ],
+            selected_visual_anchor_timestamp_ns=int(
+                round(sync.visual_timestamps[-1] * 1e9)
+            ),
+            selected_qpos_timestamps_ns=[int(round(ts * 1e9)) for ts in sync.qpos_timestamps],
+        )
 
         selected_visual_msgs = [visual_messages[index] for index in sync.history_indices]
         if self.input_modality == "sparse_ball":
@@ -514,6 +573,7 @@ class FrankaActRolloutNode(Node):
             max_anchor_age_sec=self.max_anchor_age_sec,
             max_observation_age_sec=self.max_observation_age_sec,
         )
+        self._trace_mark("complete_observation_frame_acceptance")
 
         qpos_norm = self.pre_process(sync.qpos_history)
         if not np.all(np.isfinite(qpos_norm)):
@@ -551,7 +611,7 @@ class FrankaActRolloutNode(Node):
             current_msg.data = float(current_value)
             self.prediction_current_pub.publish(current_msg)
 
-    def run_policy_step(self) -> None:
+    def run_policy_step(self) -> Tuple[bool, str]:
         step_start_wall = time.time()
         sync, qpos, curr_image, anchor_timestamp_ns = self.build_policy_inputs()
 
@@ -559,13 +619,13 @@ class FrankaActRolloutNode(Node):
             if self.reset_anchor_floor_ns is not None and anchor_timestamp_ns <= self.reset_anchor_floor_ns:
                 self.duplicate_timer_tick_skip_count += 1
                 self._last_attempted_anchor_ns = anchor_timestamp_ns
-                return
+                return False, "frame_at_or_before_reset_floor"
 
             if self._last_attempted_anchor_ns is not None:
                 delta_ns = anchor_timestamp_ns - self._last_attempted_anchor_ns
                 if delta_ns == 0:
                     self.duplicate_timer_tick_skip_count += 1
-                    return
+                    return False, "duplicate_source_frame"
                 if delta_ns < 0:
                     self.backward_anchor_count += 1
                     self._reset_temporal_aggregation("backward_visual_anchor_timestamp")
@@ -632,12 +692,13 @@ class FrankaActRolloutNode(Node):
             )
             with self._aggregation_lock:
                 self._reset_temporal_aggregation("post_inference_stale")
-            return
+            return False, "post_inference_stale"
 
         try:
             normalized_delta = raw_output[0, :, 0].detach().cpu().numpy()
             delta_s = denormalize_delta_chunk(normalized_delta, self.action_mean, self.action_std)
             absolute_s = absolute_s_from_anchor(sync.anchor_tcp_s, delta_s)
+            self._trace_mark("denormalization_and_absolute_target_conversion")
             if not np.all(np.isfinite(absolute_s)):
                 raise RuntimeError("Absolute-s chunk contains non-finite values")
 
@@ -653,6 +714,12 @@ class FrankaActRolloutNode(Node):
             current_value = float(selection.value)
             agg_contributors = int(selection.contributor_count)
             agg_effective_age_frames = float(selection.effective_age_frames)
+            self._trace_mark(
+                "temporal_aggregation_lookahead_selection",
+                chunk_size=self.chunk_size,
+                lookahead_index=self.action_lookahead_steps,
+                selected_target=current_value,
+            )
         except Exception:
             with self._aggregation_lock:
                 self.failed_or_stale_inference_gap_count += 1
@@ -664,6 +731,7 @@ class FrankaActRolloutNode(Node):
                 self.reset_anchor_floor_ns = None
 
         self.publish_predictions(absolute_s, current_value)
+        self._trace_mark("prediction_publication_completion")
         with self._aggregation_lock:
             self.accepted_prediction_count += 1
             self.accepted_distinct_anchor_count += 1
@@ -709,10 +777,21 @@ class FrankaActRolloutNode(Node):
 
         with self._aggregation_lock:
             self.step_index += 1
+        return True, ""
 
     def timer_cb(self) -> None:
+        source_stamp_ns = 0
+        if self.visual_buffer:
+            source_stamp_ns = int(self.visual_buffer[-1][0] * 1e9)
+        trace = self.latency_tracer.begin(source_stamp_ns)
+        self._active_latency_trace = trace
+        valid = False
+        rejection_reason = ""
         if not self.ready():
-            self._reject("waiting for visual image, JointState, and current_tcp_s streams")
+            rejection_reason = "waiting for visual input, JointState, and current_tcp_s streams"
+            self._reject(rejection_reason)
+            self.latency_tracer.finish(trace, valid=False, rejection_reason=rejection_reason)
+            self._active_latency_trace = None
             return
 
         if not self.running:
@@ -720,14 +799,20 @@ class FrankaActRolloutNode(Node):
             self.get_logger().info("Received first valid synchronized streams. Starting interception rollout.")
 
         try:
-            self.run_policy_step()
+            valid, rejection_reason = self.run_policy_step()
         except ValueError as exc:
-            self._reject(str(exc))
+            rejection_reason = str(exc)
+            self._reject(rejection_reason)
         except RuntimeError as exc:
-            self._reject(str(exc))
+            rejection_reason = str(exc)
+            self._reject(rejection_reason)
         except Exception as exc:
             self.get_logger().error(f"Policy step failed: {exc}")
+            rejection_reason = str(exc)
             raise
+        finally:
+            self.latency_tracer.finish(trace, valid=valid, rejection_reason=rejection_reason)
+            self._active_latency_trace = None
 
 
 def main():
@@ -761,6 +846,10 @@ def main():
     parser.add_argument("--max_anchor_age_sec", type=float, default=0.10)
     parser.add_argument("--diag_log_period_sec", type=float, default=1.0)
     parser.add_argument("--reject_log_period_sec", type=float, default=1.0)
+    parser.add_argument("--enable_latency_trace", action="store_true", default=False)
+    parser.add_argument("--latency_trace_cuda_sync", action="store_true", default=False)
+    parser.add_argument("--latency_trace_topic", type=str, default="/intercept_trace/act_rollout")
+    parser.add_argument("--latency_run_id", type=str, default="")
 
     parser.add_argument("--state_dim", type=int, default=21)
     parser.add_argument("--action_dim", type=int, default=1)
