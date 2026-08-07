@@ -105,6 +105,7 @@ class FrankaActRolloutNode(Node):
         self.rollout_epoch = 0
         self.reset_anchor_floor_ns: Optional[int] = None
         self._aggregation_lock = threading.Lock()
+        self._policy_step_ids_by_step: Dict[int, str] = {}
 
         self.expected_step_ns = int(round(1e9 / self.fps))
         self.anchor_gap_tolerance_ns = max(int(round(0.35 * self.expected_step_ns)), 5_000_000)
@@ -286,6 +287,11 @@ class FrankaActRolloutNode(Node):
         if tracer is not None:
             tracer.mark(getattr(self, "_active_latency_trace", None), stage, **detail)
 
+    def _trace_event(self, event: str, **detail) -> None:
+        tracer = getattr(self, "latency_tracer", None)
+        if tracer is not None:
+            tracer.emit(getattr(self, "_active_latency_trace", None), event, **detail)
+
     def _run_policy_forward(self, qpos: torch.Tensor, image: torch.Tensor) -> Tuple[torch.Tensor, float]:
         with torch.inference_mode():
             normalized_image = self.policy.preprocess_image(image)
@@ -294,7 +300,12 @@ class FrankaActRolloutNode(Node):
             qpos_shape=list(qpos.shape),
             image_shape=list(image.shape),
         )
-        cuda_timing = self.device.type == "cuda" and self.latency_trace_cuda_sync
+        # A traced CUDA completion must include a synchronization boundary;
+        # otherwise Python return only proves that kernels were enqueued.
+        tracer = getattr(self, "latency_tracer", None)
+        cuda_timing = self.device.type == "cuda" and (
+            self.latency_trace_cuda_sync or (tracer is not None and tracer.enabled)
+        )
         if cuda_timing:
             sync_start = time.perf_counter()
             torch.cuda.synchronize()
@@ -303,6 +314,7 @@ class FrankaActRolloutNode(Node):
                 cuda_sync_before_ms=(time.perf_counter() - sync_start) * 1000.0,
             )
         start = time.perf_counter()
+        self._trace_event("inference_started")
         with torch.inference_mode():
             raw_output = self.policy.forward_inference(qpos, normalized_image)
         if cuda_timing:
@@ -313,6 +325,10 @@ class FrankaActRolloutNode(Node):
                 cuda_sync_after_ms=(time.perf_counter() - sync_start) * 1000.0,
             )
         inference_ms = (time.perf_counter() - start) * 1000.0
+        self._trace_event(
+            "inference_completed",
+            cuda_synchronized=bool(cuda_timing),
+        )
         self._trace_mark(
             "model_forward_pass",
             model_forward_ms=inference_ms,
@@ -359,6 +375,7 @@ class FrankaActRolloutNode(Node):
         discarded_entries = len(getattr(self.aggregator, "_history", []))
         self.aggregator.reset()
         self.step_index = 0
+        self._policy_step_ids_by_step.clear()
         self._last_anchor_discontinuity_reset_reason = reason
         return discarded_entries
 
@@ -427,6 +444,7 @@ class FrankaActRolloutNode(Node):
         )
 
         selected_rgb_msgs = [rgb_messages[index] for index in sync.history_indices]
+        history_source_stamp_ns = [image_source_stamp_ns(msg) for msg in selected_rgb_msgs]
         rgb_frames = [
             self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
             for msg in selected_rgb_msgs
@@ -455,21 +473,41 @@ class FrankaActRolloutNode(Node):
             anchor_rgb_msg,
             anchor_observation_timestamp,
         )
-        return sync, qpos, image, anchor_timestamp_ns
+        return sync, qpos, image, anchor_timestamp_ns, history_source_stamp_ns
 
-    def publish_predictions(self, absolute_chunk: np.ndarray, current_value: Optional[float]) -> None:
+    def publish_predictions(
+        self,
+        absolute_chunk: np.ndarray,
+        current_value: Optional[float],
+        *,
+        contributing_policy_step_ids,
+    ) -> None:
         chunk_msg = Float64MultiArray()
         chunk_msg.data = [float(value) for value in absolute_chunk.tolist()]
         self.prediction_pub.publish(chunk_msg)
+        self.latency_tracer.emit(
+            self._active_latency_trace, "action_published",
+            action_chunk_index=int(self.action_lookahead_steps),
+            contributing_policy_step_ids=list(contributing_policy_step_ids),
+            output_topic=self.prediction_topic,
+        )
 
         if self.prediction_current_pub is not None and current_value is not None:
             current_msg = Float64()
             current_msg.data = float(current_value)
             self.prediction_current_pub.publish(current_msg)
+            self.latency_tracer.target_s_published(
+                self._active_latency_trace,
+                float(current_value),
+                action_chunk_index=int(self.action_lookahead_steps),
+                contributing_policy_step_ids=list(contributing_policy_step_ids),
+                output_topic=self.prediction_current_topic,
+                downstream_tracker_causality="unavailable_float64_interface",
+            )
 
     def run_policy_step(self) -> Tuple[bool, str]:
         step_start_wall = time.time()
-        sync, qpos, curr_image, anchor_timestamp_ns = self.build_policy_inputs()
+        sync, qpos, curr_image, anchor_timestamp_ns, history_source_stamp_ns = self.build_policy_inputs()
 
         with self._aggregation_lock:
             if self.reset_anchor_floor_ns is not None and anchor_timestamp_ns <= self.reset_anchor_floor_ns:
@@ -503,6 +541,10 @@ class FrankaActRolloutNode(Node):
             # Mark this anchor as attempted before running inference so duplicate timer ticks
             # cannot trigger repeated attempts on the same cached frame.
             self._last_attempted_anchor_ns = anchor_timestamp_ns
+
+        policy_step_id = self.latency_tracer.policy_input_accepted(
+            self._active_latency_trace, history_source_stamp_ns
+        )
 
         try:
             raw_output, inference_ms = self._run_policy_forward(qpos, curr_image)
@@ -560,7 +602,15 @@ class FrankaActRolloutNode(Node):
 
             with self._aggregation_lock:
                 self.aggregator.add_prediction(self.step_index, absolute_s)
+                if policy_step_id:
+                    self._policy_step_ids_by_step[self.step_index] = policy_step_id
+                minimum_retained_step = self.step_index - self.chunk_size
+                self._policy_step_ids_by_step = {
+                    step: identifier for step, identifier in self._policy_step_ids_by_step.items()
+                    if step >= minimum_retained_step
+                }
                 selection = self.aggregator.selection_for_step(self.step_index)
+                contributor_steps = self.aggregator.contributing_steps_for_step(self.step_index)
             if selection is None:
                 raise RuntimeError("Temporal aggregator produced no current value")
             if not np.isfinite(selection.value):
@@ -570,6 +620,10 @@ class FrankaActRolloutNode(Node):
             current_value = float(selection.value)
             agg_contributors = int(selection.contributor_count)
             agg_effective_age_frames = float(selection.effective_age_frames)
+            contributing_policy_step_ids = [
+                self._policy_step_ids_by_step[step]
+                for step in contributor_steps if step in self._policy_step_ids_by_step
+            ]
             self._trace_mark(
                 "temporal_aggregation_lookahead_selection",
                 chunk_size=self.chunk_size,
@@ -586,7 +640,11 @@ class FrankaActRolloutNode(Node):
             if self.reset_anchor_floor_ns is not None and anchor_timestamp_ns > self.reset_anchor_floor_ns:
                 self.reset_anchor_floor_ns = None
 
-        self.publish_predictions(absolute_s, current_value)
+        self.publish_predictions(
+            absolute_s,
+            current_value,
+            contributing_policy_step_ids=contributing_policy_step_ids,
+        )
         self._trace_mark("prediction_publication_completion")
         with self._aggregation_lock:
             self.accepted_prediction_count += 1

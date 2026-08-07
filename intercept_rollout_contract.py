@@ -179,6 +179,18 @@ class TemporalAbsoluteAggregator:
             effective_age_frames=float(np.sum(ages * weights)),
         )
 
+    def contributing_steps_for_step(self, current_step: int) -> Tuple[int, ...]:
+        """Return policy-step indices used by the configured selection mode."""
+        contributions = self._valid_contributions_for_step(current_step)
+        if not contributions:
+            return ()
+        if self.mode == "latest":
+            return (max(contributions, key=lambda item: item[0])[0],)
+        if self.mode == "recent":
+            selected = sorted(contributions, key=lambda item: item[0], reverse=True)[:self.recent_window]
+            return tuple(item[0] for item in sorted(selected, key=lambda item: item[0]))
+        return tuple(item[0] for item in contributions)
+
     def value_for_step(self, current_step: int) -> Optional[float]:
         selection = self.selection_for_step(current_step)
         if selection is None:

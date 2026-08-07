@@ -152,6 +152,39 @@ class RolloutLatencyTraceTests(unittest.TestCase):
                 synchronize()
         synchronize.assert_not_called()
 
+    def test_history_provenance_and_rollout_event_ids_are_preserved(self):
+        node, tracer = self.make_tracer("event")
+        tick = tracer.begin(300, source_modality="event", history_source_stamp_ns=[100, 200, 300])
+        policy_step_id = tracer.policy_input_accepted(tick, [100, 200, 300])
+        tracer.emit(tick, "inference_started")
+        tracer.emit(tick, "inference_completed", cuda_synchronized=True)
+        tracer.emit(tick, "action_published", action_chunk_index=4)
+        first_command = tracer.target_s_published(tick, 0.25, action_chunk_index=4)
+        second_command = tracer.target_s_published(tick, 0.25, action_chunk_index=4)
+
+        details = [json.loads(message.detail_json) for message in node.publisher.messages]
+        self.assertEqual(policy_step_id, "policy_step_00000001")
+        self.assertEqual(first_command, "rollout_command_00000001")
+        self.assertEqual(second_command, "rollout_command_00000002")
+        self.assertNotEqual(details[-2]["command_id"], details[-1]["command_id"])
+        self.assertEqual(details[0]["history_source_stamp_ns"], [100, 200, 300])
+        self.assertEqual(details[0]["source_oldest_stamp_ns"], 100)
+        self.assertEqual(details[0]["source_newest_stamp_ns"], 300)
+        self.assertEqual(details[0]["history_frame_count"], 3)
+        self.assertTrue(all(item["source_modality"] == "event" for item in details))
+        self.assertTrue(all(item["policy_step_id"] == policy_step_id for item in details))
+
+    def test_one_policy_step_can_produce_multiple_distinct_commands(self):
+        node, tracer = self.make_tracer()
+        tick = tracer.begin(100)
+        policy_step_id = tracer.policy_input_accepted(tick, [100])
+        tracer.target_s_published(tick, 0.5)
+        tracer.target_s_published(tick, 0.5)
+        command_details = [json.loads(message.detail_json) for message in node.publisher.messages
+                           if message.event == "target_s_published"]
+        self.assertEqual({item["policy_step_id"] for item in command_details}, {policy_step_id})
+        self.assertEqual(len({item["command_id"] for item in command_details}), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

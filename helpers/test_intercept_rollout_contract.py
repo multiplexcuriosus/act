@@ -421,6 +421,9 @@ class InterceptRolloutContractTests(unittest.TestCase):
         self.assertEqual(full_sel.contributor_count, 3)
         self.assertEqual(latest_sel.contributor_count, 1)
         self.assertEqual(recent_sel.contributor_count, 3)
+        self.assertEqual(full.contributing_steps_for_step(current_step), (2, 3, 4))
+        self.assertEqual(latest.contributing_steps_for_step(current_step), (4,))
+        self.assertEqual(recent.contributing_steps_for_step(current_step), (2, 3, 4))
 
         ages = np.asarray([3.0, 2.0, 1.0], dtype=np.float64)
         full_weights = np.exp(-0.2 * np.arange(3, dtype=np.float64))
