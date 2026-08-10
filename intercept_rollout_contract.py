@@ -309,7 +309,26 @@ def validate_intercept_stats_and_config(
     policy_config: Dict[str, object],
     expected_chunk_size: int,
 ) -> Dict[str, np.ndarray]:
-    for key, expected in EXPECTED_INTERCEPT_METADATA.items():
+    modality = str(policy_config.get("input_modality", "rgb"))
+    expected_metadata = dict(EXPECTED_INTERCEPT_METADATA)
+    if modality == "sparse_ball":
+        expected_metadata.pop("rgb_history_frames")
+        expected_metadata.pop("rgb_history_offsets")
+        expected_metadata.pop("rgb_frame_order")
+        expected_metadata.pop("image_channels")
+        expected_metadata.update({
+            "input_modality": "sparse_ball", "sparse_feature_dim": 6,
+            "sparse_feature_names": ["u", "v", "du_dt", "dv_dt", "valid", "observation_age"],
+            "sparse_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+        })
+        for key in ("image_width", "image_height", "coordinate_convention", "velocity_convention",
+                    "max_observation_age_sec", "ball_source_topic", "source_timestamp_policy",
+                    "missing_observation_policy"):
+            if key not in stats:
+                raise ValueError(f"Missing sparse checkpoint metadata in dataset_stats.pkl: {key}")
+    elif modality not in ("rgb", "event"):
+        raise ValueError(f"Unsupported interception input modality: {modality!r}")
+    for key, expected in expected_metadata.items():
         if key not in stats:
             raise ValueError(f"Missing interception checkpoint metadata in dataset_stats.pkl: {key}")
         if stats[key] != expected:
@@ -322,9 +341,11 @@ def validate_intercept_stats_and_config(
         "state_dim": 21,
         "action_dim": 1,
         "num_queries": int(expected_chunk_size),
-        "rgb_history_frames": 3,
-        "image_channels": 9,
     }
+    if modality == "sparse_ball":
+        required_config.update({"sparse_history_length": 3, "sparse_feature_dim": 6})
+    else:
+        required_config.update({"rgb_history_frames": 3, "image_channels": 9})
     for key, expected in required_config.items():
         if int(policy_config.get(key, -1)) != expected:
             raise ValueError(
@@ -357,6 +378,17 @@ def validate_intercept_stats_and_config(
         raise ValueError("qpos_std must be strictly positive")
     if np.any(arrays["action_std"] <= 0.0):
         raise ValueError("action_std must be strictly positive")
+
+    if modality == "sparse_ball":
+        for stat_key in ("sparse_mean", "sparse_std"):
+            if stat_key not in stats:
+                raise ValueError(f"Missing required sparse stats key: {stat_key}")
+            arr = np.asarray(stats[stat_key], dtype=np.float32).reshape(-1)
+            if arr.shape != (6,) or not np.isfinite(arr).all():
+                raise ValueError(f"{stat_key} must be finite with shape (6,), got {arr.shape}")
+            arrays[stat_key] = arr
+        if np.any(arrays["sparse_std"] <= 0.0):
+            raise ValueError("sparse_std must be strictly positive")
 
     return arrays
 

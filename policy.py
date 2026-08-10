@@ -7,7 +7,11 @@ from detr.main import build_ACT_model_and_optimizer, build_CNNMLP_model_and_opti
 import IPython
 e = IPython.embed
 
-from roma.mappings import special_gramschmidt
+try:
+    from roma.mappings import special_gramschmidt
+except ImportError:  # ACT/ACTPolicy does not require roma; ACTTaskPolicy reports it when used.
+    def special_gramschmidt(*_args, **_kwargs):
+        raise ImportError("ACTTaskPolicy requires the optional 'roma' package")
 
 
 def _build_image_normalizer(image_channels, normalization_mode='imagenet'):
@@ -77,13 +81,31 @@ class ACTPolicy(nn.Module):
             'use_bce_last_action_dim',
             False
         )
+        self.input_modality = str(args_override.get('input_modality', 'rgb'))
+        self.sparse_feature_dim = int(args_override.get('sparse_feature_dim', 6))
+        self.sparse_history_length = int(args_override.get('sparse_history_length', 3))
+        # Statistics live in dataset_stats.pkl; non-persistent buffers preserve dense checkpoint keys.
+        self.register_buffer('sparse_mean', torch.as_tensor(args_override.get('sparse_mean', [0.] * self.sparse_feature_dim), dtype=torch.float32), persistent=False)
+        self.register_buffer('sparse_std', torch.as_tensor(args_override.get('sparse_std', [1.] * self.sparse_feature_dim), dtype=torch.float32), persistent=False)
         self.image_channels = int(args_override.get('image_channels', 3))
         self.image_normalization = args_override.get('image_normalization', 'imagenet')
-        self.normalize = _build_image_normalizer(self.image_channels, self.image_normalization)
-        _assert_backbone_channels(self.model, self.image_channels)
+        self.normalize = None if self.input_modality == 'sparse_ball' else _build_image_normalizer(self.image_channels, self.image_normalization)
+        if self.input_modality == 'sparse_ball':
+            if self.sparse_feature_dim != 6 or self.sparse_history_length != 3:
+                raise ValueError('canonical sparse_ball contract requires history=3 and features=6')
+            if getattr(self.model, 'backbones', None) is not None:
+                raise AssertionError('sparse_ball model unexpectedly contains a visual backbone')
+        else:
+            _assert_backbone_channels(self.model, self.image_channels)
         print(f'KL Weight {self.kl_weight}')
 
     def preprocess_image(self, image):
+        if self.input_modality == 'sparse_ball':
+            if image.ndim != 3 or tuple(image.shape[1:]) != (self.sparse_history_length, self.sparse_feature_dim):
+                raise ValueError(f'sparse_ball input must have shape [B,3,6], got {tuple(image.shape)}')
+            return (image - self.sparse_mean.to(image.device)) / self.sparse_std.to(image.device)
+        if image.ndim != 5:
+            raise ValueError(f'dense image input must have shape [B,N,C,H,W], got {tuple(image.shape)}')
         return self.normalize(image)
 
     def forward_inference(self, qpos, normalized_image):

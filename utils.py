@@ -7,6 +7,7 @@ import h5py
 import cv2
 from torch.utils.data import DataLoader
 import torchvision.transforms.v2 as transforms
+from sparse_ball import SPARSE_BALL_FEATURE_DIM, SPARSE_BALL_FEATURE_NAMES
 
 import IPython
 e = IPython.embed
@@ -297,14 +298,15 @@ def _validate_intercept_episode_structure(
 ):
     _validate_intercept_root_metadata(root, dataset_path)
 
-    if modality not in ('rgb', 'event'):
+    if modality not in ('rgb', 'event', 'sparse_ball'):
         raise ValueError(f"Unsupported interception modality {modality!r} for {dataset_path}")
 
     if '/action' not in root:
         raise ValueError(f"Missing required dataset: /action in {dataset_path}")
     if '/observations/qpos' not in root:
         raise ValueError(f"Missing required dataset: /observations/qpos in {dataset_path}")
-    image_key = '/observations/images/rgb' if modality == 'rgb' else '/observations/images/event'
+    image_key = '/observations/sparse_ball' if modality == 'sparse_ball' else (
+        '/observations/images/rgb' if modality == 'rgb' else '/observations/images/event')
     if image_key not in root:
         raise ValueError(f"Missing required dataset: {image_key} in {dataset_path}")
     if '/observations/timestamps' not in root:
@@ -344,6 +346,20 @@ def _validate_intercept_episode_structure(
         raise ValueError(f"Non-finite values found in /action for {dataset_path}")
     if not np.isfinite(qpos).all():
         raise ValueError(f"Non-finite values found in /observations/qpos for {dataset_path}")
+
+    if modality == 'sparse_ball':
+        if image_ds.shape != (T, SPARSE_BALL_FEATURE_DIM):
+            raise ValueError(f"Interception sparse_ball must have shape (T,6), got {image_ds.shape}")
+        required = ('input_modality', 'sparse_feature_names', 'sparse_history_offsets',
+                    'image_width', 'image_height', 'coordinate_convention', 'velocity_convention',
+                    'max_observation_age_sec', 'ball_source_topic', 'source_timestamp_policy')
+        required = required + ('missing_observation_policy',)
+        missing = [key for key in required if key not in root.attrs]
+        if missing:
+            raise ValueError(f"Missing sparse_ball metadata in {dataset_path}: {missing}")
+        names = [_decode_h5_attr(item) for item in np.asarray(root.attrs['sparse_feature_names']).reshape(-1)]
+        if tuple(names) != SPARSE_BALL_FEATURE_NAMES:
+            raise ValueError(f"sparse feature order mismatch: {names}")
 
     event_metadata = None
     if modality == 'event':
@@ -1077,11 +1093,11 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         self._printed_image_debug = False
         self._printed_intercept_debug = False
 
-        if self.input_modality not in ('rgb', 'event'):
+        if self.input_modality not in ('rgb', 'event', 'sparse_ball'):
             raise ValueError(
                 f"Interception input_modality must be 'rgb' or 'event', got {self.input_modality!r}"
             )
-        expected_camera_names = ['rgb'] if self.input_modality == 'rgb' else ['event']
+        expected_camera_names = {'rgb': ['rgb'], 'event': ['event'], 'sparse_ball': ['sparse_ball']}[self.input_modality]
         if self.camera_names != expected_camera_names:
             raise ValueError(
                 f"Interception dataset requires camera_names={expected_camera_names} for modality {self.input_modality!r}, got {self.camera_names}"
@@ -1091,7 +1107,8 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
                 f"Interception requires exactly 3 history offsets, got {self.history_offsets}"
             )
 
-        _print_image_pipeline_info(self.camera_names, target_size=self.image_size)
+        if self.input_modality != 'sparse_ball':
+            _print_image_pipeline_info(self.camera_names, target_size=self.image_size)
         self.__getitem__(0)
 
     def __len__(self):
@@ -1116,17 +1133,17 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
             qpos_history = qpos_full[history_indices]
             qpos = qpos_history.reshape(-1).astype(np.float32)
 
-            visual_key = '/observations/images/rgb' if self.input_modality == 'rgb' else '/observations/images/event'
-            visual_frames = [root[visual_key][ts] for ts in history_indices]
-            processed_frames = _prepare_visual_history_frames(
-                visual_frames,
-                self.input_modality,
-                self.camera_names,
-                self.image_size,
-                photometric_aug=self.photometric_aug,
-                spatial_aug=self.spatial_aug,
-            )
-            image_rgb = np.concatenate(processed_frames, axis=-1)
+            if self.input_modality == 'sparse_ball':
+                sparse_history = np.stack(
+                    [np.asarray(root['/observations/sparse_ball'][ts], dtype=np.float32) for ts in history_indices]
+                )
+            else:
+                visual_key = '/observations/images/rgb' if self.input_modality == 'rgb' else '/observations/images/event'
+                visual_frames = [root[visual_key][ts] for ts in history_indices]
+                processed_frames = _prepare_visual_history_frames(
+                    visual_frames, self.input_modality, self.camera_names, self.image_size,
+                    photometric_aug=self.photometric_aug, spatial_aug=self.spatial_aug)
+                image_rgb = np.concatenate(processed_frames, axis=-1)
 
             anchor_s = float(action_full[anchor_t, 0])
             future_end = min(T, anchor_t + 1 + self.chunk_size)
@@ -1141,12 +1158,16 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         is_pad = np.zeros(self.chunk_size, dtype=np.float32)
         is_pad[action_len:] = 1.0
 
-        image_data = torch.from_numpy(np.transpose(image_rgb, (2, 0, 1))[None, ...])
+        if self.input_modality == 'sparse_ball':
+            image_data = torch.from_numpy(sparse_history).float()
+        else:
+            image_data = torch.from_numpy(np.transpose(image_rgb, (2, 0, 1))[None, ...])
         qpos_data = torch.from_numpy(qpos).float()
         action_data = torch.from_numpy(padded_action).float()
         is_pad = torch.from_numpy(is_pad).bool()
 
-        assert image_data.shape == (1, 9, self.image_size[0], self.image_size[1]), image_data.shape
+        expected_input_shape = (3, 6) if self.input_modality == 'sparse_ball' else (1, 9, self.image_size[0], self.image_size[1])
+        assert image_data.shape == expected_input_shape, image_data.shape
         assert qpos_data.shape == (21,), qpos_data.shape
         assert action_data.shape == (self.chunk_size, 1), action_data.shape
         assert is_pad.shape == (self.chunk_size,), is_pad.shape
@@ -1164,7 +1185,10 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
             self._printed_intercept_debug = True
             self._printed_image_debug = True
 
-        image_data = image_data / 255.0
+        if self.input_modality == 'sparse_ball':
+            pass  # ACTPolicy applies the saved sparse statistics for both training and rollout.
+        else:
+            image_data = image_data / 255.0
         action_data = (action_data - self.norm_stats['action_mean']) / self.norm_stats['action_std']
         qpos_data = (qpos_data - self.norm_stats['qpos_mean']) / self.norm_stats['qpos_std']
 
@@ -1222,6 +1246,8 @@ def get_intercept_norm_stats(
     event_metadata=None,
 ):
     qpos_histories = []
+    sparse_histories = []
+    sparse_checkpoint_metadata = None
     delta_tokens = []
 
     for dataset_path in episode_paths:
@@ -1232,11 +1258,22 @@ def get_intercept_norm_stats(
                 modality=input_modality,
                 expected_event_metadata=event_metadata,
             )
+            sparse_full = (np.asarray(root['/observations/sparse_ball'][()], dtype=np.float32)
+                           if input_modality == 'sparse_ball' else None)
+            if input_modality == 'sparse_ball' and sparse_checkpoint_metadata is None:
+                sparse_checkpoint_metadata = {
+                    key: _decode_h5_attr(root.attrs[key])
+                    for key in ('image_width', 'image_height', 'coordinate_convention', 'velocity_convention',
+                                'max_observation_age_sec', 'ball_source_topic', 'source_timestamp_policy',
+                                'missing_observation_policy')
+                }
 
         T = action_full.shape[0]
         for anchor_t in range(T - 1):
             history_indices = compute_history_indices(anchor_t, history_offsets)
             qpos_histories.append(qpos_full[history_indices].reshape(-1))
+            if input_modality == 'sparse_ball':
+                sparse_histories.append(sparse_full[history_indices])
 
             future_end = min(T, anchor_t + 1 + chunk_size)
             future_abs = action_full[anchor_t + 1:future_end, 0]
@@ -1286,8 +1323,20 @@ def get_intercept_norm_stats(
         'action_first_target_offset': 1,
         'action_positive_direction': 'robot_base_positive_x',
         'action_units': 'm',
-        'camera_names': ['rgb'] if str(input_modality) == 'rgb' else ['event'],
+        'camera_names': {'rgb': ['rgb'], 'event': ['event'], 'sparse_ball': ['sparse_ball']}[str(input_modality)],
     }
+
+    if str(input_modality) == 'sparse_ball':
+        values = np.concatenate(sparse_histories, axis=0)
+        stats['sparse_mean'] = values.mean(axis=0).astype(np.float32)
+        stats['sparse_std'] = values.std(axis=0).clip(1e-2, np.inf).astype(np.float32)
+        stats['sparse_feature_dim'] = 6
+        stats['sparse_feature_names'] = list(SPARSE_BALL_FEATURE_NAMES)
+        stats['sparse_history_offsets'] = list(history_offsets)
+        stats['sparse_history_length'] = 3
+        stats['image_channels'] = 0
+        stats['image_normalization'] = 'none'
+        stats.update(sparse_checkpoint_metadata)
 
     if str(input_modality) == 'event':
         if event_metadata is None:
@@ -1488,14 +1537,18 @@ def load_intercept_data(
     rgb_history_frames=3,
     visual_history_frames=None,
     history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
+    input_modality=None,
 ):
     del split_num_trials  # currently unused in interception loader
 
-    if camera_names not in (['rgb'], ['event']):
+    if camera_names not in (['rgb'], ['event'], ['sparse_ball']):
         raise ValueError(
             f"Interception requires camera_names=['rgb'] or ['event'], got {camera_names}"
         )
-    input_modality = 'event' if camera_names == ['event'] else 'rgb'
+    inferred_modality = {'rgb': 'rgb', 'event': 'event', 'sparse_ball': 'sparse_ball'}[camera_names[0]]
+    if input_modality is not None and str(input_modality) != inferred_modality:
+        raise ValueError(f"input_modality={input_modality!r} conflicts with camera_names={camera_names}")
+    input_modality = inferred_modality
     if int(raw_qpos_dim) != 7:
         raise ValueError(f"Interception raw_qpos_dim must be 7, got {raw_qpos_dim}")
     if int(state_dim) != 21:

@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, JointState
+from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float64, Float64MultiArray
 from std_srvs.srv import Trigger
 
@@ -31,6 +32,7 @@ from intercept_rollout_contract import (
 )
 from policy import ACTPolicy
 from rollout_latency_trace import RolloutLatencyTracer, image_source_stamp_ns
+from sparse_ball import BallObservation, build_sparse_history
 
 
 def stamp_to_sec(stamp) -> float:
@@ -55,6 +57,8 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(f"Using device: {self.device}")
 
         self.image_topic = args.image_topic
+        self.input_modality = str(args.input_modality)
+        self.ball_topic = args.ball_topic
         self.joint_topic = args.joint_topic
         self.current_tcp_s_topic = args.current_tcp_s_topic
         self.prediction_topic = args.prediction_topic
@@ -75,7 +79,7 @@ class FrankaActRolloutNode(Node):
         self.state_dim = args.state_dim
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
-        self.image_channels = 9
+        self.image_channels = 0 if self.input_modality == "sparse_ball" else 9
         self.image_size = int(args.image_size)
         self.max_source_buffer = int(args.max_source_buffer)
         self.max_observation_age_sec = float(args.max_observation_age_sec)
@@ -129,6 +133,9 @@ class FrankaActRolloutNode(Node):
             "rgb_history_frames": args.rgb_history_frames,
             "image_channels": self.image_channels,
             "image_size": self.image_size,
+            "input_modality": self.input_modality,
+            "sparse_feature_dim": 6,
+            "sparse_history_length": 3,
         }
 
         ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
@@ -147,6 +154,12 @@ class FrankaActRolloutNode(Node):
         self.qpos_std = stats_arrays["qpos_std"]
         self.action_mean = stats_arrays["action_mean"]
         self.action_std = stats_arrays["action_std"]
+        if self.input_modality == "sparse_ball":
+            policy_config["sparse_mean"] = stats_arrays["sparse_mean"]
+            policy_config["sparse_std"] = stats_arrays["sparse_std"]
+            self.ball_image_width = int(stats["image_width"])
+            self.ball_image_height = int(stats["image_height"])
+            self.sparse_max_observation_age = float(stats["max_observation_age_sec"])
 
         self.policy = ACTPolicy(policy_config)
         loading_status = self.policy.load_state_dict(torch.load(ckpt_path, map_location=self.device))
@@ -179,11 +192,14 @@ class FrankaActRolloutNode(Node):
             enabled=bool(args.enable_latency_trace),
             topic=str(args.latency_trace_topic),
             run_id=str(args.latency_run_id),
-            modality="rgb",
+            modality=self.input_modality,
         )
         self._active_latency_trace = None
 
-        self.create_subscription(Image, self.image_topic, self.image_cb, 10)
+        if self.input_modality == "sparse_ball":
+            self.create_subscription(PointStamped, self.ball_topic, self.ball_cb, 10)
+        else:
+            self.create_subscription(Image, self.image_topic, self.image_cb, 10)
         self.create_subscription(JointState, self.joint_topic, self.joint_cb, 10)
         current_tcp_s_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(
@@ -200,7 +216,8 @@ class FrankaActRolloutNode(Node):
 
         self.timer = self.create_timer(1.0 / self.fps, self.timer_cb)
 
-        self.get_logger().info(f"image_topic={self.image_topic}")
+        self.get_logger().info(f"input_modality={self.input_modality}")
+        self.get_logger().info(f"source_topic={self.ball_topic if self.input_modality == 'sparse_ball' else self.image_topic}")
         self.get_logger().info(f"joint_topic={self.joint_topic}")
         self.get_logger().info(f"current_tcp_s_topic={self.current_tcp_s_topic}")
         self.get_logger().info(f"temporal_agg_reset_service={self.temporal_agg_reset_service}")
@@ -243,6 +260,10 @@ class FrankaActRolloutNode(Node):
         except Exception:
             t = self.get_clock().now().nanoseconds * 1e-9
         self._append_monotonic("RGB", self.rgb_buffer, t, msg)
+
+    def ball_cb(self, msg: PointStamped) -> None:
+        t = stamp_to_sec(msg.header.stamp)
+        self._append_monotonic("sparse_ball", self.rgb_buffer, t, msg)
 
     def joint_cb(self, msg: JointState) -> None:
         try:
@@ -342,14 +363,15 @@ class FrankaActRolloutNode(Node):
             dtype=torch.float32,
             device=self.device,
         )
-        warmup_image = torch.zeros(
-            (
+        warmup_shape = ((1, 3, 6) if self.input_modality == "sparse_ball" else (
                 1,                    # batch
                 1,                    # one logical camera
                 self.image_channels,  # 9 for 3 RGB history frames
                 self.image_size,
                 self.image_size,
-            ),
+            ))
+        warmup_image = torch.zeros(
+            warmup_shape,
             dtype=torch.float32,
             device=self.device,
         )
@@ -445,11 +467,18 @@ class FrankaActRolloutNode(Node):
 
         selected_rgb_msgs = [rgb_messages[index] for index in sync.history_indices]
         history_source_stamp_ns = [image_source_stamp_ns(msg) for msg in selected_rgb_msgs]
-        rgb_frames = [
-            self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
-            for msg in selected_rgb_msgs
-        ]
-        image_np = build_rgb_history_tensor(rgb_frames, self.image_size)
+        if self.input_modality == "sparse_ball":
+            observations = [BallObservation(ts, float(msg.point.x), float(msg.point.y))
+                            for ts, msg in self.rgb_buffer]
+            image_np = build_sparse_history(
+                observations, rgb_timestamps, len(rgb_timestamps) - 1,
+                self.ball_image_width, self.ball_image_height, self.sparse_max_observation_age,
+            )[None, ...]
+            self._trace_mark("sparse_observation_selection_and_construction",
+                             ball_source_timestamp_ns=history_source_stamp_ns[-1])
+        else:
+            rgb_frames = [self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8") for msg in selected_rgb_msgs]
+            image_np = build_rgb_history_tensor(rgb_frames, self.image_size)
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         anchor_observation_timestamp = sync.rgb_timestamps[-1]
@@ -702,7 +731,7 @@ class FrankaActRolloutNode(Node):
         valid = False
         rejection_reason = ""
         if not self.ready():
-            rejection_reason = "waiting for RGB, JointState, and current_tcp_s streams"
+            rejection_reason = f"waiting for {self.input_modality}, JointState, and current_tcp_s streams"
             self._reject(rejection_reason)
             self.latency_tracer.finish(trace, valid=False, rejection_reason=rejection_reason)
             self._active_latency_trace = None
@@ -736,6 +765,8 @@ def main():
     parser.add_argument("--stats_name", type=str, default="dataset_stats.pkl")
 
     parser.add_argument("--image_topic", type=str, default="/top_cam/camera/color/image_raw")
+    parser.add_argument("--input_modality", choices=["rgb", "sparse_ball"], default="rgb")
+    parser.add_argument("--ball_topic", type=str, default="/ball_tracker2/ball_2d_px")
     parser.add_argument("--joint_topic", type=str, default="/joint_states")
     parser.add_argument("--current_tcp_s_topic", type=str, default="/middle_line/current_tcp_s")
     parser.add_argument("--prediction_topic", type=str, default="/act/intercept_prediction_chunk_abs_s")
@@ -769,7 +800,7 @@ def main():
     parser.add_argument("--chunk_size", type=int, default=30)
     parser.add_argument("--rgb_history_frames", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=320)
-    parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb"])
+    parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb", "sparse_ball"])
 
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--kl_weight", type=int, default=10)
@@ -826,6 +857,7 @@ def main():
     parser.set_defaults(use_bce_last_action_dim=False)
 
     args = parser.parse_args()
+    args.camera_name = args.input_modality
     try:
         args.temporal_agg_mode = resolve_temporal_agg_mode(
             temporal_agg_mode=args.temporal_agg_mode,

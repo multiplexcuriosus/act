@@ -45,6 +45,9 @@ def get_args_parser():
     parser.add_argument('--camera_names', default=[], type=list, # will be overridden
                         help="A list of camera names")
     parser.add_argument('--event_channel_selection', default=None, type=int)
+    parser.add_argument('--input_modality', default='rgb', choices=('rgb', 'event', 'sparse_ball'))
+    parser.add_argument('--sparse_feature_dim', default=6, type=int)
+    parser.add_argument('--sparse_history_length', default=3, type=int)
 
     # * Transformer
     parser.add_argument('--enc_layers', default=4, type=int, # will be overridden
@@ -113,6 +116,7 @@ def build_ACT_model_and_optimizer(args_override):
             "lr": args.lr_backbone,
         },
     ]
+    param_dicts = [group for group in param_dicts if group["params"]]
     optimizer = torch.optim.AdamW(
         param_dicts,
         lr=args.lr,
@@ -144,4 +148,3 @@ def build_CNNMLP_model_and_optimizer(args_override):
                                   weight_decay=args.weight_decay)
 
     return model, optimizer
-

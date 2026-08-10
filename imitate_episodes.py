@@ -47,7 +47,7 @@ def resolve_device(device_override=None):
 
 
 def validate_camera_names(camera_names):
-    allowed_single = [["rgb"], ["event"]]
+    allowed_single = [["rgb"], ["event"], ["sparse_ball"]]
     allowed_dual = ["rgb", "event"]
 
     if camera_names in allowed_single:
@@ -64,7 +64,7 @@ def validate_camera_names(camera_names):
 
     raise ValueError(
         f"Unsupported camera_names={camera_names}. "
-        "Allowed: ['rgb'], ['event'], or ['rgb', 'event']."
+        "Allowed: ['rgb'], ['event'], ['sparse_ball'], or ['rgb', 'event']."
     )
 
 
@@ -94,7 +94,7 @@ def validate_visual_history_settings(
             f"Interception mode requires visual_history_frames=3 with offsets {list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)}, got {visual_history_frames}"
         )
     if data_mode == 'intercept':
-        if camera_names not in (['rgb'], ['event']):
+        if camera_names not in (['rgb'], ['event'], ['sparse_ball']):
             raise ValueError(
                 f"Interception mode currently supports only a single camera modality, got {camera_names}"
             )
@@ -198,6 +198,12 @@ def _validate_eval_image_config(config, stats):
     policy_config['image_channels'] = configured_image_channels
     if configured_input_modality == 'event':
         policy_config['image_normalization'] = 'shifted_3chef_centered'
+    elif configured_input_modality == 'sparse_ball':
+        policy_config['image_normalization'] = 'none'
+        policy_config['sparse_feature_dim'] = int(stats['sparse_feature_dim'])
+        policy_config['sparse_history_length'] = len(stats['sparse_history_offsets'])
+        policy_config['sparse_mean'] = stats['sparse_mean']
+        policy_config['sparse_std'] = stats['sparse_std']
     else:
         policy_config['image_normalization'] = 'imagenet'
 
@@ -229,7 +235,6 @@ def _validate_intercept_checkpoint_metadata(config, stats):
         'visual_frame_order': 'oldest_to_newest',
         'qpos_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
         'qpos_flatten_order': 'oldest_to_newest',
-        'image_channels': 9,
         'action_type': 'measured_tcp_s_delta',
         'action_representation': 'future_delta_relative_to_anchor',
         'action_anchor_offset': 0,
@@ -237,6 +242,14 @@ def _validate_intercept_checkpoint_metadata(config, stats):
         'action_positive_direction': 'robot_base_positive_x',
         'action_units': 'm',
     }
+    if configured_input_modality == 'sparse_ball':
+        required_equal.update({
+            'sparse_feature_dim': 6,
+            'sparse_feature_names': ['u', 'v', 'du_dt', 'dv_dt', 'valid', 'observation_age'],
+            'sparse_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
+        })
+    else:
+        required_equal['image_channels'] = 9
 
     legacy_key_mapping = {
         'visual_history_frames': 'rgb_history_frames',
@@ -258,9 +271,9 @@ def _validate_intercept_checkpoint_metadata(config, stats):
                 f"Interception checkpoint metadata mismatch for {key}: expected {expected!r}, found {value!r}"
             )
 
-    if saved_input_modality not in ('rgb', 'event'):
+    if saved_input_modality not in ('rgb', 'event', 'sparse_ball'):
         raise ValueError(f"Unsupported saved interception modality: {saved_input_modality!r}")
-    if configured_input_modality not in ('rgb', 'event'):
+    if configured_input_modality not in ('rgb', 'event', 'sparse_ball'):
         raise ValueError(f"Unsupported configured interception modality: {configured_input_modality!r}")
     if configured_input_modality != saved_input_modality:
         raise ValueError(
@@ -268,14 +281,15 @@ def _validate_intercept_checkpoint_metadata(config, stats):
             f'configured={configured_input_modality}, saved={saved_input_modality}'
         )
 
-    expected_camera_names = ['event'] if configured_input_modality == 'event' else ['rgb']
+    expected_camera_names = [configured_input_modality]
     if configured_camera_names != expected_camera_names:
         raise ValueError(
             'Configured camera_names do not match interception modality: '
             f'camera_names={configured_camera_names}, modality={configured_input_modality}'
         )
 
-    expected_image_norm = 'shifted_3chef_centered' if configured_input_modality == 'event' else 'imagenet'
+    expected_image_norm = ('none' if configured_input_modality == 'sparse_ball' else
+                           ('shifted_3chef_centered' if configured_input_modality == 'event' else 'imagenet'))
     saved_image_norm = stats.get('image_normalization', expected_image_norm)
     if saved_image_norm != expected_image_norm:
         raise ValueError(
@@ -311,8 +325,9 @@ def _validate_intercept_checkpoint_metadata(config, stats):
         raise ValueError(f"Interception policy state_dim must be 21, got {policy_config.get('state_dim')}")
     if int(policy_config.get('action_dim')) != 1:
         raise ValueError(f"Interception policy action_dim must be 1, got {policy_config.get('action_dim')}")
-    if int(policy_config.get('image_channels')) != 9:
-        raise ValueError(f"Interception policy image_channels must be 9, got {policy_config.get('image_channels')}")
+    expected_channels = 0 if configured_input_modality == 'sparse_ball' else 9
+    if int(policy_config.get('image_channels')) != expected_channels:
+        raise ValueError(f"Interception policy image_channels must be {expected_channels}, got {policy_config.get('image_channels')}")
     if int(policy_config.get('visual_history_frames', 3)) != 3:
         raise ValueError(
             f"Interception policy visual_history_frames must be 3, got {policy_config.get('visual_history_frames')}"
@@ -352,11 +367,12 @@ def main(args):
     )
     rgb_history_frames = visual_history_frames  # legacy alias kept for compatibility
     event_channel_selection = args['event_channel_selection']
-    input_modality = 'event' if camera_names == ['event'] else 'rgb'
+    input_modality = camera_names[0] if camera_names in (['rgb'], ['event'], ['sparse_ball']) else 'rgb'
     visual_history_offsets = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT) if visual_history_frames == 3 else [0]
     visual_frame_order = 'oldest_to_newest'
     channels_per_visual_frame = 3
-    image_normalization = 'shifted_3chef_centered' if input_modality == 'event' else 'imagenet'
+    image_normalization = ('none' if input_modality == 'sparse_ball' else
+                           ('shifted_3chef_centered' if input_modality == 'event' else 'imagenet'))
     if event_channel_selection is not None:
         if camera_names != ['event']:
             raise NotImplementedError(
@@ -364,6 +380,9 @@ def main(args):
             )
         event_channel_indices = [event_channel_selection - 1]
         image_channels = 1
+    elif input_modality == 'sparse_ball':
+        event_channel_indices = None
+        image_channels = 0
     elif input_modality == 'rgb':
         event_channel_indices = None
         image_channels = channels_per_visual_frame * visual_history_frames
@@ -419,11 +438,11 @@ def main(args):
             raise ValueError(
                 f"--visual_history_frames must resolve to 3 when --data_mode intercept, got {visual_history_frames}"
             )
-        if camera_names not in (['rgb'], ['event']):
-            raise ValueError(f"--data_mode intercept requires --camera_names rgb or event, got {camera_names}")
+        if camera_names not in (['rgb'], ['event'], ['sparse_ball']):
+            raise ValueError(f"--data_mode intercept requires --camera_names rgb, event, or sparse_ball, got {camera_names}")
         if event_channel_selection is not None:
             raise ValueError('--event_channel_selection is not supported for interception mode.')
-        if image_channels != 9:
+        if input_modality != 'sparse_ball' and image_channels != 9:
             raise ValueError(f"Interception image_channels must be 9, got {image_channels}")
     elif data_mode == 'pose':
         # Keep existing ACTTask pose default while allowing override.
@@ -482,6 +501,8 @@ def main(args):
                          'rgb_history_frames': rgb_history_frames,
                          'rgb_history_offsets': list(visual_history_offsets),
                          'image_channels': image_channels,
+                         'sparse_feature_dim': 6,
+                         'sparse_history_length': 3,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -631,7 +652,11 @@ def main(args):
             rgb_history_frames=rgb_history_frames,
             visual_history_frames=visual_history_frames,
             history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
+            input_modality=input_modality,
         )
+        if input_modality == 'sparse_ball':
+            policy_config['sparse_mean'] = stats['sparse_mean']
+            policy_config['sparse_std'] = stats['sparse_std']
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
 
@@ -645,7 +670,10 @@ def main(args):
             f'action={tuple(batch_action.shape)}, '
             f'is_pad={tuple(batch_is_pad.shape)}'
         )
-        assert batch_image.ndim == 5 and batch_image.shape[1] == 1 and batch_image.shape[2] == 9, batch_image.shape
+        if input_modality == 'sparse_ball':
+            assert batch_image.ndim == 3 and tuple(batch_image.shape[1:]) == (3, 6), batch_image.shape
+        else:
+            assert batch_image.ndim == 5 and batch_image.shape[1] == 1 and batch_image.shape[2] == 9, batch_image.shape
         assert batch_qpos.ndim == 2 and batch_qpos.shape[1] == 21, batch_qpos.shape
         assert batch_action.ndim == 3 and batch_action.shape[2] == 1, batch_action.shape
         assert batch_action.shape[1] == args['chunk_size'], batch_action.shape
@@ -658,7 +686,7 @@ def main(args):
 
         assert int(policy_config['state_dim']) == 21, policy_config['state_dim']
         assert int(policy_config['action_dim']) == 1, policy_config['action_dim']
-        assert int(policy_config['image_channels']) == 9, policy_config['image_channels']
+        assert int(policy_config['image_channels']) == (0 if input_modality == 'sparse_ball' else 9), policy_config['image_channels']
         assert bool(policy_config['use_bce_last_action_dim']) is False, policy_config['use_bce_last_action_dim']
 
     # save dataset stats

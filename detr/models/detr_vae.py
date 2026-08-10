@@ -33,7 +33,8 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, action_dim, num_queries, camera_names):
+    def __init__(self, backbones, transformer, encoder, state_dim, action_dim, num_queries, camera_names,
+                 input_modality='rgb', sparse_feature_dim=6, sparse_history_length=3):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -50,10 +51,22 @@ class DETRVAE(nn.Module):
         self.transformer = transformer
         self.encoder = encoder
         hidden_dim = transformer.d_model
+        self.input_modality = str(input_modality)
+        self.sparse_feature_dim = int(sparse_feature_dim)
+        self.sparse_history_length = int(sparse_history_length)
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        if backbones is not None:
+        if self.input_modality == 'sparse_ball':
+            if backbones:
+                raise ValueError('sparse_ball must not instantiate a visual backbone')
+            self.backbones = None
+            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
+            self.sparse_input_proj = nn.Sequential(
+                nn.Linear(self.sparse_feature_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.sparse_pos_embed = nn.Embedding(self.sparse_history_length, hidden_dim)
+        elif backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
@@ -115,7 +128,18 @@ class DETRVAE(nn.Module):
             latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
             latent_input = self.latent_out_proj(latent_sample)
 
-        if self.backbones is not None:
+        if self.input_modality == 'sparse_ball':
+            if image.ndim != 3 or tuple(image.shape[1:]) != (self.sparse_history_length, self.sparse_feature_dim):
+                raise ValueError(
+                    f'sparse_ball input must have shape [B,{self.sparse_history_length},{self.sparse_feature_dim}], got {tuple(image.shape)}'
+                )
+            sparse = self.sparse_input_proj(image).transpose(1, 2).unsqueeze(2)
+            # Transformer repeats positional encodings across the batch internally.
+            pos = self.sparse_pos_embed.weight.transpose(0, 1).unsqueeze(0).unsqueeze(2)
+            proprio_input = self.input_proj_robot_state(qpos)
+            hs = self.transformer(sparse, None, self.query_embed.weight, pos, latent_input,
+                                  proprio_input, self.additional_pos_embed.weight)[0]
+        elif self.backbones is not None:
             # Image observation features and position embeddings
             all_cam_features = []
             all_cam_pos = []
@@ -236,9 +260,11 @@ def build(args):
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
+    input_modality = getattr(args, 'input_modality', 'rgb')
     backbones = []
-    backbone = build_backbone(args)
-    backbones.append(backbone)
+    if input_modality != 'sparse_ball':
+        backbone = build_backbone(args)
+        backbones.append(backbone)
 
     transformer = build_transformer(args)
 
@@ -252,6 +278,9 @@ def build(args):
         action_dim=action_dim,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
+        input_modality=input_modality,
+        sparse_feature_dim=getattr(args, 'sparse_feature_dim', 6),
+        sparse_history_length=getattr(args, 'sparse_history_length', 3),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -282,4 +311,3 @@ def build_cnnmlp(args):
     print("number of parameters: %.2fM" % (n_parameters/1e6,))
 
     return model
-
