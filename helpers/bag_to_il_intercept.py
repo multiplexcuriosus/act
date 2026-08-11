@@ -34,6 +34,7 @@ from raw_event_hdf5 import RawEventStore, resolve_recording_dir
 DEFAULT_RGB_TOPIC = "auto"
 DEFAULT_RGB_TOPIC_RAW = "/top_cam/camera/color/image_raw"
 DEFAULT_RGB_TOPIC_COMPRESSED = "/top_cam/camera/color/image_raw/compressed"
+DEFAULT_RGB_2D_TOPIC = "/ball_tracker2/ball_2d_px"
 DEFAULT_JOINT_TOPIC = "/joint_states"
 DEFAULT_EPISODE_TOPIC = "/episode/control"
 DEFAULT_CURRENT_TCP_S_TOPIC = "/middle_line/current_tcp_s"
@@ -45,6 +46,7 @@ DEFAULT_GOTO_S_TARGET_BASE_TOPIC = (
 RAW_IMAGE_TYPE = "sensor_msgs/msg/Image"
 COMPRESSED_IMAGE_TYPE = "sensor_msgs/msg/CompressedImage"
 FLOAT64_TYPE = "std_msgs/msg/Float64"
+POINT_STAMPED_TYPE = "geometry_msgs/msg/PointStamped"
 
 ARM_JOINT_NAMES = (
     "right_fr3_joint1",
@@ -69,6 +71,7 @@ class Topics:
     current_tcp_s: str
     goto_s: str
     goto_s_target_base: str
+    rgb_2d: str = DEFAULT_RGB_2D_TOPIC
 
 
 @dataclass
@@ -168,6 +171,7 @@ def validate_topics(
     topics: Topics,
     collect_goto_s_debug: bool,
     collect_target_base_debug: bool,
+    collect_rgb_2d: bool = True,
 ) -> Tuple[bool, bool]:
     required = {topics.rgb, topics.joint, topics.episode, topics.current_tcp_s}
     missing = sorted(required - set(types))
@@ -194,6 +198,23 @@ def validate_topics(
 
     goto_s_available = topics.goto_s in types
     target_base_available = topics.goto_s_target_base in types
+    rgb_2d_available = topics.rgb_2d in types
+
+    if collect_rgb_2d and rgb_2d_available:
+        rgb_2d_type = types[topics.rgb_2d]
+        if rgb_2d_type != POINT_STAMPED_TYPE:
+            log(
+                f"[WARNING] optional RGB 2D topic {topics.rgb_2d} has type "
+                f"{rgb_2d_type}, expected {POINT_STAMPED_TYPE}; writing invalid RGB 2D samples"
+            )
+            rgb_2d_available = False
+        else:
+            log(f"[INFO] {topics.rgb_2d} :: {rgb_2d_type}")
+    elif collect_rgb_2d:
+        log(
+            f"[INFO] optional RGB 2D topic is absent: {topics.rgb_2d}; "
+            "writing invalid RGB 2D samples"
+        )
 
     if collect_goto_s_debug and not goto_s_available:
         log(
@@ -412,18 +433,23 @@ def required_data_topics(
     topics: Topics,
     collect_goto_s_debug: bool,
     collect_target_base_debug: bool,
+    collect_rgb_2d: bool = False,
 ) -> List[str]:
     tracked = [topics.rgb, topics.joint, topics.current_tcp_s]
     if collect_goto_s_debug:
         tracked.append(topics.goto_s)
     if collect_target_base_debug:
         tracked.append(topics.goto_s_target_base)
+    if collect_rgb_2d:
+        tracked.append(topics.rgb_2d)
     return tracked
 
 def create_episode_buffer() -> Dict[str, Any]:
     return {
         "rgb_t": [],
         "rgb_msg": [],
+        "rgb_2d_t": [],
+        "rgb_2d_px": [],
         "joint_t": [],
         "qpos": [],
         "current_tcp_s_t": [],
@@ -445,6 +471,9 @@ def ingest_episode_message(
     if topic == topics.rgb:
         data["rgb_t"].append(timestamp)
         data["rgb_msg"].append(msg)
+    elif topic == topics.rgb_2d:
+        data["rgb_2d_t"].append(timestamp)
+        data["rgb_2d_px"].append([float(msg.point.x), float(msg.point.y)])
     elif topic == topics.joint:
         data["joint_t"].append(timestamp)
         data["qpos"].append(arm_qpos(msg.name, msg.position))
@@ -471,6 +500,8 @@ def finalize_episode(
     compression: str,
     overwrite: bool,
     collect_started_wall: float,
+    rgb_2d_enabled: bool = True,
+    max_rgb_2d_age_sec: float = 0.10,
     raw_event_store: Optional[RawEventStore] = None,
     raw_events_h5: Optional[str] = None,
     event_frame_windows_ms: Tuple[float, float, float] = (50.0, 100.0, 200.0),
@@ -508,6 +539,8 @@ def finalize_episode(
         episode=episode,
         fps=fps,
         max_current_tcp_s_age_sec=max_current_tcp_s_age_sec,
+        rgb_2d_enabled=rgb_2d_enabled,
+        max_rgb_2d_age_sec=max_rgb_2d_age_sec,
         raw_event_store=raw_event_store,
         event_frame_windows_ms=event_frame_windows_ms,
         event_frame_mode=event_frame_mode,
@@ -531,6 +564,7 @@ def finalize_episode(
         fps=fps,
         compression=compression,
         overwrite=overwrite,
+        max_rgb_2d_age_sec=max_rgb_2d_age_sec,
         raw_events_h5=raw_events_h5,
         event_frame_windows_ms=event_frame_windows_ms,
         event_frame_mode=event_frame_mode,
@@ -609,6 +643,8 @@ def sample_episode(
     episode: EpisodeWindow,
     fps: float,
     max_current_tcp_s_age_sec: float,
+    rgb_2d_enabled: bool = False,
+    max_rgb_2d_age_sec: float = 0.10,
     raw_event_store: Optional[RawEventStore] = None,
     event_frame_windows_ms: Tuple[float, float, float] = (50.0, 100.0, 200.0),
     event_frame_mode: str = "shifted",
@@ -664,6 +700,34 @@ def sample_episode(
         [image_msg_to_rgb(data["rgb_msg"][index]) for index in rgb_indices],
         axis=0,
     ).astype(np.uint8, copy=False)
+
+    rgb_2d_px = np.zeros((grid.size, 2), dtype=np.float32)
+    rgb_valid = np.zeros((grid.size,), dtype=np.uint8)
+    if rgb_2d_enabled and data.get("rgb_2d_t"):
+        detection_times = np.asarray(data["rgb_2d_t"], dtype=np.float64)
+        detections = np.asarray(data["rgb_2d_px"], dtype=np.float32).reshape(-1, 2)
+        _validate_monotonic_non_decreasing("RGB 2D", detection_times)
+        detection_indices = np.searchsorted(detection_times, grid, side="right") - 1
+        present = detection_indices >= 0
+        if np.any(present):
+            selected = detection_indices[present]
+            points = detections[selected]
+            ages = grid[present] - detection_times[selected]
+            heights = rgb[present].shape[1]
+            widths = rgb[present].shape[2]
+            valid = (
+                np.all(np.isfinite(points), axis=1)
+                & (points[:, 0] >= 0.0)
+                & (points[:, 0] < widths)
+                & (points[:, 1] >= 0.0)
+                & (points[:, 1] < heights)
+            )
+            if max_rgb_2d_age_sec > 0.0:
+                valid &= ages <= float(max_rgb_2d_age_sec)
+            present_rows = np.flatnonzero(present)
+            valid_rows = present_rows[valid]
+            rgb_2d_px[valid_rows] = points[valid]
+            rgb_valid[valid_rows] = 1
     qpos = np.stack(
         [data["qpos"][index] for index in joint_indices], axis=0
     ).astype(np.float32, copy=False)
@@ -852,6 +916,10 @@ def sample_episode(
         "target_base_points": target_base,
     }
 
+    if rgb_2d_enabled:
+        arrays["rgb_2d_px"] = rgb_2d_px
+        arrays["rgb_valid"] = rgb_valid
+
     if event is not None:
         arrays["event"] = event
         arrays["event_source_timestamps"] = event_source_timestamps
@@ -877,6 +945,7 @@ def write_episode(
     fps: float,
     compression: str,
     overwrite: bool,
+    max_rgb_2d_age_sec: float = 0.10,
     raw_events_h5: Optional[str] = None,
     event_frame_windows_ms: Tuple[float, float, float] = (50.0, 100.0, 200.0),
     event_frame_mode: str = "shifted",
@@ -993,6 +1062,22 @@ def write_episode(
             observations.create_dataset(
                 "qpos", data=arrays["qpos"], dtype=np.float32
             )
+            if "rgb_2d_px" in arrays:
+                sparse = observations.create_group("sparse_tracking")
+                sparse.create_dataset(
+                    "rgb_2d_px", data=arrays["rgb_2d_px"], dtype=np.float32
+                )
+                sparse.create_dataset(
+                    "rgb_valid", data=arrays["rgb_valid"], dtype=np.uint8
+                )
+                sparse.attrs["rgb_source_topic"] = topics.rgb_2d
+                sparse.attrs["rgb_sampling_policy"] = (
+                    "latest_message_at_or_before_observation_timestamp"
+                )
+                sparse.attrs["rgb_max_source_age_sec"] = float(
+                    max_rgb_2d_age_sec
+                )
+                sparse.attrs["rgb_invalid_coordinate_fill"] = 0.0
             images.create_dataset(
                 "rgb",
                 data=arrays["rgb"],
@@ -1218,6 +1303,21 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--rgb_topic", default=DEFAULT_RGB_TOPIC)
+    parser.add_argument("--rgb_2d_topic", default=DEFAULT_RGB_2D_TOPIC)
+    parser.add_argument(
+        "--no-rgb-2d",
+        action="store_true",
+        help="Do not extract RGB ball detections or write sparse RGB tracking datasets.",
+    )
+    parser.add_argument(
+        "--max_rgb_2d_age_sec",
+        type=float,
+        default=0.10,
+        help=(
+            "Maximum age of a causal RGB 2D detection to mark valid. "
+            "Non-positive disables the age limit. Default: 0.10 s."
+        ),
+    )
     parser.add_argument("--joint_topic", default=DEFAULT_JOINT_TOPIC)
     parser.add_argument("--episode_topic", default=DEFAULT_EPISODE_TOPIC)
     parser.add_argument(
@@ -1284,6 +1384,9 @@ def main() -> None:
         ("event_temporal_bins", 9),
         ("event_output_height", 320),
         ("event_output_width", 320),
+        ("rgb_2d_topic", DEFAULT_RGB_2D_TOPIC),
+        ("no_rgb_2d", False),
+        ("max_rgb_2d_age_sec", 0.10),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -1317,6 +1420,7 @@ def main() -> None:
 
     topics = Topics(
         rgb=selected_rgb_topic,
+        rgb_2d=args.rgb_2d_topic,
         joint=args.joint_topic,
         episode=args.episode_topic,
         current_tcp_s=args.current_tcp_s_topic,
@@ -1329,6 +1433,11 @@ def main() -> None:
         topics,
         collect_goto_s_debug=True,
         collect_target_base_debug=not args.no_target_base,
+        collect_rgb_2d=not args.no_rgb_2d,
+    )
+    collect_rgb_2d = (
+        not args.no_rgb_2d
+        and types.get(topics.rgb_2d) == POINT_STAMPED_TYPE
     )
 
     marker_filter = apply_storage_filter(marker_reader, [topics.episode])
@@ -1361,6 +1470,7 @@ def main() -> None:
         topics=topics,
         collect_goto_s_debug=collect_goto_s_debug,
         collect_target_base_debug=collect_target_base_debug,
+        collect_rgb_2d=collect_rgb_2d,
     )
     log(f"[INFO] data filter topics: {data_topics}")
 
@@ -1433,6 +1543,8 @@ def main() -> None:
                         topics=topics,
                         fps=args.fps,
                         max_current_tcp_s_age_sec=args.max_current_tcp_s_age_sec,
+                        rgb_2d_enabled=not args.no_rgb_2d,
+                        max_rgb_2d_age_sec=args.max_rgb_2d_age_sec,
                         compression=args.compression,
                         overwrite=args.overwrite,
                         collect_started_wall=active_collect_start_wall,
@@ -1493,6 +1605,8 @@ def main() -> None:
                     topics=topics,
                     fps=args.fps,
                     max_current_tcp_s_age_sec=args.max_current_tcp_s_age_sec,
+                    rgb_2d_enabled=not args.no_rgb_2d,
+                    max_rgb_2d_age_sec=args.max_rgb_2d_age_sec,
                     compression=args.compression,
                     overwrite=args.overwrite,
                     collect_started_wall=active_collect_start_wall,

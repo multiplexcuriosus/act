@@ -151,6 +151,58 @@ class BagToIlInterceptTests(unittest.TestCase):
             data["goto_s"] = list(goto_values)
         return data
 
+    def test_rgb_2d_sampling_is_causal_and_validated(self):
+        data = self.make_sampling_data([0.0, 0.1, 0.2], [0.0, 0.1, 0.2])
+        data["rgb_2d_t"] = [0.05, 0.15]
+        data["rgb_2d_px"] = [[0.25, 0.75], [1.0, 0.5]]
+        arrays = self.mod.sample_episode(
+            data, self.make_episode(end=0.2), fps=10.0,
+            max_current_tcp_s_age_sec=1.0, rgb_2d_enabled=True,
+            max_rgb_2d_age_sec=0.10,
+        )
+        np.testing.assert_array_equal(arrays["rgb_valid"], [0, 1, 0])
+        np.testing.assert_array_equal(
+            arrays["rgb_2d_px"], [[0.0, 0.0], [0.25, 0.75], [0.0, 0.0]])
+        self.assertEqual(arrays["rgb_2d_px"].dtype, np.dtype("f4"))
+        self.assertEqual(arrays["rgb_valid"].dtype, np.dtype("u1"))
+
+        data["rgb_2d_t"] = [0.0, 0.1]
+        data["rgb_2d_px"] = [[0.5, 0.5], [np.nan, np.inf]]
+        arrays = self.mod.sample_episode(
+            data, self.make_episode(end=0.2), fps=10.0,
+            max_current_tcp_s_age_sec=1.0, rgb_2d_enabled=True,
+            max_rgb_2d_age_sec=0.05,
+        )
+        np.testing.assert_array_equal(arrays["rgb_valid"], [1, 0, 0])
+        np.testing.assert_array_equal(
+            arrays["rgb_2d_px"], [[0.5, 0.5], [0.0, 0.0], [0.0, 0.0]])
+
+    def test_rgb_2d_write_default_and_opt_out_schema(self):
+        data = self.make_sampling_data([0.0, 0.1, 0.2], [0.0, 0.1, 0.2])
+        data["rgb_2d_t"] = []
+        data["rgb_2d_px"] = []
+        episode = self.make_episode(end=0.2)
+        topics = self.make_topics()
+        with tempfile.TemporaryDirectory() as directory:
+            for enabled, filename in ((True, "default.hdf5"), (False, "optout.hdf5")):
+                arrays = self.mod.sample_episode(
+                    data, episode, fps=10.0, max_current_tcp_s_age_sec=1.0,
+                    rgb_2d_enabled=enabled,
+                )
+                path = os.path.join(directory, filename)
+                self.mod.write_episode(
+                    path, arrays, episode, topics, fps=10.0,
+                    compression="none", overwrite=False,
+                )
+                with h5py.File(path, "r") as result:
+                    if enabled:
+                        sparse = result["observations/sparse_tracking"]
+                        self.assertEqual(sparse["rgb_2d_px"].shape, (3, 2))
+                        self.assertEqual(sparse["rgb_valid"].shape, (3,))
+                        self.assertEqual(int(np.sum(sparse["rgb_valid"][:])), 0)
+                    else:
+                        self.assertNotIn("sparse_tracking", result["observations"])
+
     @staticmethod
     def make_raw_events_h5(
         path: str,
