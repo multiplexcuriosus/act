@@ -2,8 +2,8 @@
 set -euo pipefail
 
 DATASETS=(
-  "/home/dyros/Data/jg_data/hdf5/event_only/voxel/hdf5_20260727_215525_xyt200_s320_t9_signed"
-  "/home/dyros/Data/jg_data/hdf5/event_only/voxel/hdf5_20260728_225008_xyt200_s320_t9_signed"
+  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260727_215525_preprocessed"
+  "/home/dyros/Data/jg_data/hdf5/event_only/hdf5_20260728_225008_preprocessed"
 )
 
 # HDF5 qpos remains (T, 7), but the loader concatenates:
@@ -12,7 +12,7 @@ RAW_QPOS_DIM=7
 STATE_DIM=21
 ACTION_DIM=1
 
-VISUAL_HISTORY_FRAMES=1
+VISUAL_HISTORY_FRAMES=3
 CHUNK_SIZE=30
 
 DATASET_NAME="$(basename "${DATASETS[0]}")"
@@ -39,7 +39,7 @@ for IMAGE_SIZE in 320; do
               ;;
             event)
               CAM_NAMES=(event)
-              CAM_TAG="xyt200_s320_t9_signed"
+              CAM_TAG="3chef_hist3_masked_cropped_s200"
               ;;
             *)
               echo "Unsupported CAM_MODE: $CAM_MODE" >&2
@@ -47,7 +47,7 @@ for IMAGE_SIZE in 320; do
               ;;
           esac
 
-          RUN_NAME="intercept_delta_s_cam_${CAM_TAG}_hist_${VISUAL_HISTORY_FRAMES}_chunk_${CHUNK_SIZE}_lr_${LR}_bs_${BS}_kl_${KL}_imgsize_${IMAGE_SIZE}"
+          RUN_NAME="intercept_delta_sexit_${CAM_TAG}_hist_${VISUAL_HISTORY_FRAMES}_chunk_${CHUNK_SIZE}_lr_${LR}_bs_${BS}_kl_${KL}_imgsize_${IMAGE_SIZE}"
           CKPT_DIR="${BASE_CKPT}/${RUN_NAME}"
           mkdir -p "$CKPT_DIR"
 
