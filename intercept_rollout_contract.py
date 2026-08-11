@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from sparse_ball import SPARSE_FEATURE_NAMES, validate_sparse_checkpoint_contract
+
 INTERCEPT_HISTORY_OFFSETS = (-6, -3, 0)
 ARM_JOINT_NAMES = (
     "right_fr3_joint1",
@@ -344,7 +346,7 @@ def validate_intercept_stats_and_config(
         expected_metadata.pop("image_channels")
         expected_metadata.update({
             "input_modality": "sparse_ball", "sparse_feature_dim": 4,
-            "sparse_feature_names": ["u_norm", "v_norm", "valid", "observation_age"],
+            "sparse_feature_names": list(SPARSE_FEATURE_NAMES),
         })
         history_length = stats.get("sparse_history_length")
         history_offsets = stats.get("sparse_history_offsets_sec")
@@ -366,9 +368,9 @@ def validate_intercept_stats_and_config(
                 stats["sparse_source"] = topic_sources[metadata_topic]
         aliases = {
             "sparse_source": ("sparse_source",),
-            "max_observation_age_sec": ("max_observation_age_sec",),
-            "image_width": ("image_width", "sparse_image_width"),
-            "image_height": ("image_height", "sparse_image_height"),
+            "max_observation_age_sec": ("sparse_max_observation_age_sec",),
+            "image_width": ("sparse_image_width",),
+            "image_height": ("sparse_image_height",),
         }
         validated = []
         unavailable = []
@@ -394,6 +396,13 @@ def validate_intercept_stats_and_config(
                 "Sparse checkpoint metadata cannot identify rgb versus event source; "
                 "refusing an ambiguous rollout"
             )
+        validate_sparse_checkpoint_contract(
+            stats,
+            runtime.get("sparse_source"),
+            runtime.get("image_width"),
+            runtime.get("image_height"),
+            runtime.get("max_observation_age_sec"),
+        )
         arrays["_validated_metadata"] = np.asarray(validated, dtype=object)
         arrays["_unavailable_metadata"] = np.asarray(unavailable, dtype=object)
     elif modality not in ("rgb", "event"):
@@ -406,7 +415,9 @@ def validate_intercept_stats_and_config(
                 f"Interception checkpoint metadata mismatch for {key}: "
                 f"expected {expected!r}, found {stats[key]!r}"
             )
-    if "chunk_size" in stats and int(stats["chunk_size"]) != int(expected_chunk_size):
+    if "chunk_size" not in stats:
+        raise ValueError("Missing interception checkpoint metadata in dataset_stats.pkl: chunk_size")
+    if int(stats["chunk_size"]) != int(expected_chunk_size):
         raise ValueError(
             f"Checkpoint chunk_size mismatch: requested {expected_chunk_size}, "
             f"checkpoint {stats['chunk_size']}"

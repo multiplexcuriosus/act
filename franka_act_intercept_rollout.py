@@ -31,10 +31,8 @@ from intercept_rollout_contract import (
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
 )
-from policy import ACTPolicy
 from rollout_latency_trace import RolloutLatencyTracer, image_source_stamp_ns
-from sparse_ball import (BallObservation, build_sparse_history, history_target_times,
-                         select_sparse_observation)
+from sparse_ball import SparsePoint, construct_causal_sparse_history
 
 
 SPARSE_TOPICS = {
@@ -68,6 +66,13 @@ def rollout_subscription_types(input_modality: str) -> Tuple[str, ...]:
 def skip_duplicate_source_frame(input_modality: str) -> bool:
     """Dense legacy rollout is frame-driven; sparse rollout is policy-clock driven."""
     return input_modality != "sparse_ball"
+
+
+def policy_period_sec(fps: float) -> float:
+    fps = float(fps)
+    if fps <= 0.0 or not np.isfinite(fps):
+        raise ValueError(f"fps must be finite and > 0, got {fps}")
+    return 1.0 / fps
 
 
 def create_visual_subscription(node, input_modality: str, image_topic: str,
@@ -158,10 +163,13 @@ class FrankaActRolloutNode(Node):
         self._last_reject_log_sec = 0.0
         self._last_reject_reason = ""
         self._last_attempted_anchor_ns: Optional[int] = None
+        self._last_sparse_message_tick_ns: Optional[int] = None
+        self._last_sparse_diagnostics: Dict[str, object] = {}
         self._last_anchor_discontinuity_reset_reason = ""
         self._last_throttled_log_sec: Dict[str, float] = {}
         self.rollout_epoch = 0
         self.reset_anchor_floor_ns: Optional[int] = None
+        self.reset_timestamp_floor_sec: Optional[float] = None
         self._aggregation_lock = threading.Lock()
         self._policy_step_ids_by_step: Dict[int, str] = {}
 
@@ -217,8 +225,8 @@ class FrankaActRolloutNode(Node):
         if self.input_modality == "sparse_ball":
             policy_config["sparse_mean"] = stats_arrays["sparse_mean"]
             policy_config["sparse_std"] = stats_arrays["sparse_std"]
-            self.ball_image_width = int(stats["image_width"])
-            self.ball_image_height = int(stats["image_height"])
+            self.ball_image_width = int(stats["sparse_image_width"])
+            self.ball_image_height = int(stats["sparse_image_height"])
             self.sparse_max_observation_age = self.max_observation_age_sec
             validated = stats_arrays.get("_validated_metadata", np.asarray([], dtype=object)).tolist()
             unavailable = stats_arrays.get("_unavailable_metadata", np.asarray([], dtype=object)).tolist()
@@ -226,8 +234,15 @@ class FrankaActRolloutNode(Node):
                 f"Sparse checkpoint metadata validated={validated} unavailable={unavailable}"
             )
 
+        from policy import ACTPolicy
+
         self.policy = ACTPolicy(policy_config)
-        loading_status = self.policy.load_state_dict(torch.load(ckpt_path, map_location=self.device))
+        checkpoint_state = torch.load(ckpt_path, map_location=self.device)
+        if self.input_modality == "sparse_ball" and any(
+            "backbone" in str(key).lower() for key in checkpoint_state
+        ):
+            raise ValueError("Sparse checkpoint contains a dense visual backbone")
+        loading_status = self.policy.load_state_dict(checkpoint_state)
         self.get_logger().info(f"Checkpoint load status: {loading_status}")
         self.policy.to(self.device)
         self.policy.eval()
@@ -278,7 +293,7 @@ class FrankaActRolloutNode(Node):
             self._handle_reset_temporal_aggregation,
         )
 
-        self.timer = self.create_timer(1.0 / self.fps, self.timer_cb)
+        self.timer = self.create_timer(policy_period_sec(self.fps), self.timer_cb)
 
         self.get_logger().info(f"input_modality={self.input_modality}")
         if self.input_modality == "sparse_ball":
@@ -325,11 +340,16 @@ class FrankaActRolloutNode(Node):
             t = stamp_to_sec(msg.header.stamp)
         except Exception:
             t = self.get_clock().now().nanoseconds * 1e-9
-        self._append_monotonic("RGB", self.rgb_buffer, t, msg)
+        if self.reset_timestamp_floor_sec is None or t > self.reset_timestamp_floor_sec:
+            self._append_monotonic("RGB", self.rgb_buffer, t, msg)
 
     def ball_cb(self, msg: PointStamped) -> None:
         t = stamp_to_sec(msg.header.stamp)
-        self._append_monotonic("sparse_ball", self.sparse_buffer, t, msg)
+        if not np.isfinite(t) or t <= 0.0:
+            self.get_logger().warn("Dropping sparse PointStamped with invalid header timestamp")
+            return
+        if self.reset_timestamp_floor_sec is None or t > self.reset_timestamp_floor_sec:
+            self._append_monotonic("sparse_ball", self.sparse_buffer, t, msg)
 
     def joint_cb(self, msg: JointState) -> None:
         try:
@@ -339,12 +359,13 @@ class FrankaActRolloutNode(Node):
             return
         t = stamp_to_sec(msg.header.stamp)
         if t <= 0.0:
-            t = self.get_clock().now().nanoseconds * 1e-9
             self._throttled_warn(
                 "jointstate_missing_header_stamp",
-                "JointState header timestamp unavailable; using ROS receipt time for qpos only.",
+                "Dropping JointState with missing header timestamp; causal qpos requires header.stamp.",
             )
-        self._append_monotonic("JointState", self.joint_buffer, t, qpos)
+            return
+        if self.reset_timestamp_floor_sec is None or t > self.reset_timestamp_floor_sec:
+            self._append_monotonic("JointState", self.joint_buffer, t, qpos)
 
     def current_tcp_s_cb(self, msg: Float64) -> None:
         value = float(msg.data)
@@ -355,7 +376,7 @@ class FrankaActRolloutNode(Node):
         self._append_monotonic("current_tcp_s", self.tcp_buffer, t, value)
 
     def ready(self) -> bool:
-        visual_ready = bool(self.sparse_buffer) if self.input_modality == "sparse_ball" else bool(self.rgb_buffer)
+        visual_ready = True if self.input_modality == "sparse_ball" else bool(self.rgb_buffer)
         return visual_ready and bool(self.joint_buffer) and bool(self.tcp_buffer)
 
     def _reject(self, reason: str) -> None:
@@ -489,10 +510,14 @@ class FrankaActRolloutNode(Node):
 
             discarded_entries = self._reset_temporal_aggregation("service_reset")
             clear_sparse_temporal_history(self.sparse_buffer, self.joint_buffer, self.tcp_buffer)
+            self.rgb_buffer.clear()
             self.rollout_epoch += 1
+            reset_now_sec = self.get_clock().now().nanoseconds * 1e-9
+            self.reset_timestamp_floor_sec = reset_now_sec
             self.reset_anchor_floor_ns = floor_anchor_ns
-            if floor_anchor_ns is not None:
-                self._last_attempted_anchor_ns = floor_anchor_ns
+            self._last_attempted_anchor_ns = None
+            self._last_sparse_message_tick_ns = None
+            self._last_sparse_diagnostics.clear()
 
             response.success = True
             response.message = f"rollout_epoch={self.rollout_epoch}"
@@ -582,23 +607,24 @@ class FrankaActRolloutNode(Node):
         return sync, qpos, image, anchor_timestamp_ns, history_source_stamp_ns
 
     def _build_sparse_policy_inputs(self, policy_time: float):
-        targets = history_target_times(policy_time)
-        observations = [
-            BallObservation(ts, float(msg.point.x), float(msg.point.y),
-                            bool(np.isfinite((msg.point.x, msg.point.y)).all()
-                                 and 0.0 <= float(msg.point.x) < self.ball_image_width
-                                 and 0.0 <= float(msg.point.y) < self.ball_image_height))
+        targets = tuple(policy_time + offset for offset in (-0.2, -0.1, 0.0))
+        points = [
+            SparsePoint(ts, float(msg.point.x), float(msg.point.y), 1)
             for ts, msg in self.sparse_buffer
         ]
-        selections = [
-            select_sparse_observation(observations, target, self.ball_image_width,
-                                      self.ball_image_height, self.sparse_max_observation_age)
-            for target in targets
-        ]
-        image_np = build_sparse_history(
-            observations, targets, self.ball_image_width, self.ball_image_height,
+        image_np = construct_causal_sparse_history(
+            points, policy_time, (-0.2, -0.1, 0.0),
+            self.ball_image_width, self.ball_image_height,
             self.sparse_max_observation_age,
         )[None, ...]
+        ordered_points = sorted(points, key=lambda item: item.source_timestamp)
+        point_stamps = [point.source_timestamp for point in ordered_points]
+        selected_source_timestamps = []
+        for target in targets:
+            index = select_latest_index_at_or_before(point_stamps, target)
+            selected_source_timestamps.append(
+                None if index is None else float(point_stamps[index])
+            )
         joint_timestamps = [item[0] for item in self.joint_buffer]
         qpos_samples = [item[1] for item in self.joint_buffer]
         qpos_history, qpos_timestamps = select_qpos_history_at_targets(
@@ -622,23 +648,38 @@ class FrankaActRolloutNode(Node):
             raise ValueError("Normalized qpos contains non-finite values")
         qpos = torch.from_numpy(qpos_norm).float().to(self.device).unsqueeze(0)
         image = torch.from_numpy(image_np).float().to(self.device)
-        source_stamps = [0 if item.source_timestamp is None else int(round(item.source_timestamp * 1e9))
-                         for item in selections]
-        latest_stamp = source_stamps[-1]
-        no_new = bool(latest_stamp and latest_stamp == self._last_attempted_anchor_ns)
+        source_stamps = [0 if stamp is None else int(round(stamp * 1e9))
+                         for stamp in selected_source_timestamps]
+        latest_message_ns = (None if not self.sparse_buffer
+                             else int(round(self.sparse_buffer[-1][0] * 1e9)))
+        no_new = latest_message_ns == self._last_sparse_message_tick_ns
+        self._last_sparse_message_tick_ns = latest_message_ns
+        self._last_sparse_diagnostics = {
+            "sparse_source": self.sparse_source,
+            "sparse_topic": self.ball_topic,
+            "policy_timestamp": policy_time,
+            "history_target_timestamps": targets,
+            "sparse_source_timestamps": tuple(selected_source_timestamps),
+            "sparse_observation_ages": tuple(float(value) for value in image_np[0, :, 3]),
+            "sparse_valid_flags": tuple(bool(value) for value in image_np[0, :, 2]),
+            "selected_qpos_timestamps": qpos_timestamps,
+            "selected_tcp_timestamp": float(tcp_timestamp),
+            "inference_without_new_sparse_message": no_new,
+        }
         self._trace_mark(
             "sparse_observation_selection_and_construction",
             sparse_source=self.sparse_source,
             sparse_topic=self.ball_topic,
             policy_tick_timestamp=policy_time,
             history_target_timestamps=list(targets),
-            sparse_source_timestamps=[item.source_timestamp for item in selections],
-            sparse_observation_ages=[item.observation_age for item in selections],
-            sparse_valid_flags=[item.valid for item in selections],
+            sparse_source_timestamps=list(selected_source_timestamps),
+            sparse_observation_ages=list(self._last_sparse_diagnostics["sparse_observation_ages"]),
+            sparse_valid_flags=list(self._last_sparse_diagnostics["sparse_valid_flags"]),
             selected_qpos_timestamps=list(qpos_timestamps),
+            selected_tcp_timestamp=float(tcp_timestamp),
             inference_without_new_sparse_message=no_new,
         )
-        return sync, qpos, image, latest_stamp, source_stamps
+        return sync, qpos, image, int(round(policy_time * 1e9)), source_stamps
 
     def publish_predictions(
         self,
@@ -829,8 +870,22 @@ class FrankaActRolloutNode(Node):
         now_wall = time.time()
         if (now_wall - self._last_diag_log_sec) >= self.diag_log_period_sec:
             agg_effective_age_ms = 1000.0 * agg_effective_age_frames / self.fps
+            sparse_diag = ""
+            if self.input_modality == "sparse_ball":
+                diag = self._last_sparse_diagnostics
+                sparse_diag = (
+                    f"sparse_source={diag['sparse_source']} sparse_topic={diag['sparse_topic']} "
+                    f"policy_ts={diag['policy_timestamp']:.9f} "
+                    f"history_target_ts={[round(ts, 9) for ts in diag['history_target_timestamps']]} "
+                    f"sparse_source_ts={diag['sparse_source_timestamps']} "
+                    f"sparse_ages={[round(age, 6) for age in diag['sparse_observation_ages']]} "
+                    f"sparse_valid={diag['sparse_valid_flags']} "
+                    f"tcp_ts={diag['selected_tcp_timestamp']:.9f} "
+                    f"inference_without_new_sparse={diag['inference_without_new_sparse_message']} "
+                )
             self.get_logger().info(
                 "Inference diagnostics: "
+                f"{sparse_diag}"
                 f"step={self.step_index} "
                 f"accepted={self.accepted_prediction_count} stale_post_inference={self.post_inference_stale_count} "
                 f"duplicate_tick_skips={self.duplicate_timer_tick_skip_count} "

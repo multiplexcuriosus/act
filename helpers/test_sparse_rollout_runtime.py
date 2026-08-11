@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT))
 pytest.importorskip("rclpy")
 from franka_act_intercept_rollout import (SPARSE_TOPICS, clear_sparse_temporal_history,
                                           create_visual_subscription,
+                                          policy_period_sec,
                                           resolve_sparse_topic,
                                           rollout_subscription_types,
                                           skip_duplicate_source_frame)
@@ -55,6 +56,52 @@ def test_sparse_mode_actually_creates_point_subscription_not_image():
 def test_sparse_fixed_clock_never_skips_a_duplicate_detection_timestamp():
     assert skip_duplicate_source_frame("sparse_ball") is False
     assert skip_duplicate_source_frame("rgb") is True
+    assert policy_period_sec(30) == pytest.approx(1 / 30)
+
+
+def test_sparse_readiness_does_not_require_a_detection():
+    from franka_act_intercept_rollout import FrankaActRolloutNode
+
+    node = object.__new__(FrankaActRolloutNode)
+    node.input_modality = "sparse_ball"
+    node.sparse_buffer = []
+    node.rgb_buffer = []
+    node.joint_buffer = [(1.0, object())]
+    node.tcp_buffer = [(1.0, 0.0)]
+    assert FrankaActRolloutNode.ready(node)
+
+
+def test_two_sparse_timer_ticks_infer_without_a_new_message():
+    from franka_act_intercept_rollout import FrankaActRolloutNode
+
+    class FakeTracer:
+        def begin(self, *_args, **_kwargs):
+            return object()
+        def finish(self, *_args, **_kwargs):
+            pass
+
+    class FakeNode:
+        input_modality = "sparse_ball"
+        sparse_source = "rgb"
+        sparse_buffer = []
+        rgb_buffer = []
+        running = True
+        latency_tracer = FakeTracer()
+        _active_latency_trace = None
+        calls = 0
+
+        def ready(self):
+            return True
+        def run_policy_step(self):
+            self.calls += 1
+            return True, ""
+        def _reject(self, _reason):
+            raise AssertionError("timer tick unexpectedly rejected")
+
+    node = FakeNode()
+    FrankaActRolloutNode.timer_cb(node)
+    FrankaActRolloutNode.timer_cb(node)
+    assert node.calls == 2
 
 
 def test_prediction_interface_constants_remain_unchanged():
@@ -68,3 +115,10 @@ def test_reset_clears_sparse_qpos_and_tcp_temporal_history():
     sparse, qpos, tcp = [1], [2], [3]
     clear_sparse_temporal_history(sparse, qpos, tcp)
     assert sparse == [] and qpos == [] and tcp == []
+
+
+def test_sparse_resources_and_warmup_have_no_dense_allocation():
+    source = (ROOT / "franka_act_intercept_rollout.py").read_text()
+    assert 'if args.input_modality != "sparse_ball":\n            from cv_bridge import CvBridge' in source
+    assert 'warmup_shape = ((1, 3, 4) if self.input_modality == "sparse_ball"' in source
+    assert 'create_timer(policy_period_sec(self.fps), self.timer_cb)' in source
