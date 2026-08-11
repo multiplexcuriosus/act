@@ -9,7 +9,6 @@ from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 import torch
-from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, JointState
 from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float64, Float64MultiArray
@@ -26,13 +25,63 @@ from intercept_rollout_contract import (
     denormalize_delta_chunk,
     extract_arm_qpos,
     resolve_temporal_agg_mode,
+    select_latest_index_at_or_before,
+    select_qpos_history_at_targets,
     select_sync_observation,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
 )
 from policy import ACTPolicy
 from rollout_latency_trace import RolloutLatencyTracer, image_source_stamp_ns
-from sparse_ball import BallObservation, build_sparse_history
+from sparse_ball import (BallObservation, build_sparse_history, history_target_times,
+                         select_sparse_observation)
+
+
+SPARSE_TOPICS = {
+    "rgb": "/ball_tracker2/ball_2d_px",
+    "event": "/openmv_cam/event_tracker/ball_2d_px",
+}
+SPARSE_SOURCE_DIMENSIONS = {"rgb": (1280, 720), "event": (320, 320)}
+
+
+def resolve_sparse_topic(source: str, explicit_topic: Optional[str],
+                         allow_mismatch: bool = False) -> str:
+    source = str(source)
+    if source not in SPARSE_TOPICS:
+        raise ValueError(f"sparse_source must be rgb or event, got {source!r}")
+    topic = explicit_topic or SPARSE_TOPICS[source]
+    other_source = "event" if source == "rgb" else "rgb"
+    if topic == SPARSE_TOPICS[other_source] and not allow_mismatch:
+        raise ValueError(
+            f"sparse_source={source} conflicts with sparse_topic={topic}; "
+            "use --allow_sparse_topic_source_mismatch only for an intentional override"
+        )
+    return topic
+
+
+def rollout_subscription_types(input_modality: str) -> Tuple[str, ...]:
+    if input_modality == "sparse_ball":
+        return ("geometry_msgs/msg/PointStamped", "sensor_msgs/msg/JointState", "std_msgs/msg/Float64")
+    return ("sensor_msgs/msg/Image", "sensor_msgs/msg/JointState", "std_msgs/msg/Float64")
+
+
+def skip_duplicate_source_frame(input_modality: str) -> bool:
+    """Dense legacy rollout is frame-driven; sparse rollout is policy-clock driven."""
+    return input_modality != "sparse_ball"
+
+
+def create_visual_subscription(node, input_modality: str, image_topic: str,
+                               sparse_topic: str):
+    """Create exactly one visual-input subscription for the selected modality."""
+    if input_modality == "sparse_ball":
+        return node.create_subscription(PointStamped, sparse_topic, node.ball_cb, 10)
+    return node.create_subscription(Image, image_topic, node.image_cb, 10)
+
+
+def clear_sparse_temporal_history(sparse_buffer, joint_buffer, tcp_buffer) -> None:
+    sparse_buffer.clear()
+    joint_buffer.clear()
+    tcp_buffer.clear()
 
 
 def stamp_to_sec(stamp) -> float:
@@ -52,13 +101,17 @@ class FrankaActRolloutNode(Node):
     def __init__(self, args):
         super().__init__("franka_act_rollout_intercept")
 
-        self.bridge = CvBridge()
+        self.bridge = None
+        if args.input_modality != "sparse_ball":
+            from cv_bridge import CvBridge
+            self.bridge = CvBridge()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.get_logger().info(f"Using device: {self.device}")
 
         self.image_topic = args.image_topic
         self.input_modality = str(args.input_modality)
-        self.ball_topic = args.ball_topic
+        self.sparse_source = str(args.sparse_source)
+        self.ball_topic = args.sparse_topic
         self.joint_topic = args.joint_topic
         self.current_tcp_s_topic = args.current_tcp_s_topic
         self.prediction_topic = args.prediction_topic
@@ -88,6 +141,7 @@ class FrankaActRolloutNode(Node):
         self.reject_log_period_sec = float(args.reject_log_period_sec)
 
         self.rgb_buffer: Deque[Tuple[float, Image]] = deque(maxlen=self.max_source_buffer)
+        self.sparse_buffer: Deque[Tuple[float, PointStamped]] = deque(maxlen=self.max_source_buffer)
         self.joint_buffer: Deque[Tuple[float, np.ndarray]] = deque(maxlen=self.max_source_buffer)
         self.tcp_buffer: Deque[Tuple[float, float]] = deque(maxlen=self.max_source_buffer)
 
@@ -134,8 +188,8 @@ class FrankaActRolloutNode(Node):
             "image_channels": self.image_channels,
             "image_size": self.image_size,
             "input_modality": self.input_modality,
-            "sparse_feature_dim": 6,
-            "sparse_history_length": 3,
+            "sparse_feature_dim": args.sparse_feature_dim,
+            "sparse_history_length": args.sparse_history_length,
         }
 
         ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
@@ -148,6 +202,12 @@ class FrankaActRolloutNode(Node):
             stats=stats,
             policy_config=policy_config,
             expected_chunk_size=self.chunk_size,
+            sparse_runtime={
+                "sparse_source": self.sparse_source,
+                "max_observation_age_sec": self.max_observation_age_sec,
+                "image_width": SPARSE_SOURCE_DIMENSIONS[self.sparse_source][0],
+                "image_height": SPARSE_SOURCE_DIMENSIONS[self.sparse_source][1],
+            } if self.input_modality == "sparse_ball" else None,
         )
 
         self.qpos_mean = stats_arrays["qpos_mean"]
@@ -159,7 +219,12 @@ class FrankaActRolloutNode(Node):
             policy_config["sparse_std"] = stats_arrays["sparse_std"]
             self.ball_image_width = int(stats["image_width"])
             self.ball_image_height = int(stats["image_height"])
-            self.sparse_max_observation_age = float(stats["max_observation_age_sec"])
+            self.sparse_max_observation_age = self.max_observation_age_sec
+            validated = stats_arrays.get("_validated_metadata", np.asarray([], dtype=object)).tolist()
+            unavailable = stats_arrays.get("_unavailable_metadata", np.asarray([], dtype=object)).tolist()
+            self.get_logger().info(
+                f"Sparse checkpoint metadata validated={validated} unavailable={unavailable}"
+            )
 
         self.policy = ACTPolicy(policy_config)
         loading_status = self.policy.load_state_dict(torch.load(ckpt_path, map_location=self.device))
@@ -196,10 +261,9 @@ class FrankaActRolloutNode(Node):
         )
         self._active_latency_trace = None
 
-        if self.input_modality == "sparse_ball":
-            self.create_subscription(PointStamped, self.ball_topic, self.ball_cb, 10)
-        else:
-            self.create_subscription(Image, self.image_topic, self.image_cb, 10)
+        self.visual_subscription = create_visual_subscription(
+            self, self.input_modality, self.image_topic, self.ball_topic
+        )
         self.create_subscription(JointState, self.joint_topic, self.joint_cb, 10)
         current_tcp_s_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(
@@ -217,6 +281,8 @@ class FrankaActRolloutNode(Node):
         self.timer = self.create_timer(1.0 / self.fps, self.timer_cb)
 
         self.get_logger().info(f"input_modality={self.input_modality}")
+        if self.input_modality == "sparse_ball":
+            self.get_logger().info(f"sparse_source={self.sparse_source} sparse_topic={self.ball_topic}")
         self.get_logger().info(f"source_topic={self.ball_topic if self.input_modality == 'sparse_ball' else self.image_topic}")
         self.get_logger().info(f"joint_topic={self.joint_topic}")
         self.get_logger().info(f"current_tcp_s_topic={self.current_tcp_s_topic}")
@@ -263,7 +329,7 @@ class FrankaActRolloutNode(Node):
 
     def ball_cb(self, msg: PointStamped) -> None:
         t = stamp_to_sec(msg.header.stamp)
-        self._append_monotonic("sparse_ball", self.rgb_buffer, t, msg)
+        self._append_monotonic("sparse_ball", self.sparse_buffer, t, msg)
 
     def joint_cb(self, msg: JointState) -> None:
         try:
@@ -272,6 +338,12 @@ class FrankaActRolloutNode(Node):
             self.get_logger().warn(f"Dropping JointState sample: {exc}")
             return
         t = stamp_to_sec(msg.header.stamp)
+        if t <= 0.0:
+            t = self.get_clock().now().nanoseconds * 1e-9
+            self._throttled_warn(
+                "jointstate_missing_header_stamp",
+                "JointState header timestamp unavailable; using ROS receipt time for qpos only.",
+            )
         self._append_monotonic("JointState", self.joint_buffer, t, qpos)
 
     def current_tcp_s_cb(self, msg: Float64) -> None:
@@ -283,7 +355,8 @@ class FrankaActRolloutNode(Node):
         self._append_monotonic("current_tcp_s", self.tcp_buffer, t, value)
 
     def ready(self) -> bool:
-        return bool(self.rgb_buffer) and bool(self.joint_buffer) and bool(self.tcp_buffer)
+        visual_ready = bool(self.sparse_buffer) if self.input_modality == "sparse_ball" else bool(self.rgb_buffer)
+        return visual_ready and bool(self.joint_buffer) and bool(self.tcp_buffer)
 
     def _reject(self, reason: str) -> None:
         now = time.time()
@@ -363,7 +436,7 @@ class FrankaActRolloutNode(Node):
             dtype=torch.float32,
             device=self.device,
         )
-        warmup_shape = ((1, 3, 6) if self.input_modality == "sparse_ball" else (
+        warmup_shape = ((1, 3, 4) if self.input_modality == "sparse_ball" else (
                 1,                    # batch
                 1,                    # one logical camera
                 self.image_channels,  # 9 for 3 RGB history frames
@@ -409,11 +482,13 @@ class FrankaActRolloutNode(Node):
         del request
         with self._aggregation_lock:
             floor_anchor_ns: Optional[int] = None
-            if self.rgb_buffer:
-                floor_sec, floor_msg = self.rgb_buffer[-1]
+            source_buffer = self.sparse_buffer if self.input_modality == "sparse_ball" else self.rgb_buffer
+            if source_buffer:
+                floor_sec, floor_msg = source_buffer[-1]
                 floor_anchor_ns = self._anchor_timestamp_ns_from_observation(floor_msg, floor_sec)
 
             discarded_entries = self._reset_temporal_aggregation("service_reset")
+            clear_sparse_temporal_history(self.sparse_buffer, self.joint_buffer, self.tcp_buffer)
             self.rollout_epoch += 1
             self.reset_anchor_floor_ns = floor_anchor_ns
             if floor_anchor_ns is not None:
@@ -444,7 +519,9 @@ class FrankaActRolloutNode(Node):
             f"inference_ms={inference_ms:.2f}"
         )
 
-    def build_policy_inputs(self):
+    def build_policy_inputs(self, policy_time: Optional[float] = None):
+        if self.input_modality == "sparse_ball":
+            return self._build_sparse_policy_inputs(float(policy_time))
         rgb_timestamps = [item[0] for item in self.rgb_buffer]
         rgb_messages = [item[1] for item in self.rgb_buffer]
         joint_timestamps = [item[0] for item in self.joint_buffer]
@@ -504,6 +581,65 @@ class FrankaActRolloutNode(Node):
         )
         return sync, qpos, image, anchor_timestamp_ns, history_source_stamp_ns
 
+    def _build_sparse_policy_inputs(self, policy_time: float):
+        targets = history_target_times(policy_time)
+        observations = [
+            BallObservation(ts, float(msg.point.x), float(msg.point.y),
+                            bool(np.isfinite((msg.point.x, msg.point.y)).all()
+                                 and 0.0 <= float(msg.point.x) < self.ball_image_width
+                                 and 0.0 <= float(msg.point.y) < self.ball_image_height))
+            for ts, msg in self.sparse_buffer
+        ]
+        selections = [
+            select_sparse_observation(observations, target, self.ball_image_width,
+                                      self.ball_image_height, self.sparse_max_observation_age)
+            for target in targets
+        ]
+        image_np = build_sparse_history(
+            observations, targets, self.ball_image_width, self.ball_image_height,
+            self.sparse_max_observation_age,
+        )[None, ...]
+        joint_timestamps = [item[0] for item in self.joint_buffer]
+        qpos_samples = [item[1] for item in self.joint_buffer]
+        qpos_history, qpos_timestamps = select_qpos_history_at_targets(
+            joint_timestamps, qpos_samples, targets
+        )
+        tcp_timestamps = [item[0] for item in self.tcp_buffer]
+        tcp_index = select_latest_index_at_or_before(tcp_timestamps, policy_time)
+        if tcp_index is None:
+            raise ValueError(f"No causal current_tcp_s at policy timestamp {policy_time:.9f}")
+        tcp_timestamp, anchor_tcp_s = self.tcp_buffer[tcp_index]
+        sync = type("SparseSync", (), {
+            "history_indices": (-1, -1, -1),
+            "rgb_timestamps": targets,
+            "qpos_timestamps": qpos_timestamps,
+            "anchor_tcp_s": float(anchor_tcp_s),
+            "anchor_tcp_s_timestamp": float(tcp_timestamp),
+            "qpos_history": qpos_history,
+        })()
+        qpos_norm = self.pre_process(qpos_history)
+        if not np.all(np.isfinite(qpos_norm)):
+            raise ValueError("Normalized qpos contains non-finite values")
+        qpos = torch.from_numpy(qpos_norm).float().to(self.device).unsqueeze(0)
+        image = torch.from_numpy(image_np).float().to(self.device)
+        source_stamps = [0 if item.source_timestamp is None else int(round(item.source_timestamp * 1e9))
+                         for item in selections]
+        latest_stamp = source_stamps[-1]
+        no_new = bool(latest_stamp and latest_stamp == self._last_attempted_anchor_ns)
+        self._trace_mark(
+            "sparse_observation_selection_and_construction",
+            sparse_source=self.sparse_source,
+            sparse_topic=self.ball_topic,
+            policy_tick_timestamp=policy_time,
+            history_target_timestamps=list(targets),
+            sparse_source_timestamps=[item.source_timestamp for item in selections],
+            sparse_observation_ages=[item.observation_age for item in selections],
+            sparse_valid_flags=[item.valid for item in selections],
+            selected_qpos_timestamps=list(qpos_timestamps),
+            inference_without_new_sparse_message=no_new,
+        )
+        return sync, qpos, image, latest_stamp, source_stamps
+
     def publish_predictions(
         self,
         absolute_chunk: np.ndarray,
@@ -535,16 +671,17 @@ class FrankaActRolloutNode(Node):
             )
 
     def run_policy_step(self) -> Tuple[bool, str]:
-        step_start_wall = time.time()
-        sync, qpos, curr_image, anchor_timestamp_ns, history_source_stamp_ns = self.build_policy_inputs()
+        step_start_wall = time.perf_counter()
+        policy_time = self.get_clock().now().nanoseconds * 1e-9
+        sync, qpos, curr_image, anchor_timestamp_ns, history_source_stamp_ns = self.build_policy_inputs(policy_time)
 
         with self._aggregation_lock:
-            if self.reset_anchor_floor_ns is not None and anchor_timestamp_ns <= self.reset_anchor_floor_ns:
+            if self.input_modality != "sparse_ball" and self.reset_anchor_floor_ns is not None and anchor_timestamp_ns <= self.reset_anchor_floor_ns:
                 self.duplicate_timer_tick_skip_count += 1
                 self._last_attempted_anchor_ns = anchor_timestamp_ns
                 return False, "frame_at_or_before_reset_floor"
 
-            if self._last_attempted_anchor_ns is not None:
+            if skip_duplicate_source_frame(self.input_modality) and self._last_attempted_anchor_ns is not None:
                 delta_ns = anchor_timestamp_ns - self._last_attempted_anchor_ns
                 if delta_ns == 0:
                     self.duplicate_timer_tick_skip_count += 1
@@ -599,13 +736,14 @@ class FrankaActRolloutNode(Node):
 
         post_now_sec = self.get_clock().now().nanoseconds * 1e-9
         try:
-            validate_anchor_freshness(
-                anchor_timestamp=sync.anchor_tcp_s_timestamp,
-                observation_timestamp=sync.rgb_timestamps[-1],
-                now_timestamp=post_now_sec,
-                max_anchor_age_sec=self.max_anchor_age_sec,
-                max_observation_age_sec=self.max_observation_age_sec,
-            )
+            if self.input_modality != "sparse_ball":
+                validate_anchor_freshness(
+                    anchor_timestamp=sync.anchor_tcp_s_timestamp,
+                    observation_timestamp=sync.rgb_timestamps[-1],
+                    now_timestamp=post_now_sec,
+                    max_anchor_age_sec=self.max_anchor_age_sec,
+                    max_observation_age_sec=self.max_observation_age_sec,
+                )
         except ValueError:
             with self._aggregation_lock:
                 self.post_inference_stale_count += 1
@@ -679,7 +817,9 @@ class FrankaActRolloutNode(Node):
             self.accepted_prediction_count += 1
             self.accepted_distinct_anchor_count += 1
 
-        total_step_ms = (time.time() - step_start_wall) * 1000.0
+        total_step_ms = (time.perf_counter() - step_start_wall) * 1000.0
+        self._trace_mark("rollout_step_complete", policy_forward_ms=inference_ms,
+                         total_rollout_step_ms=total_step_ms)
         max_input_age = post_now_sec - sync.rgb_timestamps[-1]
         max_sync_error = max(
             max(abs(rgb_ts - qpos_ts) for rgb_ts, qpos_ts in zip(sync.rgb_timestamps, sync.qpos_timestamps)),
@@ -724,9 +864,13 @@ class FrankaActRolloutNode(Node):
 
     def timer_cb(self) -> None:
         source_stamp_ns = 0
-        if self.rgb_buffer:
-            source_stamp_ns = image_source_stamp_ns(self.rgb_buffer[-1][1])
-        trace = self.latency_tracer.begin(source_stamp_ns)
+        source_buffer = self.sparse_buffer if self.input_modality == "sparse_ball" else self.rgb_buffer
+        if source_buffer:
+            source_stamp_ns = image_source_stamp_ns(source_buffer[-1][1])
+        trace = self.latency_tracer.begin(
+            source_stamp_ns,
+            source_modality=(f"sparse_ball/{self.sparse_source}" if self.input_modality == "sparse_ball" else self.input_modality),
+        )
         self._active_latency_trace = trace
         valid = False
         rejection_reason = ""
@@ -766,7 +910,12 @@ def main():
 
     parser.add_argument("--image_topic", type=str, default="/top_cam/camera/color/image_raw")
     parser.add_argument("--input_modality", choices=["rgb", "sparse_ball"], default="rgb")
-    parser.add_argument("--ball_topic", type=str, default="/ball_tracker2/ball_2d_px")
+    parser.add_argument("--sparse_source", choices=["rgb", "event"], default="rgb")
+    parser.add_argument("--sparse_topic", type=str, default=None)
+    parser.add_argument("--ball_topic", dest="sparse_topic", type=str, help=argparse.SUPPRESS)
+    parser.add_argument("--allow_sparse_topic_source_mismatch", action="store_true")
+    parser.add_argument("--sparse_feature_dim", type=int, default=4)
+    parser.add_argument("--sparse_history_length", type=int, default=3)
     parser.add_argument("--joint_topic", type=str, default="/joint_states")
     parser.add_argument("--current_tcp_s_topic", type=str, default="/middle_line/current_tcp_s")
     parser.add_argument("--prediction_topic", type=str, default="/act/intercept_prediction_chunk_abs_s")
@@ -784,9 +933,12 @@ def main():
     parser.add_argument("--no_publish_current_scalar", action="store_false", dest="publish_current_scalar")
     parser.set_defaults(publish_current_scalar=True)
 
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--policy_fps", "--fps", dest="fps", type=float, default=30.0)
     parser.add_argument("--max_source_buffer", type=int, default=256)
-    parser.add_argument("--max_observation_age_sec", type=float, default=0.20)
+    parser.add_argument(
+        "--max_observation_age_sec", type=float, default=None,
+        help="Sparse default: 0.10 s; legacy dense default: 0.20 s.",
+    )
     parser.add_argument("--max_anchor_age_sec", type=float, default=0.10)
     parser.add_argument("--diag_log_period_sec", type=float, default=1.0)
     parser.add_argument("--reject_log_period_sec", type=float, default=1.0)
@@ -858,6 +1010,14 @@ def main():
 
     args = parser.parse_args()
     args.camera_name = args.input_modality
+    if args.max_observation_age_sec is None:
+        args.max_observation_age_sec = 0.10 if args.input_modality == "sparse_ball" else 0.20
+    try:
+        args.sparse_topic = resolve_sparse_topic(
+            args.sparse_source, args.sparse_topic, args.allow_sparse_topic_source_mismatch
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         args.temporal_agg_mode = resolve_temporal_agg_mode(
             temporal_agg_mode=args.temporal_agg_mode,
@@ -870,6 +1030,10 @@ def main():
         raise ValueError(f"Interception rollout requires --state_dim 21, got {args.state_dim}")
     if int(args.action_dim) != 1:
         raise ValueError(f"Interception rollout requires --action_dim 1, got {args.action_dim}")
+    if int(args.sparse_feature_dim) != 4:
+        parser.error(f"--sparse_feature_dim must be 4, got {args.sparse_feature_dim}")
+    if int(args.sparse_history_length) != 3:
+        parser.error(f"--sparse_history_length must be 3, got {args.sparse_history_length}")
     if int(args.chunk_size) != 30:
         raise ValueError(f"Interception rollout requires --chunk_size 30, got {args.chunk_size}")
     if int(args.rgb_history_frames) != 3:

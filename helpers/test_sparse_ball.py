@@ -1,121 +1,136 @@
+import pathlib
+import sys
+
 import numpy as np
 import pytest
 import torch
-import h5py
-import pathlib
-import sys
-import types
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "detr"))
-if "roma.mappings" not in sys.modules:
-    roma = types.ModuleType("roma")
-    mappings = types.ModuleType("roma.mappings")
-    mappings.special_gramschmidt = lambda value: value
-    roma.mappings = mappings
-    sys.modules["roma"] = roma
-    sys.modules["roma.mappings"] = mappings
 
-from sparse_ball import (BallObservation, SPARSE_BALL_FEATURE_NAMES, build_sparse_history,
-                         normalize_pixel, sparse_feature_at_time)
-from intercept_rollout_contract import validate_intercept_stats_and_config
+from intercept_rollout_contract import (EXPECTED_INTERCEPT_METADATA,
+                                        select_qpos_history_at_targets,
+                                        validate_intercept_stats_and_config)
 from policy import ACTPolicy
-from utils import EpisodicInterceptDataset, get_intercept_norm_stats
+from sparse_ball import (BallObservation, SPARSE_BALL_FEATURE_NAMES, build_sparse_history,
+                         history_target_times, select_sparse_observation)
 
 
-def test_coordinate_feature_order_and_causal_velocity():
-    assert SPARSE_BALL_FEATURE_NAMES == ("u", "v", "du_dt", "dv_dt", "valid", "observation_age")
-    assert normalize_pixel(0, 0, 641, 481) == (-1.0, -1.0)
-    obs = [BallObservation(1.0, 0, 0), BallObservation(2.0, 640, 480),
-           BallObservation(3.0, 123, 234)]
-    feature = sparse_feature_at_time(obs, 2.5, 641, 481, 1.0)
-    np.testing.assert_allclose(feature, [1, 1, 2, 2, 1, .5])
-    # The future observation at 3.0 must not affect position or velocity.
-    np.testing.assert_allclose(feature, sparse_feature_at_time(obs[:2], 2.5, 641, 481, 1.0))
+def test_sparse_contract_and_exact_history_targets():
+    assert SPARSE_BALL_FEATURE_NAMES == ("u_norm", "v_norm", "valid", "observation_age")
+    assert history_target_times(10.0) == (9.8, 9.9, 10.0)
 
 
-def test_missing_stale_and_history_offsets():
-    obs = [BallObservation(1.0, 320, 240)]
-    missing = sparse_feature_at_time(obs, .5, 641, 481, .2)
-    np.testing.assert_allclose(missing, [0, 0, 0, 0, 0, .2])
-    stale = sparse_feature_at_time(obs, 2.0, 641, 481, .2)
-    assert stale[4] == 0 and stale[5] == pytest.approx(.2)
-    grid = np.arange(10, dtype=float)
-    history = build_sparse_history(obs, grid, 8, 641, 481, .2)
-    assert history.shape == (3, 6)
-    # offsets [-6,-3,0] select policy times 2,5,8.
-    np.testing.assert_allclose(history[:, 5], [.2, .2, .2])
+@pytest.mark.parametrize("width,height", [(1280, 720), (320, 240)])
+def test_rgb_and_event_build_three_by_four_with_modality_dimensions(width, height):
+    targets = history_target_times(1.0)
+    observations = [BallObservation(t, width / 2, height / 4) for t in targets]
+    result = build_sparse_history(observations, targets, width, height, 0.10)
+    assert result.shape == (3, 4)
+    np.testing.assert_allclose(result[:, :2], [[.5, .25]] * 3)
+    np.testing.assert_allclose(result[:, 2:], [[1., 0.]] * 3, atol=1e-7)
 
 
-def _config():
-    return dict(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, num_queries=30,
-                kl_weight=1, hidden_dim=32, dim_feedforward=64, enc_layers=1, dec_layers=1,
-                nheads=4, camera_names=['sparse_ball'], state_dim=21, action_dim=1,
-                use_bce_last_action_dim=False, input_modality='sparse_ball',
-                sparse_feature_dim=6, sparse_history_length=3, sparse_mean=[0]*6,
-                sparse_std=[1]*6, device='cpu')
+def test_invalid_missing_stale_and_future_samples_use_exact_sentinel():
+    sentinel = np.asarray([0., 0., 0., .1], np.float32)
+    assert np.array_equal(select_sparse_observation([], 1., 100, 100, .1).feature, sentinel)
+    stale = select_sparse_observation([BallObservation(.8, 10, 20)], 1., 100, 100, .1)
+    assert np.array_equal(stale.feature, sentinel)
+    invalid = select_sparse_observation([BallObservation(1., 10, 20, False)], 1., 100, 100, .1)
+    assert np.array_equal(invalid.feature, sentinel)
+    future = select_sparse_observation([BallObservation(1.01, 10, 20)], 1., 100, 100, .1)
+    assert future.source_timestamp is None
+    assert np.array_equal(future.feature, sentinel)
 
 
-def test_sparse_model_has_no_backbone_and_output_contract():
-    policy = ACTPolicy(_config())
+def test_header_time_reuse_increases_age_and_later_sample_does_not_leak_backward():
+    observations = [BallObservation(.85, 10, 10), BallObservation(.99, 90, 90)]
+    earlier = select_sparse_observation(observations, .90, 100, 100, .1)
+    current = select_sparse_observation(observations, 1.00, 100, 100, .1)
+    later_tick = select_sparse_observation(observations, 1.05, 100, 100, .1)
+    assert earlier.source_timestamp == .85
+    assert current.source_timestamp == .99
+    assert later_tick.observation_age > current.observation_age
+    assert earlier.feature[0] == pytest.approx(.1)
+
+
+def test_sparse_selection_uses_timestamps_not_message_indices():
+    observations = [BallObservation(.50, 1, 1), BallObservation(.79, 2, 2),
+                    BallObservation(.795, 3, 3), BallObservation(.90, 4, 4)]
+    result = build_sparse_history(observations, history_target_times(1.0), 10, 10, .1)
+    assert result[0, 0] == pytest.approx(.3)
+    assert result[1, 0] == pytest.approx(.4)
+    assert result[2, 2] == 1.0
+
+
+def test_qpos_history_is_independently_causal_and_missing_is_safe():
+    stamps = [.79, .795, .89, .91, .99]
+    samples = [np.full(7, i, np.float32) for i in range(len(stamps))]
+    qpos, selected = select_qpos_history_at_targets(stamps, samples, (.8, .9, 1.0))
+    assert selected == (.795, .89, .99)
+    np.testing.assert_array_equal(qpos.reshape(3, 7)[:, 0], [1, 2, 4])
+    with pytest.raises(ValueError, match="index=0"):
+        select_qpos_history_at_targets([.9], [samples[0]], (.8, .9, 1.0))
+
+
+def _model_config(feature_dim=4):
+    return dict(lr=1e-4, num_queries=3, kl_weight=1, hidden_dim=32,
+                dim_feedforward=64, lr_backbone=1e-5, backbone='resnet18',
+                enc_layers=1, dec_layers=1, nheads=4, camera_names=['sparse_ball'],
+                state_dim=21, action_dim=1, use_bce_last_action_dim=False,
+                input_modality='sparse_ball', sparse_feature_dim=feature_dim,
+                sparse_history_length=3, sparse_mean=[0] * feature_dim,
+                sparse_std=[1] * feature_dim, device='cpu')
+
+
+def test_sparse_forward_accepts_b_three_four_without_visual_backbone():
+    policy = ACTPolicy(_model_config())
     assert policy.model.backbones is None
-    assert not any('backbone' in name for name, _ in policy.model.named_parameters())
-    output = policy(torch.zeros(2, 21), torch.zeros(2, 3, 6))
-    assert output.shape == (2, 30, 1)
-    with pytest.raises(ValueError, match=r'\[B,3,6\]'):
-        policy(torch.zeros(1, 21), torch.zeros(1, 1, 9, 32, 32))
+    output = policy(torch.zeros(2, 21), torch.zeros(2, 3, 4))
+    assert output.shape == (2, 3, 1)
 
 
-def test_policy_wrapper_applies_sparse_normalization():
-    config = {**_config(), 'sparse_mean': [1,2,3,4,0,.1],
-              'sparse_std': [2,2,2,2,1,.1]}
-    policy = ACTPolicy(config)
-    raw = torch.tensor([[[3.,4.,5.,6.,1.,.2]]]).repeat(1,3,1)
-    expected = torch.tensor([[[1.,1.,1.,1.,1.,1.]]]).repeat(1,3,1)
-    torch.testing.assert_close(policy.preprocess_image(raw), expected)
+def test_six_feature_configuration_is_rejected():
+    with pytest.raises(ValueError, match="features=4"):
+        ACTPolicy(_model_config(6))
 
 
-def test_checkpoint_modality_contract_and_sparse_stats():
-    stats = dict(data_mode='intercept', raw_qpos_dim=7, state_dim=21, action_dim=1,
-                 qpos_history_offsets=[-6,-3,0], qpos_flatten_order='oldest_to_newest',
-                 action_type='measured_tcp_s_delta', action_representation='future_delta_relative_to_anchor',
-                 action_anchor_offset=0, action_first_target_offset=1,
-                 action_positive_direction='robot_base_positive_x', action_units='m',
-                 input_modality='sparse_ball', sparse_feature_dim=6,
-                 sparse_feature_names=list(SPARSE_BALL_FEATURE_NAMES), sparse_history_offsets=[-6,-3,0],
-                 image_width=641, image_height=481,
-                 coordinate_convention='normalized_image_coordinates_minus1_to_plus1',
-                 velocity_convention='normalized_image_coordinates_per_second', max_observation_age_sec=.2,
-                 ball_source_topic='/ball_tracker2/ball_2d_px',
-                 source_timestamp_policy='source_header_timestamp_causal_at_or_before_policy_time',
-                 missing_observation_policy='hold_last_position_zero_velocity_valid_zero_when_stale_zero_before_first',
-                 qpos_mean=np.zeros(21), qpos_std=np.ones(21), action_mean=np.zeros(1),
-                 action_std=np.ones(1), sparse_mean=np.zeros(6), sparse_std=np.ones(6))
-    arrays = validate_intercept_stats_and_config(stats, _config(), 30)
-    assert arrays['sparse_mean'].shape == (6,)
-    with pytest.raises(ValueError, match='modality'):
-        validate_intercept_stats_and_config(stats, {**_config(), 'input_modality': 'wat'}, 30)
+def _sparse_stats(source="rgb", width=1280, height=720):
+    stats = dict(EXPECTED_INTERCEPT_METADATA)
+    for key in ("rgb_history_frames", "rgb_history_offsets", "rgb_frame_order", "image_channels"):
+        stats.pop(key)
+    stats.update(input_modality="sparse_ball", sparse_source=source,
+                 sparse_feature_dim=4,
+                 sparse_feature_names=list(SPARSE_BALL_FEATURE_NAMES),
+                 sparse_history_length=3, sparse_history_offsets_sec=[-.2, -.1, 0.],
+                 max_observation_age_sec=.1, image_width=width, image_height=height,
+                 chunk_size=30, qpos_mean=np.zeros(21), qpos_std=np.ones(21),
+                 action_mean=np.zeros(1), action_std=np.ones(1),
+                 sparse_mean=np.zeros(4), sparse_std=np.ones(4))
+    return stats
 
 
-def test_synthetic_sparse_dataset_sample(tmp_path):
-    path = tmp_path / 'episode_0.hdf5'
-    with h5py.File(path, 'w') as root:
-        root.attrs.update(action_type='measured_tcp_s_absolute', action_representation='absolute',
-                          action_positive_direction='robot_base_positive_x', input_modality='sparse_ball',
-                          sparse_history_offsets=np.asarray([-6,-3,0]), image_width=641, image_height=481,
-                          coordinate_convention='normalized_image_coordinates_minus1_to_plus1',
-                          velocity_convention='normalized_image_coordinates_per_second',
-                          max_observation_age_sec=.2, ball_source_topic='/ball_tracker2/ball_2d_px',
-                          source_timestamp_policy='source_header_timestamp_causal_at_or_before_policy_time')
-        root.attrs['missing_observation_policy'] = 'hold_last_position_zero_velocity_valid_zero_when_stale_zero_before_first'
-        root.attrs['sparse_feature_names'] = np.asarray(SPARSE_BALL_FEATURE_NAMES, dtype=h5py.string_dtype())
-        root.create_dataset('/action', data=np.arange(10, dtype=np.float32)[:,None])
-        root.create_dataset('/observations/qpos', data=np.zeros((10,7), np.float32))
-        root.create_dataset('/observations/timestamps', data=np.arange(10)/30.)
-        root.create_dataset('/observations/sparse_ball', data=np.zeros((10,6), np.float32))
-    stats = get_intercept_norm_stats([str(path)], 30, input_modality='sparse_ball')
-    sample = EpisodicInterceptDataset([str(path)], ['sparse_ball'], 30, stats,
-                                      input_modality='sparse_ball', image_size=32)[0]
-    assert sample[0].shape == (3,6)
-    assert sample[1].shape == (21,)
-    assert sample[2].shape == (30,1)
+def test_checkpoint_contract_accepts_four_features_and_rejects_source_or_six_features():
+    config = {**_model_config(), "num_queries": 30}
+    arrays = validate_intercept_stats_and_config(
+        _sparse_stats(), config, 30,
+        {"sparse_source": "rgb", "max_observation_age_sec": .1,
+         "image_width": 1280, "image_height": 720},
+    )
+    assert arrays["sparse_mean"].shape == (4,)
+    with pytest.raises(ValueError, match="sparse_source"):
+        validate_intercept_stats_and_config(
+            _sparse_stats("rgb"), config, 30, {"sparse_source": "event"}
+        )
+    bad = _sparse_stats()
+    bad["sparse_feature_dim"] = 6
+    with pytest.raises(ValueError, match="sparse_feature_dim"):
+        validate_intercept_stats_and_config(bad, config, 30)
+
+
+def test_sparse_checkpoint_state_dict_roundtrip():
+    original = ACTPolicy(_model_config())
+    restored = ACTPolicy(_model_config())
+    status = restored.load_state_dict(original.state_dict())
+    assert not status.missing_keys and not status.unexpected_keys

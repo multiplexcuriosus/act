@@ -273,6 +273,30 @@ def build_qpos_history(qpos_samples: Sequence[np.ndarray]) -> np.ndarray:
     return out
 
 
+def select_qpos_history_at_targets(
+    joint_timestamps: Sequence[float],
+    joint_qpos_samples: Sequence[np.ndarray],
+    target_timestamps: Sequence[float],
+) -> Tuple[np.ndarray, Tuple[float, float, float]]:
+    """Select three independent causal JointState samples at policy-time targets."""
+    if len(joint_timestamps) != len(joint_qpos_samples):
+        raise ValueError("joint_timestamps and joint_qpos_samples length mismatch")
+    if len(target_timestamps) != 3:
+        raise ValueError(f"Expected exactly 3 qpos target timestamps, got {len(target_timestamps)}")
+    selected = []
+    selected_timestamps = []
+    for history_index, target in enumerate(target_timestamps):
+        index = select_latest_index_at_or_before(joint_timestamps, float(target))
+        if index is None:
+            raise ValueError(
+                "Missing causal JointState history target "
+                f"index={history_index} target_timestamp={float(target):.9f}"
+            )
+        selected.append(joint_qpos_samples[index])
+        selected_timestamps.append(float(joint_timestamps[index]))
+    return build_qpos_history(selected), tuple(selected_timestamps)
+
+
 def build_rgb_history_tensor(rgb_frames: Sequence[np.ndarray], image_size: int) -> np.ndarray:
     if len(rgb_frames) != 3:
         raise ValueError(f"Expected 3 RGB frames for temporal history, got {len(rgb_frames)}")
@@ -308,8 +332,10 @@ def validate_intercept_stats_and_config(
     stats: Dict[str, object],
     policy_config: Dict[str, object],
     expected_chunk_size: int,
+    sparse_runtime: Optional[Dict[str, object]] = None,
 ) -> Dict[str, np.ndarray]:
     modality = str(policy_config.get("input_modality", "rgb"))
+    arrays: Dict[str, np.ndarray] = {}
     expected_metadata = dict(EXPECTED_INTERCEPT_METADATA)
     if modality == "sparse_ball":
         expected_metadata.pop("rgb_history_frames")
@@ -317,15 +343,59 @@ def validate_intercept_stats_and_config(
         expected_metadata.pop("rgb_frame_order")
         expected_metadata.pop("image_channels")
         expected_metadata.update({
-            "input_modality": "sparse_ball", "sparse_feature_dim": 6,
-            "sparse_feature_names": ["u", "v", "du_dt", "dv_dt", "valid", "observation_age"],
-            "sparse_history_offsets": list(INTERCEPT_HISTORY_OFFSETS),
+            "input_modality": "sparse_ball", "sparse_feature_dim": 4,
+            "sparse_feature_names": ["u_norm", "v_norm", "valid", "observation_age"],
         })
-        for key in ("image_width", "image_height", "coordinate_convention", "velocity_convention",
-                    "max_observation_age_sec", "ball_source_topic", "source_timestamp_policy",
-                    "missing_observation_policy"):
-            if key not in stats:
-                raise ValueError(f"Missing sparse checkpoint metadata in dataset_stats.pkl: {key}")
+        history_length = stats.get("sparse_history_length")
+        history_offsets = stats.get("sparse_history_offsets_sec")
+        if history_length is not None and int(history_length) != 3:
+            raise ValueError(f"sparse_history_length must be 3, found {history_length}")
+        if history_offsets is not None and list(history_offsets) != [-0.2, -0.1, 0.0]:
+            raise ValueError(f"sparse_history_offsets_sec mismatch: {history_offsets!r}")
+        if history_length is None and history_offsets is None:
+            raise ValueError("Sparse checkpoint lacks history length/offset metadata")
+        runtime = sparse_runtime or {}
+        if "sparse_source" not in stats:
+            metadata_topic = stats.get("sparse_topic", stats.get("ball_source_topic"))
+            topic_sources = {
+                "/ball_tracker2/ball_2d_px": "rgb",
+                "/openmv_cam/event_tracker/ball_2d_px": "event",
+            }
+            if metadata_topic in topic_sources:
+                stats = dict(stats)
+                stats["sparse_source"] = topic_sources[metadata_topic]
+        aliases = {
+            "sparse_source": ("sparse_source",),
+            "max_observation_age_sec": ("max_observation_age_sec",),
+            "image_width": ("image_width", "sparse_image_width"),
+            "image_height": ("image_height", "sparse_image_height"),
+        }
+        validated = []
+        unavailable = []
+        for runtime_key, metadata_keys in aliases.items():
+            expected = runtime.get(runtime_key)
+            if expected is None:
+                continue
+            metadata_key = next((key for key in metadata_keys if key in stats), None)
+            if metadata_key is None:
+                unavailable.append(runtime_key)
+                continue
+            actual = stats[metadata_key]
+            matches = (math.isclose(float(actual), float(expected), rel_tol=0.0, abs_tol=1e-9)
+                       if runtime_key == "max_observation_age_sec" else actual == expected)
+            if not matches:
+                raise ValueError(
+                    f"Sparse checkpoint/runtime mismatch for {runtime_key}: "
+                    f"requested {expected!r}, checkpoint {actual!r}"
+                )
+            validated.append(runtime_key)
+        if "sparse_source" in unavailable:
+            raise ValueError(
+                "Sparse checkpoint metadata cannot identify rgb versus event source; "
+                "refusing an ambiguous rollout"
+            )
+        arrays["_validated_metadata"] = np.asarray(validated, dtype=object)
+        arrays["_unavailable_metadata"] = np.asarray(unavailable, dtype=object)
     elif modality not in ("rgb", "event"):
         raise ValueError(f"Unsupported interception input modality: {modality!r}")
     for key, expected in expected_metadata.items():
@@ -336,6 +406,11 @@ def validate_intercept_stats_and_config(
                 f"Interception checkpoint metadata mismatch for {key}: "
                 f"expected {expected!r}, found {stats[key]!r}"
             )
+    if "chunk_size" in stats and int(stats["chunk_size"]) != int(expected_chunk_size):
+        raise ValueError(
+            f"Checkpoint chunk_size mismatch: requested {expected_chunk_size}, "
+            f"checkpoint {stats['chunk_size']}"
+        )
 
     required_config = {
         "state_dim": 21,
@@ -343,7 +418,7 @@ def validate_intercept_stats_and_config(
         "num_queries": int(expected_chunk_size),
     }
     if modality == "sparse_ball":
-        required_config.update({"sparse_history_length": 3, "sparse_feature_dim": 6})
+        required_config.update({"sparse_history_length": 3, "sparse_feature_dim": 4})
     else:
         required_config.update({"rgb_history_frames": 3, "image_channels": 9})
     for key, expected in required_config.items():
@@ -356,7 +431,6 @@ def validate_intercept_stats_and_config(
     if bool(policy_config.get("use_bce_last_action_dim", False)):
         raise ValueError("Interception rollout requires use_bce_last_action_dim=false")
 
-    arrays: Dict[str, np.ndarray] = {}
     for stat_key, expected_shape in (
         ("qpos_mean", (21,)),
         ("qpos_std", (21,)),
@@ -384,8 +458,8 @@ def validate_intercept_stats_and_config(
             if stat_key not in stats:
                 raise ValueError(f"Missing required sparse stats key: {stat_key}")
             arr = np.asarray(stats[stat_key], dtype=np.float32).reshape(-1)
-            if arr.shape != (6,) or not np.isfinite(arr).all():
-                raise ValueError(f"{stat_key} must be finite with shape (6,), got {arr.shape}")
+            if arr.shape != (4,) or not np.isfinite(arr).all():
+                raise ValueError(f"{stat_key} must be finite with shape (4,), got {arr.shape}")
             arrays[stat_key] = arr
         if np.any(arrays["sparse_std"] <= 0.0):
             raise ValueError("sparse_std must be strictly positive")
