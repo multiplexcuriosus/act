@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import os
 import sys
 import unittest
@@ -17,20 +18,40 @@ from intercept_rollout_contract import (  # noqa: E402
     EXPECTED_INTERCEPT_XYT_METADATA,
     AggregationSelection,
     TemporalAbsoluteAggregator,
+    add_event_spatial_preprocessing_arguments,
     absolute_s_from_anchor,
     build_visual_history_tensor,
     build_qpos_history,
     build_rgb_history_tensor,
     compute_history_indices,
     denormalize_delta_chunk,
+    preprocess_event_history_frames,
+    resolve_event_spatial_preprocessing,
     resolve_temporal_agg_mode,
     select_sync_observation,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
 )
+from image_preprocessing import (  # noqa: E402
+    mask_and_center_crop_square_rotated_event_image,
+    mask_and_left_crop_image,
+)
 
 
 class InterceptRolloutContractTests(unittest.TestCase):
+    @staticmethod
+    def make_asymmetric_event_frame(offset=0):
+        rows = np.arange(320, dtype=np.uint16)[:, None]
+        cols = np.arange(320, dtype=np.uint16)[None, :]
+        return np.stack(
+            [
+                np.broadcast_to((rows + offset) % 256, (320, 320)),
+                np.broadcast_to((3 * cols + 17 + offset) % 256, (320, 320)),
+                (5 * rows + 7 * cols + 29 + offset) % 256,
+            ],
+            axis=-1,
+        ).astype(np.uint8)
+
     def make_stats(self, modality="rgb"):
         if modality == "event":
             stats = dict(EXPECTED_INTERCEPT_EVENT_METADATA)
@@ -170,6 +191,143 @@ class InterceptRolloutContractTests(unittest.TestCase):
             np.asarray([11, 12, 13, 21, 22, 23, 31, 32, 33], dtype=np.float32),
             atol=0.5,
         )
+
+    def test_event_spatial_preprocessing_cli_defaults_to_disabled(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--camera_name", choices=("rgb", "event"), default="rgb")
+        add_event_spatial_preprocessing_arguments(parser)
+        args = parser.parse_args([])
+
+        self.assertIsNone(args.event_mask_x)
+        self.assertIsNone(args.event_crop_square)
+        self.assertEqual(args.event_mask_fill_value, 128)
+        self.assertIsNone(
+            resolve_event_spatial_preprocessing(
+                modality=args.camera_name,
+                mask_x=args.event_mask_x,
+                crop_square=args.event_crop_square,
+                fill_value=args.event_mask_fill_value,
+            )
+        )
+
+    def test_disabled_spatial_preprocessing_preserves_rgb_and_event_behavior(self):
+        for modality in ("rgb", "event"):
+            frames = [
+                np.full((4, 4, 3), value, dtype=np.uint8)
+                for value in (10, 20, 30)
+            ]
+            unchanged = preprocess_event_history_frames(frames, None)
+            self.assertTrue(all(before is after for before, after in zip(frames, unchanged)))
+            expected = build_visual_history_tensor(frames, image_size=4, modality=modality)
+            actual = build_visual_history_tensor(unchanged, image_size=4, modality=modality)
+            np.testing.assert_array_equal(actual, expected)
+
+    def test_event_spatial_preprocessing_configuration_validation(self):
+        invalid_cases = (
+            ({"modality": "event", "mask_x": (140, 34), "crop_square": None}, "supplied together"),
+            ({"modality": "event", "mask_x": None, "crop_square": 200}, "supplied together"),
+            ({"modality": "rgb", "mask_x": (140, 34), "crop_square": 200}, "only valid"),
+            ({"modality": "event", "mask_x": (-1, 34), "crop_square": 200}, "XTOP"),
+            ({"modality": "event", "mask_x": (140, 320), "crop_square": 200}, "XBOTTOM"),
+            ({"modality": "event", "mask_x": (140, 34), "crop_square": 0}, "0 < SIDE"),
+            ({"modality": "event", "mask_x": (140, 34), "crop_square": 321}, "<= 320"),
+            (
+                {
+                    "modality": "event",
+                    "mask_x": (140, 34),
+                    "crop_square": 200,
+                    "fill_value": 256,
+                },
+                "<= 255",
+            ),
+            (
+                {
+                    "modality": "event",
+                    "mask_x": None,
+                    "crop_square": None,
+                    "fill_value": -1,
+                },
+                "0 <= VALUE",
+            ),
+        )
+        for kwargs, message in invalid_cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, message):
+                    resolve_event_spatial_preprocessing(**kwargs)
+
+    def test_rollout_spatial_transform_exactly_matches_offline_order_and_orientation(self):
+        frame = self.make_asymmetric_event_frame()
+        config = resolve_event_spatial_preprocessing(
+            modality="event",
+            mask_x=(140, 34),
+            crop_square=200,
+            fill_value=128,
+        )
+        actual = preprocess_event_history_frames([frame], config)[0]
+        offline = mask_and_center_crop_square_rotated_event_image(
+            frame,
+            mask_x=(140, 34),
+            square_side=200,
+            fill_value=128,
+        )
+
+        rotated = np.rot90(frame, k=1, axes=(0, 1))
+        masked = mask_and_left_crop_image(
+            rotated,
+            mask_x=(140, 34),
+            crop_x=0,
+            fill_value=128,
+        )
+        manual = np.rot90(masked[60:260, 60:260], k=-1, axes=(0, 1))
+        np.testing.assert_array_equal(actual, offline)
+        np.testing.assert_array_equal(actual, manual)
+        self.assertEqual(actual.shape, (200, 200, 3))
+
+    def test_three_spatially_transformed_frames_build_existing_policy_tensor(self):
+        config = resolve_event_spatial_preprocessing(
+            modality="event",
+            mask_x=(140, 34),
+            crop_square=200,
+            fill_value=128,
+        )
+        frames = [self.make_asymmetric_event_frame(offset) for offset in (0, 31, 79)]
+        transformed = preprocess_event_history_frames(frames, config)
+        tensor = build_visual_history_tensor(
+            transformed,
+            image_size=320,
+            modality="event",
+        )
+
+        self.assertEqual([frame.shape for frame in transformed], [(200, 200, 3)] * 3)
+        self.assertEqual(tensor.shape, (1, 1, 9, 320, 320))
+        self.assertEqual(tensor[0, 0].shape, (9, 320, 320))
+        channel_means = tensor[0, 0].reshape(9, -1).mean(axis=1) * 255.0
+        expected_means = np.concatenate(
+            [frame.reshape(-1, 3).mean(axis=0) for frame in transformed]
+        )
+        np.testing.assert_allclose(channel_means, expected_means, atol=0.5)
+
+    def test_event_spatial_preprocessing_rejects_dtype_and_raw_shape_mismatches(self):
+        config = resolve_event_spatial_preprocessing(
+            modality="event",
+            mask_x=(140, 34),
+            crop_square=200,
+            fill_value=128,
+        )
+        with self.assertRaisesRegex(ValueError, "raw frame dtype uint8.*float32"):
+            preprocess_event_history_frames(
+                [np.zeros((320, 320, 3), dtype=np.float32)],
+                config,
+            )
+
+        invalid_shapes = ((200, 200, 3), (320, 320), (320, 320, 1), (321, 320, 3))
+        for shape in invalid_shapes:
+            with self.subTest(shape=shape):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"raw frame shape \(320, 320, 3\).*already be cropped or otherwise incompatible",
+                ):
+                    preprocess_event_history_frames([np.zeros(shape, dtype=np.uint8)], config)
 
     def test_event_neutral_normalizes_to_zero(self):
         frame = np.full((4, 4, 3), 128, dtype=np.uint8)

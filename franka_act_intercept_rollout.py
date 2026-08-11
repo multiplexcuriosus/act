@@ -20,10 +20,13 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from intercept_rollout_contract import (
     TemporalAbsoluteAggregator,
+    add_event_spatial_preprocessing_arguments,
     absolute_s_from_anchor,
     build_visual_history_tensor,
     denormalize_delta_chunk,
     extract_arm_qpos,
+    preprocess_event_history_frames,
+    resolve_event_spatial_preprocessing,
     resolve_temporal_agg_mode,
     select_sync_observation,
     validate_anchor_freshness,
@@ -74,6 +77,8 @@ class FrankaActRolloutNode(Node):
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
         self.input_modality = str(args.camera_name)
+        self.event_spatial_preprocessing = args.event_spatial_preprocessing
+        self._event_spatial_shape_trace_logged = False
         self.image_channels = 9
         self.image_size = int(args.image_size)
         self.max_source_buffer = int(args.max_source_buffer)
@@ -196,6 +201,15 @@ class FrankaActRolloutNode(Node):
         self.timer = self.create_timer(1.0 / self.fps, self.timer_cb)
 
         self.get_logger().info(f"image_topic={self.image_topic}")
+        if self.event_spatial_preprocessing is None:
+            self.get_logger().info("event spatial preprocessing: disabled")
+        else:
+            event_config = self.event_spatial_preprocessing
+            self.get_logger().info(
+                "event spatial preprocessing: enabled "
+                f"mask_x={event_config.mask_x} crop_square={event_config.crop_square} "
+                f"fill_value={event_config.fill_value}"
+            )
         self.get_logger().info(f"joint_topic={self.joint_topic}")
         self.get_logger().info(f"current_tcp_s_topic={self.current_tcp_s_topic}")
         self.get_logger().info(f"temporal_agg_reset_service={self.temporal_agg_reset_service}")
@@ -401,6 +415,11 @@ class FrankaActRolloutNode(Node):
                     raise ValueError(
                         "Event image decoding contract violated: expected uint8 HxWx3 from /openmv_cam/event_frame_3ch"
                     )
+        raw_event_shape = visual_frames[0].shape if self.event_spatial_preprocessing is not None else None
+        visual_frames = preprocess_event_history_frames(
+            visual_frames,
+            self.event_spatial_preprocessing,
+        )
         image_np = build_visual_history_tensor(visual_frames, self.image_size, modality=self.input_modality)
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
@@ -419,6 +438,18 @@ class FrankaActRolloutNode(Node):
 
         qpos = torch.from_numpy(qpos_norm).float().to(self.device).unsqueeze(0)
         image = torch.from_numpy(image_np).float().to(self.device)
+        if (
+            self.event_spatial_preprocessing is not None
+            and not self._event_spatial_shape_trace_logged
+        ):
+            crop_shape = visual_frames[0].shape
+            self.get_logger().info(
+                "event spatial preprocessing: "
+                f"raw {raw_event_shape[0]}x{raw_event_shape[1]}x{raw_event_shape[2]} -> "
+                f"crop {crop_shape[0]}x{crop_shape[1]}x{crop_shape[2]} -> "
+                f"policy tensor {image_np.shape[-2]}x{image_np.shape[-1]}x{image_np.shape[2]}"
+            )
+            self._event_spatial_shape_trace_logged = True
         anchor_visual_msg = selected_visual_msgs[-1]
         anchor_timestamp_ns = self._anchor_timestamp_ns_from_observation(
             anchor_visual_msg,
@@ -652,6 +683,7 @@ def main():
     parser.add_argument("--rgb_history_frames", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=320)
     parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb", "event"])
+    add_event_spatial_preprocessing_arguments(parser)
 
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--kl_weight", type=int, default=10)
@@ -712,6 +744,16 @@ def main():
         args.temporal_agg_mode = resolve_temporal_agg_mode(
             temporal_agg_mode=args.temporal_agg_mode,
             temporal_agg_legacy=args.temporal_agg_legacy,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    try:
+        args.event_spatial_preprocessing = resolve_event_spatial_preprocessing(
+            modality=args.camera_name,
+            mask_x=args.event_mask_x,
+            crop_square=args.event_crop_square,
+            fill_value=args.event_mask_fill_value,
         )
     except ValueError as exc:
         parser.error(str(exc))
