@@ -60,7 +60,6 @@ ARM_JOINT_NAMES = (
 
 SHIFTED_3CHEF_REPRESENTATION = "shifted_3chef_signed"
 XYT_REPRESENTATION = "xyt_signed_voxel_v1"
-XYT_RUN_TAG = "xyt200_s320_t9_signed"
 
 
 @dataclass
@@ -1152,27 +1151,6 @@ def write_episode(
     log(f"[INFO] wrote {output_path}")
 
 
-def recording_name(bag_path: str) -> str:
-    normalized = os.path.normpath(os.path.abspath(os.path.expanduser(bag_path)))
-    basename = os.path.basename(normalized)
-    return os.path.splitext(basename)[0]
-
-
-def output_dir_name(args: argparse.Namespace, bag_path: str) -> str:
-    if args.rec_dir is not None:
-        rec_dir = os.path.abspath(os.path.expanduser(args.rec_dir))
-        rec_name = os.path.basename(os.path.normpath(rec_dir))
-        if rec_name.startswith("recording_"):
-            base_name = "hdf5_" + rec_name[len("recording_") :]
-        else:
-            base_name = rec_name
-    else:
-        base_name = recording_name(bag_path)
-    if getattr(args, "event_representation", SHIFTED_3CHEF_REPRESENTATION) == XYT_REPRESENTATION:
-        return f"{base_name}_{XYT_RUN_TAG}"
-    return base_name
-
-
 def resolve_input_paths(
     args: argparse.Namespace,
 ) -> Tuple[str, Optional[str]]:
@@ -1203,6 +1181,11 @@ def resolve_input_paths(
     return bag_path, None
 
 
+def resolve_output_dir(out_dir: str) -> str:
+    """Resolve --out_dir as the exact episode destination directory."""
+    return os.path.abspath(os.path.expanduser(out_dir))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a ROS 2 ball-interception bag to per-episode IL HDF5"
@@ -1218,7 +1201,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out_dir",
         required=True,
-        help="Parent output directory; a bag-named child directory is created",
+        help="Exact directory in which episode_*.hdf5 files are written",
     )
     parser.add_argument(
         "--storage_id", choices=("mcap", "sqlite3"), default="mcap"
@@ -1391,7 +1374,7 @@ def main() -> None:
         if not hasattr(args, name):
             setattr(args, name, default)
     bag_path, raw_events_h5 = resolve_input_paths(args)
-    output_parent = os.path.abspath(os.path.expanduser(args.out_dir))
+    output_dir = resolve_output_dir(args.out_dir)
     if not os.path.exists(bag_path):
         raise RuntimeError(f"Bag path does not exist: {bag_path}")
     if args.event_clip_count is not None and raw_events_h5 is None:
@@ -1459,7 +1442,6 @@ def main() -> None:
         f"in {format_hms(marker_elapsed)}"
     )
 
-    output_dir = os.path.join(output_parent, output_dir_name(args, bag_path))
     os.makedirs(output_dir, exist_ok=True)
     log(f"[INFO] output directory: {output_dir}")
 

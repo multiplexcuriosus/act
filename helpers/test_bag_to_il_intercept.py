@@ -922,6 +922,24 @@ class BagToIlInterceptTests(unittest.TestCase):
         finally:
             sys.argv = argv
 
+    def test_out_dir_is_the_exact_episode_destination(self):
+        argv = list(sys.argv)
+        try:
+            sys.argv = [
+                "bag_to_il_intercept.py",
+                "--rec_dir",
+                "/data/recording_20260727_215525",
+                "--out_dir",
+                "/data/position_only/recording_20260727_215525_position_only",
+            ]
+            args = self.mod.parse_args()
+            self.assertEqual(
+                self.mod.resolve_output_dir(args.out_dir),
+                "/data/position_only/recording_20260727_215525_position_only",
+            )
+        finally:
+            sys.argv = argv
+
     def test_write_episode_rejects_non_shifted_event_metadata_mode(self):
         data = self.make_sampling_data(
             tcp_times=[1.0, 1.1, 1.2],
