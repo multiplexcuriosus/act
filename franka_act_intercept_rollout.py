@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, JointState
+from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float64, Float64MultiArray
 from std_srvs.srv import Trigger
 
@@ -33,6 +34,10 @@ from intercept_rollout_contract import (
     validate_intercept_stats_and_config,
 )
 from policy import ACTPolicy
+from sparse_ball import (
+    SparsePoint, construct_causal_sparse_history,
+    default_sparse_topic, validate_sparse_checkpoint_contract,
+)
 
 
 def stamp_to_sec(stamp) -> float:
@@ -76,10 +81,14 @@ class FrankaActRolloutNode(Node):
         self.state_dim = args.state_dim
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
-        self.input_modality = str(args.camera_name)
+        self.input_modality = str(args.input_modality)
+        self.sparse_source = args.sparse_source
+        self.sparse_topic = args.sparse_topic or default_sparse_topic(self.sparse_source)
         self.event_spatial_preprocessing = args.event_spatial_preprocessing
         self._event_spatial_shape_trace_logged = False
-        self.image_channels = 9
+        self.image_channels = 0 if self.input_modality == "sparse_ball" else 9
+        self.sparse_image_width = 1280 if self.sparse_source == "rgb" else 320
+        self.sparse_image_height = 720 if self.sparse_source == "rgb" else 320
         self.image_size = int(args.image_size)
         self.max_source_buffer = int(args.max_source_buffer)
         self.max_observation_age_sec = float(args.max_observation_age_sec)
@@ -125,7 +134,8 @@ class FrankaActRolloutNode(Node):
             "enc_layers": args.enc_layers,
             "dec_layers": args.dec_layers,
             "nheads": args.nheads,
-            "camera_names": [args.camera_name],
+            "camera_names": (["sparse_ball"] if self.input_modality == "sparse_ball"
+                             else [args.camera_name]),
             "input_modality": self.input_modality,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
@@ -133,11 +143,19 @@ class FrankaActRolloutNode(Node):
             "rgb_history_frames": args.rgb_history_frames,
             "visual_history_frames": args.rgb_history_frames,
             "visual_history_offsets": [-6, -3, 0],
-            "channels_per_visual_frame": 3,
+            "channels_per_visual_frame": 0 if self.input_modality == "sparse_ball" else 3,
             "visual_frame_order": "oldest_to_newest",
-            "image_normalization": "shifted_3chef_centered" if self.input_modality == "event" else "imagenet",
+            "image_normalization": (
+                "sparse_train_split_standardization"
+                if self.input_modality == "sparse_ball"
+                else ("shifted_3chef_centered" if self.input_modality == "event" else "imagenet")
+            ),
             "image_channels": self.image_channels,
             "image_size": self.image_size,
+            "sparse_source": self.sparse_source,
+            "sparse_feature_dim": 4,
+            "sparse_history_length": 3,
+            "max_observation_age_sec": self.max_observation_age_sec,
         }
 
         ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
@@ -146,11 +164,22 @@ class FrankaActRolloutNode(Node):
         with open(stats_path, "rb") as f:
             stats = pickle.load(f)
 
-        stats_arrays = validate_intercept_stats_and_config(
-            stats=stats,
-            policy_config=policy_config,
-            expected_chunk_size=self.chunk_size,
-        )
+        if self.input_modality == "sparse_ball":
+            self.sparse_image_width = int(stats.get("sparse_image_width", self.sparse_image_width))
+            self.sparse_image_height = int(stats.get("sparse_image_height", self.sparse_image_height))
+            validate_sparse_checkpoint_contract(
+                stats, self.sparse_source, self.sparse_image_width,
+                self.sparse_image_height, self.max_observation_age_sec,
+            )
+            stats_arrays = {key: np.asarray(stats[key]) for key in (
+                "qpos_mean", "qpos_std", "action_mean", "action_std")}
+            policy_config["sparse_mean"] = stats["sparse_mean"]
+            policy_config["sparse_std"] = stats["sparse_std"]
+        else:
+            stats_arrays = validate_intercept_stats_and_config(
+                stats=stats, policy_config=policy_config,
+                expected_chunk_size=self.chunk_size,
+            )
 
         self.qpos_mean = stats_arrays["qpos_mean"]
         self.qpos_std = stats_arrays["qpos_std"]
@@ -183,7 +212,10 @@ class FrankaActRolloutNode(Node):
                 10,
             )
 
-        self.create_subscription(Image, self.image_topic, self.image_cb, 10)
+        if self.input_modality == "sparse_ball":
+            self.create_subscription(PointStamped, self.sparse_topic, self.sparse_cb, 10)
+        else:
+            self.create_subscription(Image, self.image_topic, self.image_cb, 10)
         self.create_subscription(JointState, self.joint_topic, self.joint_cb, 10)
         current_tcp_s_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(
@@ -200,7 +232,12 @@ class FrankaActRolloutNode(Node):
 
         self.timer = self.create_timer(1.0 / self.fps, self.timer_cb)
 
-        self.get_logger().info(f"image_topic={self.image_topic}")
+        if self.input_modality == "sparse_ball":
+            self.get_logger().info(
+                f"sparse_source={self.sparse_source} sparse_topic={self.sparse_topic}"
+            )
+        else:
+            self.get_logger().info(f"image_topic={self.image_topic}")
         if self.event_spatial_preprocessing is None:
             self.get_logger().info("event spatial preprocessing: disabled")
         else:
@@ -252,6 +289,14 @@ class FrankaActRolloutNode(Node):
         except Exception:
             t = self.get_clock().now().nanoseconds * 1e-9
         self._append_monotonic("visual", self.visual_buffer, t, msg)
+
+    def sparse_cb(self, msg: PointStamped) -> None:
+        """Buffer sparse detections exclusively by PointStamped header time."""
+        t = stamp_to_sec(msg.header.stamp)
+        if not np.isfinite(t):
+            self.get_logger().warn("Dropping sparse point with non-finite header stamp")
+            return
+        self._append_monotonic("sparse PointStamped", self.visual_buffer, t, msg)
 
     def joint_cb(self, msg: JointState) -> None:
         try:
@@ -308,17 +353,16 @@ class FrankaActRolloutNode(Node):
             dtype=torch.float32,
             device=self.device,
         )
-        warmup_image = torch.zeros(
-            (
+        if self.input_modality == "sparse_ball":
+            warmup_image = torch.zeros((1, 3, 4), dtype=torch.float32, device=self.device)
+        else:
+            warmup_image = torch.zeros((
                 1,                    # batch
                 1,                    # one logical camera
                 self.image_channels,  # 9 for 3 RGB history frames
                 self.image_size,
                 self.image_size,
-            ),
-            dtype=torch.float32,
-            device=self.device,
-        )
+            ), dtype=torch.float32, device=self.device)
 
         _warmup_output, _warmup_ms = self._run_policy_forward(
             warmup_qpos,
@@ -404,23 +448,37 @@ class FrankaActRolloutNode(Node):
         )
 
         selected_visual_msgs = [visual_messages[index] for index in sync.history_indices]
-        desired_encoding = "passthrough" if self.input_modality == "event" else "rgb8"
-        visual_frames = [
-            self.bridge.imgmsg_to_cv2(msg, desired_encoding=desired_encoding)
-            for msg in selected_visual_msgs
-        ]
+        if self.input_modality == "sparse_ball":
+            sparse_points = [
+                SparsePoint(stamp_to_sec(msg.header.stamp), msg.point.x, msg.point.y)
+                for msg in visual_messages
+            ]
+            image_np = construct_causal_sparse_history(
+                sparse_points, sync.visual_timestamps[-1], (-0.2, -0.1, 0.0),
+                self.sparse_image_width, self.sparse_image_height,
+                self.max_observation_age_sec,
+            )[None, ...]
+            visual_frames = []
+        else:
+            desired_encoding = "passthrough" if self.input_modality == "event" else "rgb8"
+            visual_frames = [
+                self.bridge.imgmsg_to_cv2(msg, desired_encoding=desired_encoding)
+                for msg in selected_visual_msgs
+            ]
         if self.input_modality == "event":
             for frame in visual_frames:
                 if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
                     raise ValueError(
                         "Event image decoding contract violated: expected uint8 HxWx3 from /openmv_cam/event_frame_3ch"
                     )
-        raw_event_shape = visual_frames[0].shape if self.event_spatial_preprocessing is not None else None
-        visual_frames = preprocess_event_history_frames(
-            visual_frames,
-            self.event_spatial_preprocessing,
-        )
-        image_np = build_visual_history_tensor(visual_frames, self.image_size, modality=self.input_modality)
+        raw_event_shape = visual_frames[0].shape if visual_frames and self.event_spatial_preprocessing is not None else None
+        if self.input_modality != "sparse_ball":
+            visual_frames = preprocess_event_history_frames(
+                visual_frames, self.event_spatial_preprocessing,
+            )
+            image_np = build_visual_history_tensor(
+                visual_frames, self.image_size, modality=self.input_modality
+            )
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         anchor_observation_timestamp = sync.visual_timestamps[-1]
@@ -439,7 +497,8 @@ class FrankaActRolloutNode(Node):
         qpos = torch.from_numpy(qpos_norm).float().to(self.device).unsqueeze(0)
         image = torch.from_numpy(image_np).float().to(self.device)
         if (
-            self.event_spatial_preprocessing is not None
+            self.input_modality != "sparse_ball"
+            and self.event_spatial_preprocessing is not None
             and not self._event_spatial_shape_trace_logged
         ):
             crop_shape = visual_frames[0].shape
@@ -672,7 +731,7 @@ def main():
 
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--max_source_buffer", type=int, default=256)
-    parser.add_argument("--max_observation_age_sec", type=float, default=0.20)
+    parser.add_argument("--max_observation_age_sec", type=float, default=None)
     parser.add_argument("--max_anchor_age_sec", type=float, default=0.10)
     parser.add_argument("--diag_log_period_sec", type=float, default=1.0)
     parser.add_argument("--reject_log_period_sec", type=float, default=1.0)
@@ -683,6 +742,9 @@ def main():
     parser.add_argument("--rgb_history_frames", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=320)
     parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb", "event"])
+    parser.add_argument("--input_modality", choices=["rgb", "event", "sparse_ball"])
+    parser.add_argument("--sparse_source", choices=["rgb", "event"])
+    parser.add_argument("--sparse_topic", type=str)
     add_event_spatial_preprocessing_arguments(parser)
 
     parser.add_argument("--lr", type=float, default=2e-5)
@@ -740,6 +802,16 @@ def main():
     parser.set_defaults(use_bce_last_action_dim=False)
 
     args = parser.parse_args()
+    if args.input_modality is None:
+        args.input_modality = args.camera_name
+    if args.max_observation_age_sec is None:
+        args.max_observation_age_sec = (
+            0.10 if args.input_modality == "sparse_ball" else 0.20
+        )
+    if args.input_modality == "sparse_ball" and args.sparse_source is None:
+        parser.error("--sparse_source rgb|event is required with sparse_ball")
+    if args.input_modality in ("rgb", "event") and args.input_modality != args.camera_name:
+        parser.error("Dense --input_modality must match --camera_name")
     try:
         args.temporal_agg_mode = resolve_temporal_agg_mode(
             temporal_agg_mode=args.temporal_agg_mode,
@@ -750,7 +822,7 @@ def main():
 
     try:
         args.event_spatial_preprocessing = resolve_event_spatial_preprocessing(
-            modality=args.camera_name,
+            modality=("rgb" if args.input_modality == "sparse_ball" else args.camera_name),
             mask_x=args.event_mask_x,
             crop_square=args.event_crop_square,
             fill_value=args.event_mask_fill_value,

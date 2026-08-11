@@ -24,6 +24,7 @@ from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from utils import INTERCEPT_HISTORY_OFFSETS_DEFAULT
 from policy import ACTPolicy, ACTTaskPolicy, CNNMLPPolicy
+from sparse_ball import validate_sparse_checkpoint_contract
 from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
@@ -47,7 +48,7 @@ def resolve_device(device_override=None):
 
 
 def validate_camera_names(camera_names):
-    allowed_single = [["rgb"], ["event"]]
+    allowed_single = [["rgb"], ["event"], ["sparse_ball"]]
     allowed_dual = ["rgb", "event"]
 
     if camera_names in allowed_single:
@@ -64,7 +65,7 @@ def validate_camera_names(camera_names):
 
     raise ValueError(
         f"Unsupported camera_names={camera_names}. "
-        "Allowed: ['rgb'], ['event'], or ['rgb', 'event']."
+        "Allowed: ['rgb'], ['event'], ['sparse_ball'], or ['rgb', 'event']."
     )
 
 
@@ -96,7 +97,7 @@ def validate_visual_history_settings(
             f"expected {expected_intercept_frames}, got {visual_history_frames}"
         )
     if data_mode == 'intercept':
-        if camera_names not in (['rgb'], ['event']):
+        if camera_names not in (['rgb'], ['event'], ['sparse_ball']):
             raise ValueError(
                 f"Interception mode currently supports only a single camera modality, got {camera_names}"
             )
@@ -141,6 +142,15 @@ def _infer_input_modality_from_stats(stats, fallback_camera_names=None):
 
 def _validate_eval_image_config(config, stats):
     policy_config = config['policy_config']
+    if policy_config.get('input_modality') == 'sparse_ball':
+        validate_sparse_checkpoint_contract(
+            stats, policy_config.get('sparse_source'),
+            stats.get('sparse_image_width'), stats.get('sparse_image_height'),
+            policy_config.get('max_observation_age_sec', 0.10),
+        )
+        policy_config['sparse_mean'] = stats['sparse_mean']
+        policy_config['sparse_std'] = stats['sparse_std']
+        return
     configured_visual_history_frames = int(
         policy_config.get(
             'visual_history_frames',
@@ -215,6 +225,16 @@ def _validate_intercept_checkpoint_metadata(config, stats):
     configured_input_modality = str(
         config['policy_config'].get('input_modality', config.get('input_modality', 'rgb'))
     )
+    if configured_input_modality == 'sparse_ball':
+        policy_config = config['policy_config']
+        validate_sparse_checkpoint_contract(
+            stats, policy_config.get('sparse_source'),
+            stats.get('sparse_image_width'), stats.get('sparse_image_height'),
+            policy_config.get('max_observation_age_sec', 0.10),
+        )
+        if configured_camera_names != ['sparse_ball']:
+            raise ValueError("Sparse checkpoints require camera_names=['sparse_ball']")
+        return
 
     saved_input_modality = _infer_input_modality_from_stats(
         stats,
@@ -391,7 +411,24 @@ def main(args):
     )
     rgb_history_frames = visual_history_frames  # legacy alias kept for compatibility
     event_channel_selection = args['event_channel_selection']
-    input_modality = 'event' if camera_names == ['event'] else 'rgb'
+    inferred_input_modality = (
+        'sparse_ball' if camera_names == ['sparse_ball']
+        else ('event' if camera_names == ['event'] else 'rgb')
+    )
+    input_modality = args.get('input_modality') or inferred_input_modality
+    if input_modality != inferred_input_modality:
+        raise ValueError(
+            f"--input_modality {input_modality!r} does not match --camera_names {camera_names}"
+        )
+    sparse_source = args.get('sparse_source')
+    sparse_feature_dim = int(args.get('sparse_feature_dim', 4))
+    sparse_history_length = int(args.get('sparse_history_length', 3))
+    max_observation_age_sec = float(args.get('max_observation_age_sec', 0.10))
+    if input_modality == 'sparse_ball':
+        if sparse_source not in ('rgb', 'event'):
+            raise ValueError('--sparse_source rgb|event is required for sparse_ball')
+        if sparse_feature_dim != 4 or sparse_history_length != 3:
+            raise ValueError('Sparse ACT requires feature_dim=4 and history_length=3')
     visual_history_offsets = (
         list(intercept_visual_config['visual_history_offsets'])
         if intercept_visual_config is not None
@@ -466,7 +503,7 @@ def main(args):
             if action_dim != 1:
                 raise ValueError(f"--action_dim must be 1 when --data_mode intercept, got {action_dim}")
 
-        if camera_names not in (['rgb'], ['event']):
+        if camera_names not in (['rgb'], ['event'], ['sparse_ball']):
             raise ValueError(f"--data_mode intercept requires --camera_names rgb or event, got {camera_names}")
         if event_channel_selection is not None:
             raise ValueError('--event_channel_selection is not supported for interception mode.')
@@ -532,6 +569,10 @@ def main(args):
                          'rgb_history_frames': rgb_history_frames,
                          'rgb_history_offsets': list(visual_history_offsets),
                          'image_channels': image_channels,
+                         'sparse_source': sparse_source,
+                         'sparse_feature_dim': sparse_feature_dim,
+                         'sparse_history_length': sparse_history_length,
+                         'max_observation_age_sec': max_observation_age_sec,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -681,6 +722,11 @@ def main(args):
             rgb_history_frames=rgb_history_frames,
             visual_history_frames=visual_history_frames,
             history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
+            input_modality=input_modality,
+            sparse_source=sparse_source,
+            sparse_feature_dim=sparse_feature_dim,
+            sparse_history_length=sparse_history_length,
+            max_observation_age_sec=max_observation_age_sec,
         )
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
@@ -695,7 +741,10 @@ def main(args):
             f'action={tuple(batch_action.shape)}, '
             f'is_pad={tuple(batch_is_pad.shape)}'
         )
-        assert batch_image.ndim == 5 and batch_image.shape[1] == 1 and batch_image.shape[2] == 9, batch_image.shape
+        if input_modality == 'sparse_ball':
+            assert batch_image.shape[1:] == (3, 4), batch_image.shape
+        else:
+            assert batch_image.ndim == 5 and batch_image.shape[1] == 1, batch_image.shape
         assert batch_qpos.ndim == 2 and batch_qpos.shape[1] == 21, batch_qpos.shape
         assert batch_action.ndim == 3 and batch_action.shape[2] == 1, batch_action.shape
         assert batch_action.shape[1] == args['chunk_size'], batch_action.shape
@@ -708,7 +757,9 @@ def main(args):
 
         assert int(policy_config['state_dim']) == 21, policy_config['state_dim']
         assert int(policy_config['action_dim']) == 1, policy_config['action_dim']
-        assert int(policy_config['image_channels']) == 9, policy_config['image_channels']
+        if input_modality == 'sparse_ball':
+            policy_config['sparse_mean'] = stats['sparse_mean']
+            policy_config['sparse_std'] = stats['sparse_std']
         assert bool(policy_config['use_bce_last_action_dim']) is False, policy_config['use_bce_last_action_dim']
 
     # save dataset stats
@@ -1531,6 +1582,11 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
     parser.add_argument('--camera_names', nargs='+', required=True, help='camera names to load from dataset')
+    parser.add_argument('--input_modality', choices=['rgb', 'event', 'sparse_ball'])
+    parser.add_argument('--sparse_source', choices=['rgb', 'event'])
+    parser.add_argument('--sparse_feature_dim', type=int, default=4)
+    parser.add_argument('--sparse_history_length', type=int, default=3)
+    parser.add_argument('--max_observation_age_sec', type=float, default=0.10)
     parser.add_argument(
         '--event_channel_selection',
         type=int,

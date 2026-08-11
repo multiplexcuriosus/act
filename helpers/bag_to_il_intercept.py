@@ -93,6 +93,44 @@ def ns_to_sec(timestamp_ns: int) -> float:
     return float(timestamp_ns) * 1e-9
 
 
+def header_stamp_to_sec(msg: Any) -> float:
+    """Return a PointStamped source timestamp, never its bag receipt time."""
+    try:
+        stamp = msg.header.stamp
+        value = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError("RGB PointStamped message has no valid header timestamp") from error
+    if not np.isfinite(value):
+        raise RuntimeError("RGB PointStamped header timestamp is non-finite")
+    return value
+
+
+def add_rgb_source_timestamps_dataset(path, values, overwrite=False):
+    """Add or replace only the RGB source-timestamp dataset in an episode."""
+    values = np.asarray(values, dtype=np.float64)
+    with h5py.File(path, "r+") as target:
+        sparse_key = "/observations/sparse_tracking"
+        key = f"{sparse_key}/rgb_source_timestamps"
+        if sparse_key not in target:
+            raise ValueError(f"{path}: missing {sparse_key}")
+        if key in target and not overwrite:
+            raise FileExistsError(f"{path}: {key} already exists; use --overwrite")
+        timestamps = target["/observations/timestamps"]
+        if values.shape != timestamps.shape:
+            raise ValueError(
+                f"{path}: RGB source timestamps must have shape {timestamps.shape}, "
+                f"got {values.shape}"
+            )
+        sparse = target[sparse_key]
+        temporary_name = "rgb_source_timestamps.__tmp__"
+        if temporary_name in sparse:
+            del sparse[temporary_name]
+        sparse.create_dataset(temporary_name, data=values, dtype=np.float64)
+        if "rgb_source_timestamps" in sparse:
+            del sparse["rgb_source_timestamps"]
+        sparse.move(temporary_name, "rgb_source_timestamps")
+
+
 def open_reader(bag_path: str, storage_id: str) -> rosbag2_py.SequentialReader:
     reader = rosbag2_py.SequentialReader()
     reader.open(
@@ -448,6 +486,7 @@ def create_episode_buffer() -> Dict[str, Any]:
         "rgb_t": [],
         "rgb_msg": [],
         "rgb_2d_t": [],
+        "rgb_2d_source_t": [],
         "rgb_2d_px": [],
         "joint_t": [],
         "qpos": [],
@@ -472,6 +511,7 @@ def ingest_episode_message(
         data["rgb_msg"].append(msg)
     elif topic == topics.rgb_2d:
         data["rgb_2d_t"].append(timestamp)
+        data["rgb_2d_source_t"].append(header_stamp_to_sec(msg))
         data["rgb_2d_px"].append([float(msg.point.x), float(msg.point.y)])
     elif topic == topics.joint:
         data["joint_t"].append(timestamp)
@@ -702,15 +742,20 @@ def sample_episode(
 
     rgb_2d_px = np.zeros((grid.size, 2), dtype=np.float32)
     rgb_valid = np.zeros((grid.size,), dtype=np.uint8)
+    rgb_source_timestamps = np.full((grid.size,), np.nan, dtype=np.float64)
     if rgb_2d_enabled and data.get("rgb_2d_t"):
         detection_times = np.asarray(data["rgb_2d_t"], dtype=np.float64)
         detections = np.asarray(data["rgb_2d_px"], dtype=np.float32).reshape(-1, 2)
+        source_times = np.asarray(data["rgb_2d_source_t"], dtype=np.float64)
+        if source_times.shape != detection_times.shape:
+            raise RuntimeError("RGB 2D source timestamp count does not match detections")
         _validate_monotonic_non_decreasing("RGB 2D", detection_times)
         detection_indices = np.searchsorted(detection_times, grid, side="right") - 1
         present = detection_indices >= 0
         if np.any(present):
             selected = detection_indices[present]
             points = detections[selected]
+            rgb_source_timestamps[present] = source_times[selected]
             ages = grid[present] - detection_times[selected]
             heights = rgb[present].shape[1]
             widths = rgb[present].shape[2]
@@ -918,6 +963,7 @@ def sample_episode(
     if rgb_2d_enabled:
         arrays["rgb_2d_px"] = rgb_2d_px
         arrays["rgb_valid"] = rgb_valid
+        arrays["rgb_source_timestamps"] = rgb_source_timestamps
 
     if event is not None:
         arrays["event"] = event
@@ -1069,6 +1115,11 @@ def write_episode(
                 sparse.create_dataset(
                     "rgb_valid", data=arrays["rgb_valid"], dtype=np.uint8
                 )
+                sparse.create_dataset(
+                    "rgb_source_timestamps",
+                    data=arrays["rgb_source_timestamps"],
+                    dtype=np.float64,
+                )
                 sparse.attrs["rgb_source_topic"] = topics.rgb_2d
                 sparse.attrs["rgb_sampling_policy"] = (
                     "latest_message_at_or_before_observation_timestamp"
@@ -1077,6 +1128,8 @@ def write_episode(
                     max_rgb_2d_age_sec
                 )
                 sparse.attrs["rgb_invalid_coordinate_fill"] = 0.0
+                sparse.attrs["rgb_width_px"] = int(arrays["rgb"].shape[2])
+                sparse.attrs["rgb_height_px"] = int(arrays["rgb"].shape[1])
             images.create_dataset(
                 "rgb",
                 data=arrays["rgb"],

@@ -78,14 +78,27 @@ class ACTPolicy(nn.Module):
             False
         )
         self.image_channels = int(args_override.get('image_channels', 3))
+        self.input_modality = args_override.get('input_modality', 'rgb')
         self.image_normalization = args_override.get('image_normalization', 'imagenet')
-        self.normalize = _build_image_normalizer(self.image_channels, self.image_normalization)
+        if self.input_modality == 'sparse_ball':
+            mean = torch.as_tensor(args_override['sparse_mean'], dtype=torch.float32)
+            std = torch.as_tensor(args_override['sparse_std'], dtype=torch.float32)
+            if mean.shape != (4,) or std.shape != (4,):
+                raise ValueError("Sparse normalization statistics must have shape (4,)")
+            self.register_buffer('sparse_mean', mean)
+            self.register_buffer('sparse_std', std.clamp_min(1e-4))
+            self.normalize = None
+        else:
+            self.normalize = _build_image_normalizer(self.image_channels, self.image_normalization)
         _assert_backbone_channels(self.model, self.image_channels)
         print(f'KL Weight {self.kl_weight}')
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None
-        image = self.normalize(image)
+        if self.input_modality == 'sparse_ball':
+            image = (image - self.sparse_mean) / self.sparse_std
+        else:
+            image = self.normalize(image)
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]

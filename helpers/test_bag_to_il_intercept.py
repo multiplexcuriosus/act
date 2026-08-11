@@ -131,6 +131,9 @@ class BagToIlInterceptTests(unittest.TestCase):
         data = {
             "rgb_t": [base_time + 0.0, base_time + 0.1, base_time + 0.2],
             "rgb_msg": rgb_msgs,
+            "rgb_2d_t": [],
+            "rgb_2d_source_t": [],
+            "rgb_2d_px": [],
             "joint_t": [base_time + 0.0, base_time + 0.1, base_time + 0.2],
             "qpos": [
                 np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.float32),
@@ -154,6 +157,7 @@ class BagToIlInterceptTests(unittest.TestCase):
     def test_rgb_2d_sampling_is_causal_and_validated(self):
         data = self.make_sampling_data([0.0, 0.1, 0.2], [0.0, 0.1, 0.2])
         data["rgb_2d_t"] = [0.05, 0.15]
+        data["rgb_2d_source_t"] = [0.04, 0.14]
         data["rgb_2d_px"] = [[0.25, 0.75], [1.0, 0.5]]
         arrays = self.mod.sample_episode(
             data, self.make_episode(end=0.2), fps=10.0,
@@ -165,8 +169,13 @@ class BagToIlInterceptTests(unittest.TestCase):
             arrays["rgb_2d_px"], [[0.0, 0.0], [0.25, 0.75], [0.0, 0.0]])
         self.assertEqual(arrays["rgb_2d_px"].dtype, np.dtype("f4"))
         self.assertEqual(arrays["rgb_valid"].dtype, np.dtype("u1"))
+        np.testing.assert_allclose(
+            arrays["rgb_source_timestamps"], [np.nan, 0.04, 0.14],
+            equal_nan=True,
+        )
 
         data["rgb_2d_t"] = [0.0, 0.1]
+        data["rgb_2d_source_t"] = [0.0, 0.09]
         data["rgb_2d_px"] = [[0.5, 0.5], [np.nan, np.inf]]
         arrays = self.mod.sample_episode(
             data, self.make_episode(end=0.2), fps=10.0,
@@ -180,6 +189,7 @@ class BagToIlInterceptTests(unittest.TestCase):
     def test_rgb_2d_write_default_and_opt_out_schema(self):
         data = self.make_sampling_data([0.0, 0.1, 0.2], [0.0, 0.1, 0.2])
         data["rgb_2d_t"] = []
+        data["rgb_2d_source_t"] = []
         data["rgb_2d_px"] = []
         episode = self.make_episode(end=0.2)
         topics = self.make_topics()
@@ -199,9 +209,34 @@ class BagToIlInterceptTests(unittest.TestCase):
                         sparse = result["observations/sparse_tracking"]
                         self.assertEqual(sparse["rgb_2d_px"].shape, (3, 2))
                         self.assertEqual(sparse["rgb_valid"].shape, (3,))
+                        self.assertEqual(sparse["rgb_source_timestamps"].shape, (3,))
+                        self.assertEqual(sparse["rgb_source_timestamps"].dtype, np.dtype("f8"))
+                        self.assertTrue(np.isnan(sparse["rgb_source_timestamps"][:]).all())
                         self.assertEqual(int(np.sum(sparse["rgb_valid"][:])), 0)
                     else:
                         self.assertNotIn("sparse_tracking", result["observations"])
+
+    def test_rgb_timestamp_migration_changes_only_timestamp_dataset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "episode_0.hdf5")
+            with h5py.File(path, "w") as target:
+                observations = target.create_group("observations")
+                observations.create_dataset("timestamps", data=[1.0, 1.1])
+                sparse = observations.create_group("sparse_tracking")
+                sparse.attrs["sentinel"] = "keep"
+                sparse.create_dataset("rgb_2d_px", data=np.asarray([[1, 2], [3, 4]], "f4"))
+                sparse.create_dataset("rgb_valid", data=np.asarray([1, 0], "u1"))
+                sparse.create_dataset("event_sentinel", data=np.asarray([7], "i2"))
+            self.mod.add_rgb_source_timestamps_dataset(path, [0.99, np.nan])
+            with h5py.File(path, "r") as target:
+                sparse = target["observations/sparse_tracking"]
+                np.testing.assert_allclose(
+                    sparse["rgb_source_timestamps"][:], [0.99, np.nan], equal_nan=True
+                )
+                np.testing.assert_array_equal(sparse["rgb_2d_px"][:], [[1, 2], [3, 4]])
+                np.testing.assert_array_equal(sparse["rgb_valid"][:], [1, 0])
+                np.testing.assert_array_equal(sparse["event_sentinel"][:], [7])
+                self.assertEqual(sparse.attrs["sentinel"], "keep")
 
     @staticmethod
     def make_raw_events_h5(
