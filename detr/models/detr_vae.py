@@ -62,7 +62,7 @@ class DETRVAE(nn.Module):
                 raise ValueError('sparse_ball must not instantiate a visual backbone')
             self.backbones = None
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
-            self.sparse_input_proj = nn.Sequential(
+            self.sparse_feature_proj = nn.Sequential(
                 nn.Linear(self.sparse_feature_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)
             )
             self.sparse_pos_embed = nn.Embedding(self.sparse_history_length, hidden_dim)
@@ -133,7 +133,7 @@ class DETRVAE(nn.Module):
                 raise ValueError(
                     f'sparse_ball input must have shape [B,{self.sparse_history_length},{self.sparse_feature_dim}], got {tuple(image.shape)}'
                 )
-            sparse = self.sparse_input_proj(image).transpose(1, 2).unsqueeze(2)
+            sparse = self.sparse_feature_proj(image).transpose(1, 2).unsqueeze(2)
             # Transformer repeats positional encodings across the batch internally.
             pos = self.sparse_pos_embed.weight.transpose(0, 1).unsqueeze(0).unsqueeze(2)
             proprio_input = self.input_proj_robot_state(qpos)

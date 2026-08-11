@@ -75,6 +75,28 @@ def policy_period_sec(fps: float) -> float:
     return 1.0 / fps
 
 
+def validate_sparse_checkpoint_state_dict(checkpoint_state, chunk_size: int) -> None:
+    """Validate sparse architecture facts encoded directly in checkpoint tensors."""
+    if not isinstance(checkpoint_state, dict):
+        raise ValueError("Sparse checkpoint must contain a state dictionary")
+    backbone_keys = [key for key in checkpoint_state if "backbone" in str(key).lower()]
+    if backbone_keys:
+        raise ValueError("Sparse checkpoint contains a dense visual backbone")
+    query_key = "model.query_embed.weight"
+    if query_key not in checkpoint_state:
+        raise ValueError(f"Sparse checkpoint is missing {query_key}")
+    query_shape = tuple(checkpoint_state[query_key].shape)
+    if len(query_shape) != 2 or query_shape[0] != int(chunk_size):
+        raise ValueError(
+            "Sparse checkpoint chunk_size mismatch: "
+            f"expected {chunk_size}, query embedding shape={query_shape}"
+        )
+    action_key = "model.action_head.weight"
+    if action_key not in checkpoint_state or checkpoint_state[action_key].shape[0] != 1:
+        actual = None if action_key not in checkpoint_state else tuple(checkpoint_state[action_key].shape)
+        raise ValueError(f"Sparse checkpoint action_dim mismatch: expected 1, shape={actual}")
+
+
 def create_visual_subscription(node, input_modality: str, image_topic: str,
                                sparse_topic: str):
     """Create exactly one visual-input subscription for the selected modality."""
@@ -238,10 +260,8 @@ class FrankaActRolloutNode(Node):
 
         self.policy = ACTPolicy(policy_config)
         checkpoint_state = torch.load(ckpt_path, map_location=self.device)
-        if self.input_modality == "sparse_ball" and any(
-            "backbone" in str(key).lower() for key in checkpoint_state
-        ):
-            raise ValueError("Sparse checkpoint contains a dense visual backbone")
+        if self.input_modality == "sparse_ball":
+            validate_sparse_checkpoint_state_dict(checkpoint_state, self.chunk_size)
         loading_status = self.policy.load_state_dict(checkpoint_state)
         self.get_logger().info(f"Checkpoint load status: {loading_status}")
         self.policy.to(self.device)

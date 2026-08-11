@@ -109,6 +109,9 @@ def test_four_feature_checkpoint_loads_and_six_feature_or_source_mismatch_reject
                "image_width": 1280, "image_height": 720}
     arrays = validate_intercept_stats_and_config(_sparse_stats(), config, 30, runtime)
     assert arrays["sparse_mean"].shape == (4,)
+    stats_without_redundant_chunk_size = _sparse_stats()
+    stats_without_redundant_chunk_size.pop("chunk_size")
+    validate_intercept_stats_and_config(stats_without_redundant_chunk_size, config, 30, runtime)
     policy = ACTPolicy(config)
     assert policy.model.backbones is None
     assert policy(torch.zeros(1, 21), torch.zeros(1, 3, 4)).shape == (1, 30, 1)

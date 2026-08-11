@@ -85,8 +85,8 @@ class ACTPolicy(nn.Module):
         self.sparse_feature_dim = int(args_override.get('sparse_feature_dim', 4))
         self.sparse_history_length = int(args_override.get('sparse_history_length', 3))
         # Statistics live in dataset_stats.pkl; non-persistent buffers preserve dense checkpoint keys.
-        self.register_buffer('sparse_mean', torch.as_tensor(args_override.get('sparse_mean', [0.] * self.sparse_feature_dim), dtype=torch.float32), persistent=False)
-        self.register_buffer('sparse_std', torch.as_tensor(args_override.get('sparse_std', [1.] * self.sparse_feature_dim), dtype=torch.float32), persistent=False)
+        self.register_buffer('sparse_mean', torch.as_tensor(args_override.get('sparse_mean', [0.] * self.sparse_feature_dim), dtype=torch.float32))
+        self.register_buffer('sparse_std', torch.as_tensor(args_override.get('sparse_std', [1.] * self.sparse_feature_dim), dtype=torch.float32))
         self.image_channels = int(args_override.get('image_channels', 3))
         self.image_normalization = args_override.get('image_normalization', 'imagenet')
         self.normalize = None if self.input_modality == 'sparse_ball' else _build_image_normalizer(self.image_channels, self.image_normalization)

@@ -415,9 +415,7 @@ def validate_intercept_stats_and_config(
                 f"Interception checkpoint metadata mismatch for {key}: "
                 f"expected {expected!r}, found {stats[key]!r}"
             )
-    if "chunk_size" not in stats:
-        raise ValueError("Missing interception checkpoint metadata in dataset_stats.pkl: chunk_size")
-    if int(stats["chunk_size"]) != int(expected_chunk_size):
+    if "chunk_size" in stats and int(stats["chunk_size"]) != int(expected_chunk_size):
         raise ValueError(
             f"Checkpoint chunk_size mismatch: requested {expected_chunk_size}, "
             f"checkpoint {stats['chunk_size']}"
