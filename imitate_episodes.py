@@ -1325,7 +1325,14 @@ def train_bc(train_dataloader, val_dataloader, config):
             if not printed_train_image_shape:
                 image_data = data[0]
                 print(f"[DEBUG] train image_data.shape={tuple(image_data.shape)}")
-                if policy_config.get('event_channel_indices') is not None:
+                if policy_config.get('input_modality') == 'sparse_ball':
+                    expected_history = int(policy_config.get('sparse_history_length', 3))
+                    expected_features = int(policy_config.get('sparse_feature_dim', 4))
+                    assert image_data.ndim == 3, image_data.shape
+                    assert image_data.shape[1:] == (
+                        expected_history, expected_features
+                    ), image_data.shape
+                elif policy_config.get('event_channel_indices') is not None:
                     assert image_data.ndim == 5, image_data.shape
                     assert image_data.shape[1] == 1, image_data.shape
                     assert image_data.shape[2] == 1, image_data.shape
