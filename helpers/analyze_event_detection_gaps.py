@@ -16,7 +16,9 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
+from html import escape
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -391,6 +393,190 @@ def _print_episode(metric: Mapping[str, Any]) -> None:
     )
 
 
+def _safe_plot_name(episode_id: str, index: int) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", episode_id).strip("._")
+    return f"episode_{index:04d}_{stem[-80:] or 'episode'}.svg"
+
+
+def _write_episode_plot(
+    path: Path,
+    metric: Mapping[str, Any],
+    runs: Sequence[Mapping[str, Any]],
+    presence_mode: str,
+    max_age_ms: float,
+) -> None:
+    """Write a dependency-free SVG timeline using actual run-time offsets."""
+    width, height = 1100, 300
+    left, right, timeline_y, timeline_h = 80, 30, 108, 72
+    plot_width = width - left - right
+    duration = float(metric["episode_duration_sec"])
+    title = escape(str(metric["episode_id"]))
+    mode_note = f"mode={presence_mode}"
+    if presence_mode == "fresh":
+        mode_note += f", max age={max_age_ms:g} ms"
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<style>text{font-family:Arial,sans-serif;fill:#202124}.small{font-size:12px}.label{font-size:14px}.title{font-size:17px;font-weight:bold}</style>',
+        f'<text x="{left}" y="28" class="title">Event-detection presence timeline</text>',
+        f'<text x="{left}" y="51" class="small">{title}</text>',
+        f'<text x="{left}" y="72" class="small">{escape(mode_note)}; actual timestamp-cell duration={duration:.3f} s</text>',
+        f'<text x="{left - 10}" y="{timeline_y + timeline_h / 2 + 5}" text-anchor="end" class="label">state</text>',
+    ]
+    for run in runs:
+        start = float(run["start_offset_sec"])
+        run_duration = float(run["duration_sec"])
+        x = left + plot_width * start / duration
+        rect_width = max(0.8, plot_width * run_duration / duration)
+        color = "#2e7d32" if run["state"] == "present" else "#d32f2f"
+        tooltip = escape(
+            f"{run['state']}: {start:.6f}-{start + run_duration:.6f} s "
+            f"({run_duration * 1000.0:.2f} ms, {run['sample_count']} samples)"
+        )
+        elements.append(
+            f'<rect x="{x:.3f}" y="{timeline_y}" width="{rect_width:.3f}" '
+            f'height="{timeline_h}" fill="{color}"><title>{tooltip}</title></rect>'
+        )
+    elements.extend(
+        [
+            f'<rect x="{left}" y="{timeline_y}" width="{plot_width}" height="{timeline_h}" fill="none" stroke="#333"/>',
+            f'<text x="{left}" y="{timeline_y + timeline_h + 22}" class="small">0 s</text>',
+            f'<text x="{left + plot_width}" y="{timeline_y + timeline_h + 22}" text-anchor="end" class="small">{duration:.3f} s</text>',
+            '<rect x="80" y="226" width="16" height="16" fill="#2e7d32"/><text x="103" y="239" class="small">present</text>',
+            '<rect x="180" y="226" width="16" height="16" fill="#d32f2f"/><text x="203" y="239" class="small">absent / gap</text>',
+            f'<text x="360" y="239" class="small">presence={100.0 * float(metric["time_weighted_presence_fraction"]):.2f}% · gaps={metric["gap_count_including_boundary_gaps"]} · max gap={_fmt(metric["maximum_gap_duration_ms"], 1)} ms</text>',
+            '</svg>',
+        ]
+    )
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _write_aggregate_plot(
+    path: Path,
+    metrics: Sequence[Mapping[str, Any]],
+    runs: Sequence[Mapping[str, Any]],
+    aggregate: Mapping[str, Any],
+    presence_mode: str,
+    max_age_ms: float,
+) -> None:
+    """Write an SVG dashboard of aggregate presence and dropout behavior."""
+    width, height = 1200, 700
+    presence = float(aggregate["time_weighted_presence_fraction"])
+    gap_ms = np.asarray(
+        [float(run["duration_sec"]) * 1000.0 for run in runs if run["state"] == "absent"],
+        dtype=np.float64,
+    )
+    counts = np.array(
+        [
+            np.count_nonzero(gap_ms <= 33.0),
+            np.count_nonzero((gap_ms > 33.0) & (gap_ms <= 50.0)),
+            np.count_nonzero((gap_ms > 50.0) & (gap_ms <= 100.0)),
+            np.count_nonzero((gap_ms > 100.0) & (gap_ms <= 200.0)),
+            np.count_nonzero(gap_ms > 200.0),
+        ],
+        dtype=int,
+    )
+    labels = ("≤33", "33–50", "50–100", "100–200", ">200")
+    mode_note = f"mode={presence_mode}" + (
+        f", max age={max_age_ms:g} ms" if presence_mode == "fresh" else ""
+    )
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<style>text{font-family:Arial,sans-serif;fill:#202124}.small{font-size:12px}.label{font-size:14px}.title{font-size:20px;font-weight:bold}.section{font-size:16px;font-weight:bold}</style>',
+        '<text x="50" y="34" class="title">Event-detection aggregate analysis</text>',
+        f'<text x="50" y="58" class="label">{escape(mode_note)} · episodes={len(metrics)} · duration={float(aggregate["total_observation_duration_sec"]):.3f} s</text>',
+        '<text x="50" y="98" class="section">Time-weighted presence</text>',
+    ]
+    # Stacked presence/absence bar is less ambiguous than a pie and preserves exact proportions.
+    bar_x, bar_y, bar_w, bar_h = 50, 120, 500, 65
+    present_w = bar_w * presence
+    elements.extend(
+        [
+            f'<rect x="{bar_x}" y="{bar_y}" width="{present_w:.3f}" height="{bar_h}" fill="#2e7d32"/>',
+            f'<rect x="{bar_x + present_w:.3f}" y="{bar_y}" width="{bar_w - present_w:.3f}" height="{bar_h}" fill="#d32f2f"/>',
+            f'<rect x="{bar_x}" y="{bar_y}" width="{bar_w}" height="{bar_h}" fill="none" stroke="#333"/>',
+            f'<text x="{bar_x + 8}" y="{bar_y + 40}" fill="white" style="fill:white;font-weight:bold">present {presence * 100:.2f}%</text>',
+            f'<text x="{bar_x + bar_w - 8}" y="{bar_y + 40}" text-anchor="end" fill="white" style="fill:white;font-weight:bold">absent {(1-presence) * 100:.2f}%</text>',
+            '<text x="650" y="98" class="section">Gap-duration distribution (ms)</text>',
+        ]
+    )
+    hist_x, hist_y, hist_w, hist_h = 650, 120, 490, 170
+    max_count = max(int(np.max(counts)), 1)
+    each_w = hist_w / len(counts)
+    for index, (label, count) in enumerate(zip(labels, counts)):
+        h = hist_h * int(count) / max_count
+        x = hist_x + index * each_w + 12
+        y = hist_y + hist_h - h
+        elements.extend(
+            [
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{each_w - 24:.2f}" height="{h:.2f}" fill="#ef6c00"><title>{escape(label)} ms: {int(count)} gaps</title></rect>',
+                f'<text x="{x + (each_w - 24) / 2:.2f}" y="{hist_y + hist_h + 18}" text-anchor="middle" class="small">{escape(label)}</text>',
+                f'<text x="{x + (each_w - 24) / 2:.2f}" y="{max(y - 5, hist_y + 12):.2f}" text-anchor="middle" class="small">{int(count)}</text>',
+            ]
+        )
+    elements.append(f'<line x1="{hist_x}" y1="{hist_y + hist_h}" x2="{hist_x + hist_w}" y2="{hist_y + hist_h}" stroke="#333"/>')
+    elements.append('<text x="50" y="245" class="section">Episode presence fractions</text>')
+    chart_x, chart_y, chart_w, chart_h = 50, 270, 1090, 320
+    n = len(metrics)
+    slot = chart_w / max(n, 1)
+    for index, metric in enumerate(metrics):
+        value = float(metric["time_weighted_presence_fraction"])
+        height_px = chart_h * value
+        x = chart_x + index * slot + min(5.0, slot * 0.1)
+        rect_w = max(1.0, slot - min(10.0, slot * 0.2))
+        title = escape(f"{metric['episode_id']}: {value * 100:.2f}%")
+        elements.append(
+            f'<rect x="{x:.2f}" y="{chart_y + chart_h - height_px:.2f}" width="{rect_w:.2f}" '
+            f'height="{height_px:.2f}" fill="#1565c0"><title>{title}</title></rect>'
+        )
+        if n <= 30:
+            elements.append(
+                f'<text x="{x + rect_w / 2:.2f}" y="{chart_y + chart_h + 17}" text-anchor="middle" class="small">{index + 1}</text>'
+            )
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        y = chart_y + chart_h * (1.0 - fraction)
+        elements.extend(
+            [
+                f'<line x1="{chart_x}" y1="{y:.2f}" x2="{chart_x + chart_w}" y2="{y:.2f}" stroke="#bbb" stroke-dasharray="3 4"/>',
+                f'<text x="{chart_x - 8}" y="{y + 4:.2f}" text-anchor="end" class="small">{fraction * 100:.0f}%</text>',
+            ]
+        )
+    elements.extend(
+        [
+            f'<text x="50" y="660" class="small">Pooled gaps: {aggregate["pooled_total_gap_count"]}; median/p90/p95/max: '
+            f'{_fmt(aggregate["pooled_all_gaps"]["median_ms"], 1)} / {_fmt(aggregate["pooled_all_gaps"]["p90_ms"], 1)} / '
+            f'{_fmt(aggregate["pooled_all_gaps"]["p95_ms"], 1)} / {_fmt(aggregate["pooled_all_gaps"]["max_ms"], 1)} ms</text>',
+            '</svg>',
+        ]
+    )
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def write_plots(
+    plot_dir: Path,
+    episode_metrics: Sequence[Mapping[str, Any]],
+    all_runs: Sequence[Mapping[str, Any]],
+    aggregate: Mapping[str, Any],
+    presence_mode: str,
+    max_age_ms: float,
+) -> list[str]:
+    """Create per-episode timelines and an aggregate SVG dashboard."""
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for index, metric in enumerate(episode_metrics):
+        episode_runs = [run for run in all_runs if run["episode_id"] == metric["episode_id"]]
+        path = plot_dir / _safe_plot_name(str(metric["episode_id"]), index)
+        _write_episode_plot(path, metric, episode_runs, presence_mode, max_age_ms)
+        paths.append(str(path))
+    aggregate_path = plot_dir / "aggregate_summary.svg"
+    _write_aggregate_plot(
+        aggregate_path, episode_metrics, all_runs, aggregate, presence_mode, max_age_ms
+    )
+    paths.append(str(aggregate_path))
+    return paths
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -406,6 +592,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recursive", action="store_true", help="recursively discover HDF5 files")
     parser.add_argument("--max-files", type=int, help="analyze at most M discovered files")
     parser.add_argument("--output-dir", type=Path, help="directory for CSV and JSON reports")
+    parser.add_argument(
+        "--plot", action="store_true",
+        help="create dependency-free SVG timelines and summary charts under OUTPUT_DIR/plots",
+    )
     parser.add_argument(
         "--presence-mode", choices=("valid", "fresh", "new_update"), default="fresh",
         help="presence signal (default: fresh; valid may include held tracker values)",
@@ -512,6 +702,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "presence_mode": args.presence_mode,
                 "max_age_ms": args.max_age_ms,
                 "timestamp_epsilon_sec": args.timestamp_epsilon,
+                "plots_enabled": args.plot,
                 "policy_grid_note": "approximately 30 Hz policy-grid-visible presence",
             },
             "aggregate_metrics": None,
@@ -527,12 +718,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     aggregate = summarize_aggregate(episode_metrics, all_runs, discovered_count, len(skipped))
     _write_csv(output_dir / "per_episode_metrics.csv", episode_metrics)
     _write_csv(output_dir / "rle_runs.csv", all_runs)
+    plot_paths = (
+        write_plots(
+            output_dir / "plots", episode_metrics, all_runs, aggregate,
+            args.presence_mode, args.max_age_ms,
+        )
+        if args.plot else []
+    )
     summary = {
         "analysis_configuration": {
             "presence_mode": args.presence_mode,
             "max_age_ms": args.max_age_ms,
             "max_age_sec": max_age_sec,
             "timestamp_epsilon_sec": args.timestamp_epsilon,
+            "plots_enabled": args.plot,
             "gap_thresholds_ms": list(GAP_THRESHOLDS_MS),
             "policy_grid_note": (
                 "approximately 30 Hz policy-grid-visible presence; native tracker gaps faster "
@@ -542,6 +741,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "aggregate_metrics": aggregate,
         "skipped_episodes": skipped,
         "analyzed_episode_identifiers": [m["episode_id"] for m in episode_metrics],
+        "plot_files": plot_paths,
     }
     (output_dir / "aggregate_summary.json").write_text(
         json.dumps(_json_value(summary), indent=2) + "\n", encoding="utf-8"
@@ -560,6 +760,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{_fmt(aggregate['pooled_all_gaps']['p95_sec'])}/"
         f"{_fmt(aggregate['pooled_all_gaps']['max_sec'])}s"
     )
+    if plot_paths:
+        print(f"Plots written to {output_dir / 'plots'}")
     print(f"Reports written to {output_dir}")
     return 0
 
