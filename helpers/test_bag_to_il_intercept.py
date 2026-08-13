@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -1039,7 +1040,7 @@ class BagToIlInterceptTests(unittest.TestCase):
                     event_clip_count=4.0,
                 )
 
-    def test_resolve_input_paths_defaults_to_recording_sidecar_for_event_mode(self):
+    def test_resolve_input_paths_allows_rgb_only_when_sidecar_is_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             rec_dir = os.path.join(tmpdir, "recording_20260728_225008")
             os.makedirs(rec_dir)
@@ -1060,12 +1061,8 @@ class BagToIlInterceptTests(unittest.TestCase):
             ):
                 resolved_bag_path, resolved_sidecar_path = self.mod.resolve_input_paths(args)
 
-            expected_sidecar = os.path.join(
-                rec_dir,
-                "recording_20260728_225008_raw_events.h5",
-            )
             self.assertEqual(resolved_bag_path, bag_path)
-            self.assertEqual(resolved_sidecar_path, expected_sidecar)
+            self.assertIsNone(resolved_sidecar_path)
 
     def test_apply_storage_filter_sets_expected_topics(self):
         captured = {}
@@ -1244,6 +1241,140 @@ class BagToIlInterceptTests(unittest.TestCase):
         self.assertEqual(finalize_calls[1]["rgb_t"], [4.0, 5.0])
         self.assertNotIn(3.0, finalize_calls[0]["rgb_t"])
         self.assertNotIn(3.0, finalize_calls[1]["rgb_t"])
+
+    def test_openmv_api_and_default_config_resolution(self):
+        api = self.mod.import_openmv_tracker_api(
+            "/home/dyros/jg_ws/src/openmv_cam"
+        )
+        for name in self.mod.OPENMV_REQUIRED_API:
+            self.assertTrue(hasattr(api, name))
+        args = types.SimpleNamespace(
+            event_tracker_config=None, rec_dir="/tmp/no-recording-config"
+        )
+        config, config_json, pre_roll_ms, source = (
+            self.mod.resolve_event_tracker_config(args, "recording_test", api)
+        )
+        self.assertEqual(config["width"], 320)
+        self.assertEqual(config["height"], 320)
+        self.assertEqual(pre_roll_ms, 0.0)
+        self.assertIn("offline_tracker_example.json", source)
+        self.assertEqual(json.loads(config_json), config)
+
+    def test_event_alignment_is_causal_held_fresh_and_duplicate_stable(self):
+        api = self.mod.import_openmv_tracker_api(
+            "/home/dyros/jg_ws/src/openmv_cam"
+        )
+
+        def update(t, valid, x, reason):
+            return types.SimpleNamespace(
+                available_ros_t_ns=t, packet_id=t, sensor_window_start_us=0,
+                sensor_window_end_us=1, x_px=x, y_px=x + 1,
+                vx_px_s=2, vy_px_s=3, speed_px_s=4, confidence=.8,
+                valid=valid, velocity_valid=True, window_event_count=10,
+                candidate_count=1, blob_area_px=20, blob_event_count=10,
+                blob_width_px=4, blob_height_px=5, circularity=.5,
+                rejection_reason=reason,
+            )
+
+        updates = [
+            update(100, True, 1, ""),
+            update(150, False, 0, "noise"),
+            update(150, True, 2, ""),  # last duplicate wins
+            update(400, True, 9, ""),  # future for all tested grid rows
+        ]
+        aligned = api.align_tracker_updates_to_policy_grid(
+            updates, np.asarray([90, 120, 160, 300], dtype=np.int64), 1e-7
+        )
+        np.testing.assert_array_equal(aligned["event_valid"], [0, 1, 1, 0])
+        np.testing.assert_array_equal(aligned["event_2d_px"][1:3], [[1, 2], [2, 3]])
+        self.assertEqual(aligned["event_latest_update_timestamp_ns"][2], 150)
+        self.assertNotIn(9, aligned["event_2d_px"][:, 0])
+
+    def test_rgb_and_event_sparse_streams_write_additively(self):
+        api = self.mod.import_openmv_tracker_api(
+            "/home/dyros/jg_ws/src/openmv_cam"
+        )
+        data = self.make_sampling_data([0.0, 0.1, 0.2], [0.0, 0.1, 0.2])
+        data["rgb_2d_t"] = [0.0]
+        data["rgb_2d_source_t"] = [0.0]
+        data["rgb_2d_px"] = [[0.0, 0.0]]
+        row = api.TrackerUpdate(
+            "episode_0", 0, 0, 0, 1, 0, 1, 1.0, 1.0, 0.0, 0.0,
+            0.0, 1.0, True, False, 10, 1, 4, 10, 2, 2, 1.0, "",
+        )
+        arrays = self.mod.sample_episode(
+            data, self.make_episode(end=0.2), fps=10.0,
+            max_current_tcp_s_age_sec=1.0, rgb_2d_enabled=True,
+            event_tracker_updates=[row],
+            event_tracker_aligner=api.align_tracker_updates_to_policy_grid,
+            max_observation_age_sec=0.1,
+        )
+        metadata = {
+            "schema_version": "event_tracker_updates_v2",
+            "sensor_width": 320, "sensor_height": 320,
+            "tracker_config_json": "{}", "tracker_config_hash": "hash",
+            "raw_events_h5": "/raw.h5", "tracker_code_version": "5336fa8",
+            "availability_timestamp_domain": "packet_ros_t_ns",
+            "sensor_timestamp_domain": "genx320_microseconds",
+            "pre_roll_ms": 0.0, "max_observation_age_sec": 0.1,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "episode_0.hdf5")
+            self.mod.write_episode(
+                output, arrays, self.make_episode(end=0.2), self.make_topics(),
+                10.0, "none", False, event_tracker_metadata=metadata,
+            )
+            with h5py.File(output, "r") as target:
+                sparse = target["observations/sparse_tracking"]
+                for name in ("rgb_2d_px", "rgb_valid", "event_2d_px",
+                             "event_valid", "event_latest_rejection_reason"):
+                    self.assertIn(name, sparse)
+                self.assertIn("images/rgb", target["observations"])
+                self.assertIn("processing/event_tracker", target)
+                self.assertEqual(len(sparse["rgb_valid"]), len(sparse["event_valid"]))
+                np.testing.assert_array_equal(
+                    sparse["event_2d_px"][:][sparse["event_valid"][:] == 0], 0
+                )
+
+    def test_failed_write_removes_temporary_file(self):
+        arrays = {
+            "timestamps": np.asarray([0.0]),
+            "timestamps_ns": np.asarray([0], dtype=np.int64),
+            "rgb": np.zeros((1, 1, 1, 3), dtype=np.uint8),
+            "qpos": np.zeros((1, 7), dtype=np.float32),
+            "action": np.zeros((1, 1), dtype=np.float32),
+            "action_source_timestamps": np.asarray([0.0]),
+            "action_source_age_sec": np.asarray([0.0], dtype=np.float32),
+            "command_timestamps": np.empty(0),
+            "command_values": np.empty((0, 1), dtype=np.float32),
+            "target_base_timestamps": np.empty(0),
+            "target_base_points": np.empty((0, 3), dtype=np.float32),
+            "event": np.zeros((1, 1, 1, 3), dtype=np.uint8),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "episode_0.hdf5")
+            with self.assertRaises(RuntimeError):
+                self.mod.write_episode(
+                    output, arrays, self.make_episode(), self.make_topics(),
+                    30.0, "none", False, raw_events_h5=None,
+                )
+            self.assertFalse(os.path.exists(output + ".tmp"))
+
+    def test_cache_hash_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = os.path.join(directory, "raw.h5")
+            open(raw, "wb").close()
+            cache = os.path.join(directory, "cache.json")
+            with open(cache, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "schema_version": self.mod.EVENT_TRACKER_CACHE_SCHEMA,
+                    "raw_events_h5": raw, "tracker_config_hash": "wrong",
+                    "episodes": {"episode_0": []},
+                }, stream)
+            with self.assertRaisesRegex(RuntimeError, "configuration hash"):
+                self.mod.load_event_tracker_cache(
+                    cache, raw, "expected", ["episode_0"], object
+                )
 
 
 if __name__ == "__main__":

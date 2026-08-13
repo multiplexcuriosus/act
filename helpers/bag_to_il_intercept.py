@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
+import importlib
+import json
 import os
 from pathlib import Path
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
@@ -36,7 +39,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from sparse_ball import policy_period_ns, validate_policy_rate
+from sparse_ball import (
+    construct_sparse_features, policy_period_ns,
+)
 
 
 DEFAULT_RGB_TOPIC = "auto"
@@ -68,6 +73,11 @@ ARM_JOINT_NAMES = (
 
 SHIFTED_3CHEF_REPRESENTATION = "shifted_3chef_signed"
 XYT_REPRESENTATION = "xyt_signed_voxel_v1"
+EVENT_TRACKER_CACHE_SCHEMA = "act_event_tracker_cache_v1"
+EVENT_TRACKER_PROCESSING_SCHEMA = "event_tracker_updates_v2"
+OPENMV_REQUIRED_API = (
+    "TrackerUpdate", "run_tracker_updates", "align_tracker_updates_to_policy_grid",
+)
 
 
 @dataclass
@@ -113,6 +123,139 @@ def policy_grid_ns(start_sec: float, end_sec: float, rate_hz: int) -> np.ndarray
     offsets = (indices * 1_000_000_000 + rate // 2) // rate
     grid = origin_ns + offsets
     return grid[grid <= end_ns]
+
+
+def import_openmv_tracker_api(openmv_cam_root=None):
+    """Resolve and validate the reusable OpenMV offline tracker API."""
+    roots = []
+    if openmv_cam_root:
+        roots.append(("--openmv-cam-root", Path(openmv_cam_root)))
+    if os.environ.get("OPENMV_CAM_ROOT"):
+        roots.append(("OPENMV_CAM_ROOT", Path(os.environ["OPENMV_CAM_ROOT"])))
+    roots.append(("sibling repository", REPOSITORY_ROOT.parent / "openmv_cam"))
+
+    errors = []
+    for source, root in roots:
+        root = root.expanduser().resolve()
+        if not root.is_dir():
+            errors.append(f"{source}: {root} is not a directory")
+            continue
+        candidates = (root, root / "src", root.parent)
+        import_root = next(
+            (candidate for candidate in candidates
+             if (candidate / "openmv_cam" / "offline_dataset.py").is_file()),
+            None,
+        )
+        if import_root is None:
+            errors.append(f"{source}: {root} does not contain openmv_cam/offline_dataset.py")
+            continue
+        import_root_text = str(import_root)
+        if import_root_text not in sys.path:
+            sys.path.insert(0, import_root_text)
+        try:
+            module = importlib.import_module("openmv_cam.offline_dataset")
+            missing = [name for name in OPENMV_REQUIRED_API if not hasattr(module, name)]
+            if missing:
+                raise AttributeError(f"missing API: {', '.join(missing)}")
+            log(f"[INFO] OpenMV tracker package: {root} ({source})")
+            return module
+        except (ImportError, ModuleNotFoundError, AttributeError) as error:
+            errors.append(f"{source}: {root}: {error}")
+
+    try:
+        module = importlib.import_module("openmv_cam.offline_dataset")
+        missing = [name for name in OPENMV_REQUIRED_API if not hasattr(module, name)]
+        if missing:
+            raise AttributeError(f"missing API: {', '.join(missing)}")
+        log("[INFO] OpenMV tracker package: installed/PYTHONPATH")
+        return module
+    except (ImportError, ModuleNotFoundError, AttributeError) as error:
+        errors.append(f"installed/PYTHONPATH: {error}")
+    raise RuntimeError(
+        "Raw-event sparse tracking requires openmv_cam.offline_dataset exposing "
+        f"{', '.join(OPENMV_REQUIRED_API)}. Set --openmv-cam-root or "
+        "OPENMV_CAM_ROOT to the repository root (accepted default: "
+        f"{REPOSITORY_ROOT.parent / 'openmv_cam'}). Attempts: {'; '.join(errors)}"
+    )
+
+
+def resolve_event_tracker_config(args, recording_name, openmv_module):
+    """Resolve a validated tracker JSON using the documented priority order."""
+    candidates = []
+    if args.event_tracker_config:
+        candidates.append(("--event-tracker-config", Path(args.event_tracker_config)))
+    elif os.environ.get("OPENMV_EVENT_TRACKER_CONFIG"):
+        candidates.append((
+            "OPENMV_EVENT_TRACKER_CONFIG",
+            Path(os.environ["OPENMV_EVENT_TRACKER_CONFIG"]),
+        ))
+    if args.rec_dir:
+        candidates.append((
+            "recording-local",
+            Path(args.rec_dir) / f"{recording_name}_event_tracker_config.json",
+        ))
+    module_root = Path(openmv_module.__file__).resolve().parents[1]
+    candidates.append((
+        "OpenMV repository default", module_root / "config" / "offline_tracker_example.json",
+    ))
+    for source, path in candidates:
+        path = path.expanduser().resolve()
+        if not path.is_file():
+            if source in ("--event-tracker-config", "OPENMV_EVENT_TRACKER_CONFIG"):
+                raise RuntimeError(f"{source} tracker configuration does not exist: {path}")
+            continue
+        with path.open("r", encoding="utf-8") as stream:
+            config = json.load(stream)
+        if not isinstance(config, dict):
+            raise RuntimeError(f"Tracker configuration must be a JSON object: {path}")
+        pre_roll_ms = float(config.pop("pre_roll_ms", 0.0))
+        try:
+            openmv_module.tracker_factory(config)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"Invalid OpenMV tracker configuration {path}: {error}") from error
+        config_json = json.dumps(config, sort_keys=True, separators=(",", ":"))
+        log(f"[INFO] event tracker configuration: {path} ({source})")
+        return config, config_json, pre_roll_ms, str(path)
+    raise RuntimeError(
+        "No validated event tracker JSON was found. Provide --event-tracker-config, "
+        "OPENMV_EVENT_TRACKER_CONFIG, a recording-local config, or the OpenMV "
+        "config/offline_tracker_example.json default."
+    )
+
+
+def load_event_tracker_cache(path, raw_events_h5, config_hash, episode_names,
+                             TrackerUpdate):
+    with Path(path).expanduser().open("r", encoding="utf-8") as stream:
+        cache = json.load(stream)
+    if cache.get("schema_version") != EVENT_TRACKER_CACHE_SCHEMA:
+        raise RuntimeError("event tracker cache schema version mismatch")
+    if Path(cache.get("raw_events_h5", "")).resolve() != Path(raw_events_h5).resolve():
+        raise RuntimeError("event tracker cache raw-event path mismatch")
+    if cache.get("tracker_config_hash") != config_hash:
+        raise RuntimeError("event tracker cache configuration hash mismatch")
+    rows = cache.get("episodes")
+    if not isinstance(rows, dict) or any(name not in rows for name in episode_names):
+        raise RuntimeError("event tracker cache is missing selected episodes")
+    try:
+        return {name: [TrackerUpdate(**row) for row in rows[name]]
+                for name in episode_names}
+    except (TypeError, KeyError) as error:
+        raise RuntimeError(f"event tracker cache has invalid TrackerUpdate fields: {error}") from error
+
+
+def save_event_tracker_cache(path, raw_events_h5, config_hash, updates_by_episode):
+    cache = {
+        "schema_version": EVENT_TRACKER_CACHE_SCHEMA,
+        "raw_events_h5": str(Path(raw_events_h5).resolve()),
+        "tracker_config_hash": config_hash,
+        "episodes": {name: [asdict(update) for update in updates]
+                     for name, updates in updates_by_episode.items()},
+    }
+    target = Path(path).expanduser().resolve()
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(cache, stream, sort_keys=True)
+    os.replace(temporary, target)
 
 
 def header_stamp_to_sec(msg: Any) -> float:
@@ -574,6 +717,11 @@ def finalize_episode(
     event_temporal_bins: int = 9,
     event_output_height: int = 320,
     event_output_width: int = 320,
+    event_tracker_updates=None,
+    event_tracker_aligner=None,
+    event_tracker_metadata: Optional[Dict[str, Any]] = None,
+    sparse_source: Optional[str] = None,
+    max_observation_age_sec: float = 0.10,
 ) -> int:
     collect_sec = max(0.0, time.perf_counter() - collect_started_wall)
 
@@ -612,6 +760,14 @@ def finalize_episode(
         event_temporal_bins=event_temporal_bins,
         event_output_height=event_output_height,
         event_output_width=event_output_width,
+        event_tracker_updates=event_tracker_updates,
+        event_tracker_aligner=event_tracker_aligner,
+        sparse_source=sparse_source,
+        max_observation_age_sec=max_observation_age_sec,
+        event_sparse_size=(
+            int((event_tracker_metadata or {}).get("sensor_width", 320)),
+            int((event_tracker_metadata or {}).get("sensor_height", 320)),
+        ),
     )
     sample_sec = max(0.0, time.perf_counter() - sample_start)
 
@@ -635,6 +791,9 @@ def finalize_episode(
         event_temporal_bins=event_temporal_bins,
         event_output_height=event_output_height,
         event_output_width=event_output_width,
+        event_tracker_metadata=event_tracker_metadata,
+        sparse_source=sparse_source,
+        max_observation_age_sec=max_observation_age_sec,
     )
     write_sec = max(0.0, time.perf_counter() - write_start)
     total_sec = collect_sec + sample_sec + write_sec
@@ -716,6 +875,11 @@ def sample_episode(
     event_temporal_bins: int = 9,
     event_output_height: int = 320,
     event_output_width: int = 320,
+    event_tracker_updates=None,
+    event_tracker_aligner=None,
+    sparse_source: Optional[str] = None,
+    max_observation_age_sec: float = 0.10,
+    event_sparse_size: Tuple[int, int] = (320, 320),
 ) -> Dict[str, np.ndarray]:
     """Causally sample observations and measured current_tcp_s action."""
     rgb_times = np.asarray(data["rgb_t"], dtype=np.float64)
@@ -796,6 +960,11 @@ def sample_episode(
             valid_rows = present_rows[valid]
             rgb_2d_px[valid_rows] = points[valid]
             rgb_valid[valid_rows] = 1
+    rgb_source_age_sec = np.full((grid.size,), np.nan, dtype=np.float64)
+    rgb_has_source = np.isfinite(rgb_source_timestamps)
+    rgb_source_age_sec[rgb_has_source] = (
+        grid[rgb_has_source] - rgb_source_timestamps[rgb_has_source]
+    )
     qpos = np.stack(
         [data["qpos"][index] for index in joint_indices], axis=0
     ).astype(np.float32, copy=False)
@@ -973,6 +1142,7 @@ def sample_episode(
 
     arrays = {
         "timestamps": grid,
+        "timestamps_ns": grid_ns,
         "rgb": rgb,
         "qpos": qpos,
         "action": action,
@@ -985,15 +1155,56 @@ def sample_episode(
     }
 
     if rgb_2d_enabled:
+        # Legacy in-memory aliases retained for callers; the writer uses the
+        # explicit source-qualified keys below.
         arrays["rgb_2d_px"] = rgb_2d_px
         arrays["rgb_valid"] = rgb_valid
         arrays["rgb_source_timestamps"] = rgb_source_timestamps
+        arrays["sparse_tracking/rgb_2d_px"] = rgb_2d_px
+        arrays["sparse_tracking/rgb_valid"] = rgb_valid
+        arrays["sparse_tracking/rgb_source_timestamps"] = rgb_source_timestamps
+        arrays["sparse_tracking/rgb_source_age_sec"] = rgb_source_age_sec
 
     if event is not None:
         arrays["event"] = event
         arrays["event_source_timestamps"] = event_source_timestamps
         arrays["event_source_age_sec"] = event_source_age_sec
         arrays["event_count_per_channel"] = event_count_per_channel
+
+    if event_tracker_updates is not None:
+        if event_tracker_aligner is None:
+            raise RuntimeError("event tracker updates require the OpenMV alignment API")
+        event_tracking = event_tracker_aligner(
+            event_tracker_updates, grid_ns, max_observation_age_sec
+        )
+        # OpenMV retains the last valid point for diagnostics after it expires;
+        # ACT's model-facing coordinate contract requires invalid rows to be zero.
+        event_tracking["event_2d_px"] = np.asarray(
+            event_tracking["event_2d_px"], dtype=np.float32
+        ).copy()
+        event_tracking["event_2d_px"][
+            np.asarray(event_tracking["event_valid"]) == 0
+        ] = 0.0
+        arrays.update({f"sparse_tracking/{key}": value
+                       for key, value in event_tracking.items()})
+        arrays["event_tracker_updates"] = list(event_tracker_updates)
+
+    if sparse_source is not None:
+        prefix = f"sparse_tracking/{sparse_source}"
+        required = (f"{prefix}_2d_px", f"{prefix}_valid",
+                    f"{prefix}_source_timestamps")
+        missing = [name for name in required if name not in arrays]
+        if missing:
+            raise RuntimeError(
+                f"sparse source {sparse_source!r} has no aligned detections: {missing}"
+            )
+        width, height = ((int(rgb.shape[2]), int(rgb.shape[1]))
+                         if sparse_source == "rgb" else event_sparse_size)
+        arrays["sparse_ball"] = construct_sparse_features(
+            grid, arrays[required[0]], arrays[required[1]], arrays[required[2]],
+            width, height, max_observation_age_sec,
+        )
+        arrays["sparse_image_size"] = (int(width), int(height))
 
     return arrays
 
@@ -1024,6 +1235,9 @@ def write_episode(
     event_temporal_bins: int = 9,
     event_output_height: int = 320,
     event_output_width: int = 320,
+    event_tracker_metadata: Optional[Dict[str, Any]] = None,
+    sparse_source: Optional[str] = None,
+    max_observation_age_sec: float = 0.10,
 ) -> None:
     if os.path.exists(output_path) and not overwrite:
         raise RuntimeError(
@@ -1072,6 +1286,17 @@ def write_episode(
             h5.attrs["joint_source_topic"] = topics.joint
             h5.attrs["rgb_temporal_stacking"] = "deferred_to_training_loader"
             h5.attrs["command_count"] = int(arrays["command_timestamps"].size)
+            h5.attrs["sparse_tracking_sources"] = np.asarray(
+                (["rgb", "event"] if event_tracker_metadata else ["rgb"]),
+                dtype=h5py.string_dtype("utf-8"),
+            )
+            if event_tracker_metadata:
+                h5.attrs["event_tracker_schema_version"] = (
+                    event_tracker_metadata["schema_version"]
+                )
+                h5.attrs["event_tracker_config_hash"] = (
+                    event_tracker_metadata["tracker_config_hash"]
+                )
 
             has_event_sidecar = "event" in arrays
             if has_event_sidecar:
@@ -1135,21 +1360,24 @@ def write_episode(
                 "timestamps", data=arrays["timestamps"], dtype=np.float64
             )
             observations.create_dataset(
+                "timestamps_ns", data=arrays["timestamps_ns"], dtype=np.int64
+            )
+            observations.create_dataset(
                 "qpos", data=arrays["qpos"], dtype=np.float32
             )
-            if "rgb_2d_px" in arrays:
+            tracking_keys = sorted(
+                key for key in arrays if key.startswith("sparse_tracking/")
+            )
+            if tracking_keys:
                 sparse = observations.create_group("sparse_tracking")
-                sparse.create_dataset(
-                    "rgb_2d_px", data=arrays["rgb_2d_px"], dtype=np.float32
-                )
-                sparse.create_dataset(
-                    "rgb_valid", data=arrays["rgb_valid"], dtype=np.uint8
-                )
-                sparse.create_dataset(
-                    "rgb_source_timestamps",
-                    data=arrays["rgb_source_timestamps"],
-                    dtype=np.float64,
-                )
+                for key in tracking_keys:
+                    name = key.split("/", 1)[1]
+                    values = arrays[key]
+                    if name.endswith("rejection_reason"):
+                        values = np.asarray(
+                            values, dtype=h5py.string_dtype("utf-8", length=256)
+                        )
+                    sparse.create_dataset(name, data=values)
                 sparse.attrs["rgb_source_topic"] = topics.rgb_2d
                 sparse.attrs["rgb_sampling_policy"] = (
                     "latest_message_at_or_before_observation_timestamp"
@@ -1164,6 +1392,22 @@ def write_episode(
                 sparse.attrs["raw_coordinate_units"] = "pixels"
                 sparse.attrs["rgb_width_px"] = int(arrays["rgb"].shape[2])
                 sparse.attrs["rgb_height_px"] = int(arrays["rgb"].shape[1])
+                if event_tracker_metadata:
+                    sparse.attrs["event_source_timestamp_domain"] = (
+                        "tracker_packet_availability_ros_t_ns"
+                    )
+                    sparse.attrs["event_valid_semantics"] = (
+                        "latest causal valid detection held until max_observation_age_sec"
+                    )
+                    sparse.attrs["event_width_px"] = int(
+                        event_tracker_metadata["sensor_width"]
+                    )
+                    sparse.attrs["event_height_px"] = int(
+                        event_tracker_metadata["sensor_height"]
+                    )
+                    sparse.attrs["sources"] = np.asarray(
+                        ["rgb", "event"], dtype=h5py.string_dtype("utf-8")
+                    )
             images.create_dataset(
                 "rgb",
                 data=arrays["rgb"],
@@ -1208,6 +1452,50 @@ def write_episode(
                     dtype=np.int32,
                 )
 
+            if "event_tracker_updates" in arrays:
+                processing = h5.require_group("processing").create_group(
+                    "event_tracker"
+                )
+                updates = arrays["event_tracker_updates"]
+                field_names = tuple(asdict(updates[0]).keys()) if updates else (
+                    "available_ros_t_ns", "packet_id", "sensor_window_start_us",
+                    "sensor_window_end_us", "x_px", "y_px", "vx_px_s",
+                    "vy_px_s", "speed_px_s", "confidence", "valid",
+                    "velocity_valid", "window_event_count", "candidate_count",
+                    "blob_area_px", "blob_event_count", "blob_width_px",
+                    "blob_height_px", "circularity", "rejection_reason",
+                )
+                excluded = {"episode_name", "episode_index", "source_episode_index"}
+                for field in field_names:
+                    if field in excluded:
+                        continue
+                    values = [getattr(update, field) for update in updates]
+                    if field == "rejection_reason":
+                        values = np.asarray(
+                            values, dtype=h5py.string_dtype("utf-8", length=256)
+                        )
+                    else:
+                        values = np.asarray(values)
+                    processing.create_dataset(field, data=values)
+                for key, value in (event_tracker_metadata or {}).items():
+                    processing.attrs[key] = value
+
+            if "sparse_ball" in arrays:
+                observations.create_dataset(
+                    "sparse_ball", data=arrays["sparse_ball"], dtype=np.float32
+                )
+                width, height = arrays["sparse_image_size"]
+                h5.attrs["sparse_source"] = sparse_source
+                h5.attrs["sparse_feature_names"] = np.asarray(
+                    ["u_norm", "v_norm", "valid", "observation_age_sec"],
+                    dtype=h5py.string_dtype("utf-8"),
+                )
+                h5.attrs["sparse_image_width"] = int(width)
+                h5.attrs["sparse_image_height"] = int(height)
+                h5.attrs["sparse_max_observation_age_sec"] = float(
+                    max_observation_age_sec
+                )
+
             commands = h5.create_group("commands")
             goto_s = commands.create_group("goto_s")
             goto_s.attrs["source_topic"] = topics.goto_s
@@ -1232,7 +1520,8 @@ def write_episode(
 
         os.replace(temporary_path, output_path)
     except Exception:
-        # Preserve a partially written .tmp file for diagnosis rather than deleting it.
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
         raise
 
     log(f"[INFO] wrote {output_path}")
@@ -1249,7 +1538,7 @@ def resolve_input_paths(
         return bag_path, raw_events_h5
 
     rec_dir = os.path.abspath(os.path.expanduser(args.rec_dir))
-    bag_path, auto_raw_events_h5, recording_name = resolve_recording_dir(
+    bag_path, auto_raw_events_h5, _ = resolve_recording_dir(
         rec_dir,
         allow_missing_raw_events=True,
         logger=log,
@@ -1257,15 +1546,8 @@ def resolve_input_paths(
     if args.raw_events_h5 is not None:
         return bag_path, os.path.abspath(os.path.expanduser(args.raw_events_h5))
 
-    # In --rec_dir mode, event conversion is expected to use a colocated sidecar
-    # named <recording_name>_raw_events.h5 when --event_clip_count is provided.
     if auto_raw_events_h5 is not None:
         return bag_path, auto_raw_events_h5
-    if args.event_clip_count is not None:
-        expected_sidecar = os.path.join(
-            rec_dir, f"{recording_name}_raw_events.h5"
-        )
-        return bag_path, expected_sidecar
     return bag_path, None
 
 
@@ -1294,7 +1576,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--storage_id", choices=("mcap", "sqlite3"), default="mcap"
     )
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--fps", type=float, choices=(30.0, 60.0), default=30.0)
     parser.add_argument(
         "--min_duration",
         type=float,
@@ -1332,6 +1614,14 @@ def parse_args() -> argparse.Namespace:
             "--rec_dir), event tensors are rendered from raw packets."
         ),
     )
+    parser.add_argument("--event-tracker-config", "--event_tracker_config")
+    parser.add_argument("--openmv-cam-root", "--openmv_cam_root")
+    parser.add_argument("--sparse-source", "--sparse_source",
+                        choices=("rgb", "event"), default=None)
+    parser.add_argument("--max-observation-age-sec", "--max_observation_age_sec",
+                        type=float, default=0.10)
+    parser.add_argument("--save-event-tracker-cache", "--save_event_tracker_cache")
+    parser.add_argument("--reuse-event-tracker-cache", "--reuse_event_tracker_cache")
     parser.add_argument(
         "--event_representation",
         choices=(SHIFTED_3CHEF_REPRESENTATION, XYT_REPRESENTATION),
@@ -1419,6 +1709,8 @@ def parse_args() -> argparse.Namespace:
         )
     if args.event_clip_count is not None and args.event_clip_count <= 0.0:
         parser.error("--event_clip_count must be positive when provided")
+    if args.max_observation_age_sec <= 0.0:
+        parser.error("--max-observation-age-sec must be positive")
     if args.event_packet_margin_ms < 0.0:
         parser.error("--event_packet_margin_ms must be non-negative")
     if (
@@ -1458,6 +1750,12 @@ def main() -> None:
         ("rgb_2d_topic", DEFAULT_RGB_2D_TOPIC),
         ("no_rgb_2d", False),
         ("max_rgb_2d_age_sec", 0.10),
+        ("event_tracker_config", None),
+        ("openmv_cam_root", None),
+        ("sparse_source", None),
+        ("max_observation_age_sec", 0.10),
+        ("save_event_tracker_cache", None),
+        ("reuse_event_tracker_cache", None),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -1476,7 +1774,7 @@ def main() -> None:
     if raw_events_h5 is not None:
         log(f"[INFO] raw events H5: {raw_events_h5}")
     else:
-        log("[INFO] raw events H5: disabled")
+        log("[WARNING] raw events H5 unavailable: sparse event fields will not be generated")
     log(f"[INFO] storage: {args.storage_id}")
 
     marker_pass_start_wall = time.perf_counter()
@@ -1518,6 +1816,66 @@ def main() -> None:
     if args.max_episodes is not None:
         episodes = episodes[: args.max_episodes]
     validate_non_overlapping_windows(episodes)
+
+    tracker_updates_by_episode = {}
+    event_tracker_aligner = None
+    event_tracker_metadata = None
+    if raw_events_h5 is not None:
+        openmv = import_openmv_tracker_api(args.openmv_cam_root)
+        bag_name = Path(bag_path).name
+        recording_name = bag_name[:-4] if bag_name.endswith("_bag") else bag_name
+        tracker_config, tracker_config_json, pre_roll_ms, config_source = (
+            resolve_event_tracker_config(args, recording_name, openmv)
+        )
+        config_hash = hashlib.sha256(tracker_config_json.encode("utf-8")).hexdigest()
+        openmv_episodes = [
+            openmv.Episode(
+                Path(f"episode_{episode.output_idx}.hdf5"),
+                f"episode_{episode.output_idx}", episode.output_idx,
+                episode.source_idx, episode.start, episode.end,
+                np.empty(0, dtype=np.float64),
+            )
+            for episode in episodes
+        ]
+        episode_names = [episode.name for episode in openmv_episodes]
+        if args.reuse_event_tracker_cache:
+            tracker_updates_by_episode = load_event_tracker_cache(
+                args.reuse_event_tracker_cache, raw_events_h5, config_hash,
+                episode_names, openmv.TrackerUpdate,
+            )
+            log(f"[INFO] reused event tracker cache: {args.reuse_event_tracker_cache}")
+        else:
+            tracker_updates_by_episode = openmv.run_tracker_updates(
+                raw_events_h5, openmv_episodes, tracker_config,
+                pre_roll_ms=pre_roll_ms,
+            )
+        if any(name not in tracker_updates_by_episode for name in episode_names):
+            raise RuntimeError("OpenMV tracker did not return every selected episode")
+        if args.save_event_tracker_cache:
+            save_event_tracker_cache(
+                args.save_event_tracker_cache, raw_events_h5, config_hash,
+                tracker_updates_by_episode,
+            )
+            log(f"[INFO] saved event tracker cache: {args.save_event_tracker_cache}")
+        event_tracker_aligner = openmv.align_tracker_updates_to_policy_grid
+        event_tracker_metadata = {
+            "schema_version": EVENT_TRACKER_PROCESSING_SCHEMA,
+            "raw_events_h5": str(Path(raw_events_h5).resolve()),
+            "tracker_config_json": tracker_config_json,
+            "tracker_config_hash": config_hash,
+            "tracker_config_source": config_source,
+            "tracker_code_version": "openmv_cam@5336fa880f28a861f2ff79d4480d081a4a48a819",
+            "availability_timestamp_domain": "packet_ros_t_ns",
+            "sensor_timestamp_domain": "genx320_microseconds",
+            "sensor_width": int(tracker_config.get("width", 320)),
+            "sensor_height": int(tracker_config.get("height", 320)),
+            "pre_roll_ms": float(pre_roll_ms),
+            "max_observation_age_sec": float(args.max_observation_age_sec),
+        }
+        update_count = sum(len(rows) for rows in tracker_updates_by_episode.values())
+        log(f"[INFO] OpenMV tracker updates: {update_count} across {len(episodes)} episodes")
+    elif args.sparse_source == "event":
+        raise RuntimeError("--sparse-source event requires a raw-event HDF5 sidecar")
 
     marker_elapsed = max(0.0, time.perf_counter() - marker_pass_start_wall)
     log(
@@ -1624,6 +1982,13 @@ def main() -> None:
                         event_temporal_bins=args.event_temporal_bins,
                         event_output_height=args.event_output_height,
                         event_output_width=args.event_output_width,
+                        event_tracker_updates=tracker_updates_by_episode.get(
+                            f"episode_{episode.output_idx}"
+                        ) if raw_events_h5 is not None else None,
+                        event_tracker_aligner=event_tracker_aligner,
+                        event_tracker_metadata=event_tracker_metadata,
+                        sparse_source=args.sparse_source,
+                        max_observation_age_sec=args.max_observation_age_sec,
                     )
                 )
                 completed_episodes += 1
@@ -1686,6 +2051,13 @@ def main() -> None:
                     event_temporal_bins=args.event_temporal_bins,
                     event_output_height=args.event_output_height,
                     event_output_width=args.event_output_width,
+                    event_tracker_updates=tracker_updates_by_episode.get(
+                        f"episode_{episode.output_idx}"
+                    ) if raw_events_h5 is not None else None,
+                    event_tracker_aligner=event_tracker_aligner,
+                    event_tracker_metadata=event_tracker_metadata,
+                    sparse_source=args.sparse_source,
+                    max_observation_age_sec=args.max_observation_age_sec,
                 )
             )
             completed_episodes += 1
