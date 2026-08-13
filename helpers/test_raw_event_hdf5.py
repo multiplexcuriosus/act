@@ -66,6 +66,28 @@ def load_bag_to_hdf5_module():
 
 
 class RawEventHdf5Tests(unittest.TestCase):
+    def test_rec_dir_pairs_sidecar_with_selected_bag_prefix(self):
+        with tempfile.TemporaryDirectory() as root:
+            rec_dir = os.path.join(root, "recording_20260812_181403_etd")
+            os.makedirs(rec_dir)
+            bag_path = os.path.join(rec_dir, "recording_20260812_181403_bag")
+            os.makedirs(bag_path)
+            with open(os.path.join(bag_path, "metadata.yaml"), "w", encoding="utf-8"):
+                pass
+            sidecar_path = os.path.join(
+                rec_dir, "recording_20260812_181403_raw_events.h5"
+            )
+            with h5py.File(sidecar_path, "w"):
+                pass
+
+            resolved_bag, resolved_sidecar, recording_name = (
+                reh5.resolve_recording_dir(rec_dir)
+            )
+
+            self.assertEqual(resolved_bag, bag_path)
+            self.assertEqual(resolved_sidecar, sidecar_path)
+            self.assertEqual(recording_name, "recording_20260812_181403")
+
     @staticmethod
     def write_sidecar(
         path: str,

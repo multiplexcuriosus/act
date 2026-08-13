@@ -39,9 +39,9 @@ def resolve_recording_dir(
             f"recording_dir does not exist or is not a directory: {recording_dir}"
         )
 
-    recording_name = os.path.basename(recording_dir)
+    directory_name = os.path.basename(recording_dir)
 
-    exact_bag = os.path.join(recording_dir, f"{recording_name}_bag")
+    exact_bag = os.path.join(recording_dir, f"{directory_name}_bag")
     bag_candidates = []
     for entry in os.listdir(recording_dir):
         full = os.path.join(recording_dir, entry)
@@ -62,9 +62,11 @@ def resolve_recording_dir(
     else:
         raise RuntimeError(
             "Multiple bag candidates found in recording_dir and no exact match "
-            f"for '{recording_name}_bag'. Candidates: {bag_candidates}"
+            f"for '{directory_name}_bag'. Candidates: {bag_candidates}"
         )
 
+    bag_name = os.path.basename(os.path.normpath(bag_path))
+    recording_name = bag_name[:-4] if bag_name.endswith("_bag") else bag_name
     exact_h5 = os.path.join(recording_dir, f"{recording_name}_raw_events.h5")
     h5_candidates = [
         os.path.join(recording_dir, entry)

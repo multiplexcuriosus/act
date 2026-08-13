@@ -1243,7 +1243,7 @@ def resolve_input_paths(
         return bag_path, raw_events_h5
 
     rec_dir = os.path.abspath(os.path.expanduser(args.rec_dir))
-    bag_path, auto_raw_events_h5, _ = resolve_recording_dir(
+    bag_path, auto_raw_events_h5, recording_name = resolve_recording_dir(
         rec_dir,
         allow_missing_raw_events=True,
         logger=log,
@@ -1256,8 +1256,9 @@ def resolve_input_paths(
     if auto_raw_events_h5 is not None:
         return bag_path, auto_raw_events_h5
     if args.event_clip_count is not None:
-        rec_name = os.path.basename(os.path.normpath(rec_dir))
-        expected_sidecar = os.path.join(rec_dir, f"{rec_name}_raw_events.h5")
+        expected_sidecar = os.path.join(
+            rec_dir, f"{recording_name}_raw_events.h5"
+        )
         return bag_path, expected_sidecar
     return bag_path, None
 
