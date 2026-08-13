@@ -17,7 +17,8 @@ from intercept_rollout_contract import (EXPECTED_INTERCEPT_METADATA,
                                         validate_intercept_stats_and_config)
 from policy import ACTPolicy
 from sparse_ball import (SPARSE_FEATURE_NAMES, SparsePoint,
-                         construct_causal_sparse_history, construct_sparse_features)
+                         construct_causal_sparse_history, construct_sparse_features,
+                         rate_contract)
 
 
 @pytest.mark.parametrize("width,height", [(1280, 720), (320, 320)])
@@ -121,3 +122,15 @@ def test_four_feature_checkpoint_loads_and_six_feature_or_source_mismatch_reject
         validate_intercept_stats_and_config(bad, config, 30, runtime)
     with pytest.raises(ValueError, match="sparse_source"):
         validate_intercept_stats_and_config(_sparse_stats("event"), config, 30, runtime)
+
+
+def test_rate_contract_and_checkpoint_rate_mismatch():
+    assert rate_contract(30)[:2] == ((-6, -3, 0), 30)
+    assert rate_contract(60)[:2] == ((-12, -6, 0), 60)
+    stats = _sparse_stats()
+    stats.update(policy_rate_hz=30, sparse_history_offsets_frames=[-6, -3, 0])
+    runtime = {"sparse_source": "rgb", "max_observation_age_sec": .1,
+               "image_width": 1280, "image_height": 720,
+               "policy_rate_hz": 60}
+    with pytest.raises(ValueError, match="policy rate|policy_rate_hz|chunk_size"):
+        validate_intercept_stats_and_config(stats, _model_config(), 60, runtime)

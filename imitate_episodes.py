@@ -24,6 +24,7 @@ from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from utils import INTERCEPT_HISTORY_OFFSETS_DEFAULT
 from policy import ACTPolicy, ACTTaskPolicy, CNNMLPPolicy
+from sparse_ball import rate_contract
 from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
@@ -224,16 +225,19 @@ def _validate_intercept_checkpoint_metadata(config, stats):
             'Legacy fallback is only supported when camera_names == [\'rgb\'].'
         )
 
+    saved_rate = int(stats.get('policy_rate_hz', 30))
+    saved_history_offsets, saved_chunk_size, _ = rate_contract(saved_rate)
     required_equal = {
         'data_mode': 'intercept',
         'raw_qpos_dim': 7,
         'state_dim': 21,
         'action_dim': 1,
         'visual_history_frames': 3,
-        'visual_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
+        'visual_history_offsets': list(saved_history_offsets),
         'channels_per_visual_frame': 3,
         'visual_frame_order': 'oldest_to_newest',
-        'qpos_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
+        'qpos_history_offsets': list(saved_history_offsets),
+        'policy_rate_hz': saved_rate,
         'qpos_flatten_order': 'oldest_to_newest',
         'action_type': 'measured_tcp_s_delta',
         'action_representation': 'future_delta_relative_to_anchor',
@@ -244,9 +248,9 @@ def _validate_intercept_checkpoint_metadata(config, stats):
     }
     if configured_input_modality == 'sparse_ball':
         required_equal.update({
-            'sparse_feature_dim': 6,
-            'sparse_feature_names': ['u', 'v', 'du_dt', 'dv_dt', 'valid', 'observation_age'],
-            'sparse_history_offsets': list(INTERCEPT_HISTORY_OFFSETS_DEFAULT),
+            'sparse_feature_dim': 4,
+            'sparse_feature_names': ['u', 'v', 'valid', 'observation_age'],
+            'sparse_history_offsets': list(saved_history_offsets),
         })
     else:
         required_equal['image_channels'] = 9
@@ -321,6 +325,11 @@ def _validate_intercept_checkpoint_metadata(config, stats):
             )
 
     policy_config = config['policy_config']
+    if int(policy_config.get('num_queries', -1)) != saved_chunk_size:
+        raise ValueError(
+            f"Checkpoint chunk size does not match {saved_rate} Hz policy rate: "
+            f"expected {saved_chunk_size}, found {policy_config.get('num_queries')}"
+        )
     if int(policy_config.get('state_dim')) != 21:
         raise ValueError(f"Interception policy state_dim must be 21, got {policy_config.get('state_dim')}")
     if int(policy_config.get('action_dim')) != 1:
@@ -501,7 +510,7 @@ def main(args):
                          'rgb_history_frames': rgb_history_frames,
                          'rgb_history_offsets': list(visual_history_offsets),
                          'image_channels': image_channels,
-                         'sparse_feature_dim': 6,
+                         'sparse_feature_dim': 4,
                          'sparse_history_length': 3,
                          }
     elif policy_class == 'CNNMLP':
@@ -657,6 +666,11 @@ def main(args):
         if input_modality == 'sparse_ball':
             policy_config['sparse_mean'] = stats['sparse_mean']
             policy_config['sparse_std'] = stats['sparse_std']
+        rate_history_offsets, _, _ = rate_contract(stats['policy_rate_hz'])
+        visual_history_offsets = list(rate_history_offsets)
+        policy_config['visual_history_offsets'] = list(rate_history_offsets)
+        policy_config['rgb_history_offsets'] = list(rate_history_offsets)
+        policy_config['policy_rate_hz'] = int(stats['policy_rate_hz'])
     else:
         raise ValueError(f"Unsupported data_mode: {args['data_mode']}")
 
@@ -671,7 +685,7 @@ def main(args):
             f'is_pad={tuple(batch_is_pad.shape)}'
         )
         if input_modality == 'sparse_ball':
-            assert batch_image.ndim == 3 and tuple(batch_image.shape[1:]) == (3, 6), batch_image.shape
+            assert batch_image.ndim == 3 and tuple(batch_image.shape[1:]) == (3, 4), batch_image.shape
         else:
             assert batch_image.ndim == 5 and batch_image.shape[1] == 1 and batch_image.shape[2] == 9, batch_image.shape
         assert batch_qpos.ndim == 2 and batch_qpos.shape[1] == 21, batch_qpos.shape
@@ -711,7 +725,7 @@ def main(args):
         stats['raw_qpos_dim'] = 7
         stats['state_dim'] = 21
         stats['action_dim'] = 1
-        stats['qpos_history_offsets'] = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)
+        stats['qpos_history_offsets'] = list(visual_history_offsets)
         stats['qpos_flatten_order'] = 'oldest_to_newest'
         stats['action_type'] = 'measured_tcp_s_delta'
         stats['action_representation'] = 'future_delta_relative_to_anchor'

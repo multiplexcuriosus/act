@@ -32,7 +32,8 @@ from intercept_rollout_contract import (
     validate_intercept_stats_and_config,
 )
 from rollout_latency_trace import RolloutLatencyTracer, image_source_stamp_ns
-from sparse_ball import SparsePoint, construct_causal_sparse_history
+from sparse_ball import (SparsePoint, construct_causal_sparse_history,
+                         rate_contract, validate_policy_rate)
 
 
 SPARSE_TOPICS = {
@@ -220,6 +221,7 @@ class FrankaActRolloutNode(Node):
             "input_modality": self.input_modality,
             "sparse_feature_dim": args.sparse_feature_dim,
             "sparse_history_length": args.sparse_history_length,
+            "policy_rate_hz": validate_policy_rate(self.fps),
         }
 
         ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
@@ -237,6 +239,7 @@ class FrankaActRolloutNode(Node):
                 "max_observation_age_sec": self.max_observation_age_sec,
                 "image_width": SPARSE_SOURCE_DIMENSIONS[self.sparse_source][0],
                 "image_height": SPARSE_SOURCE_DIMENSIONS[self.sparse_source][1],
+                "policy_rate_hz": validate_policy_rate(self.fps),
             } if self.input_modality == "sparse_ball" else None,
         )
 
@@ -589,18 +592,11 @@ class FrankaActRolloutNode(Node):
 
         selected_rgb_msgs = [rgb_messages[index] for index in sync.history_indices]
         history_source_stamp_ns = [image_source_stamp_ns(msg) for msg in selected_rgb_msgs]
-        if self.input_modality == "sparse_ball":
-            observations = [BallObservation(ts, float(msg.point.x), float(msg.point.y))
-                            for ts, msg in self.rgb_buffer]
-            image_np = build_sparse_history(
-                observations, rgb_timestamps, len(rgb_timestamps) - 1,
-                self.ball_image_width, self.ball_image_height, self.sparse_max_observation_age,
-            )[None, ...]
-            self._trace_mark("sparse_observation_selection_and_construction",
-                             ball_source_timestamp_ns=history_source_stamp_ns[-1])
-        else:
-            rgb_frames = [self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8") for msg in selected_rgb_msgs]
-            image_np = build_rgb_history_tensor(rgb_frames, self.image_size)
+        rgb_frames = [
+            self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+            for msg in selected_rgb_msgs
+        ]
+        image_np = build_rgb_history_tensor(rgb_frames, self.image_size)
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         anchor_observation_timestamp = sync.rgb_timestamps[-1]
@@ -1008,7 +1004,8 @@ def main():
     parser.add_argument("--no_publish_current_scalar", action="store_false", dest="publish_current_scalar")
     parser.set_defaults(publish_current_scalar=True)
 
-    parser.add_argument("--policy_fps", "--fps", dest="fps", type=float, default=30.0)
+    parser.add_argument("--policy-rate-hz", "--policy_fps", "--fps",
+                        dest="fps", type=int, choices=(30, 60), default=30)
     parser.add_argument("--max_source_buffer", type=int, default=256)
     parser.add_argument(
         "--max_observation_age_sec", type=float, default=None,
@@ -1109,8 +1106,12 @@ def main():
         parser.error(f"--sparse_feature_dim must be 4, got {args.sparse_feature_dim}")
     if int(args.sparse_history_length) != 3:
         parser.error(f"--sparse_history_length must be 3, got {args.sparse_history_length}")
-    if int(args.chunk_size) != 30:
-        raise ValueError(f"Interception rollout requires --chunk_size 30, got {args.chunk_size}")
+    _, expected_chunk_size, _ = rate_contract(args.fps)
+    if int(args.chunk_size) != expected_chunk_size:
+        raise ValueError(
+            f"Interception rollout at {args.fps} Hz requires --chunk_size "
+            f"{expected_chunk_size}, got {args.chunk_size}"
+        )
     if int(args.rgb_history_frames) != 3:
         raise ValueError(
             f"Interception rollout requires --rgb_history_frames 3, got {args.rgb_history_frames}"

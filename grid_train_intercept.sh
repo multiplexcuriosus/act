@@ -13,7 +13,13 @@ STATE_DIM=21
 ACTION_DIM=1
 
 VISUAL_HISTORY_FRAMES=3
-CHUNK_SIZE=30
+POLICY_RATE_HZ="${POLICY_RATE_HZ:-30}"
+case "$POLICY_RATE_HZ" in
+  30) HISTORY_OFFSETS="[-6, -3, 0]" ;;
+  60) HISTORY_OFFSETS="[-12, -6, 0]" ;;
+  *) echo "POLICY_RATE_HZ must be 30 or 60" >&2; exit 2 ;;
+esac
+CHUNK_SIZE="$POLICY_RATE_HZ"
 
 DATASET_NAME="$(basename "${DATASETS[0]}")"
 BASE_CKPT="/home/dyros/Data/jg_data/ckpts/${DATASET_NAME}_$(date +%Y%m%d_%H%M%S)"
@@ -58,7 +64,8 @@ for IMAGE_SIZE in 320; do
           echo "Raw qpos dim: ${RAW_QPOS_DIM}"
           echo "Model state dim: ${STATE_DIM}"
           echo "Action dim: ${ACTION_DIM}"
-          echo "RGB/qpos history offsets: [-6, -3, 0]"
+          echo "Policy rate: ${POLICY_RATE_HZ} Hz"
+          echo "RGB/qpos history offsets: ${HISTORY_OFFSETS}"
           echo "Action: delta_s[k] = tcp_s(t+k+1) - tcp_s(t)"
           echo "Chunk size: ${CHUNK_SIZE}"
           echo "LR: ${LR}, BS: ${BS}, KL: ${KL}, IMAGE_SIZE: ${IMAGE_SIZE}"

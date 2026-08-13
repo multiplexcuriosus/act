@@ -209,6 +209,68 @@ class BagToIlInterceptTests(unittest.TestCase):
         np.testing.assert_array_equal(rgb[0, 0], np.array([255, 0, 0], dtype=np.uint8))
         np.testing.assert_array_equal(rgb[0, 1], np.array([0, 255, 0], dtype=np.uint8))
 
+    def test_policy_grids_are_exact_for_30_and_60_hz(self):
+        for rate, expected_period in ((30, 33_333_333), (60, 16_666_667)):
+            grid = self.mod.policy_grid_ns(1.0, 11.0, rate)
+            self.assertEqual(grid.dtype, np.int64)
+            self.assertEqual(int(round(np.mean(np.diff(grid)))), expected_period)
+            indices = np.arange(len(grid), dtype=np.int64)
+            expected = 1_000_000_000 + np.rint(
+                indices.astype(np.float64) * 1e9 / rate
+            ).astype(np.int64)
+            np.testing.assert_array_equal(grid, expected)
+
+    def test_rgb_point_uses_header_timestamp_and_aligns_causally(self):
+        topics = self.make_topics()
+        topics.rgb_2d = "/ball_tracker2/ball_2d_px"
+        data = self.mod.create_episode_buffer()
+        msg = types.SimpleNamespace(
+            header=types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=1, nanosec=20_000_000)
+            ),
+            point=types.SimpleNamespace(x=100.0, y=200.0, z=0.0),
+        )
+        self.mod.ingest_episode_message(data, topics.rgb_2d, msg, 9.0, topics)
+        aligned = self.mod.align_point_detections(
+            data["rgb_2d"], np.asarray([1_010_000_000, 1_020_000_000], "i8")
+        )
+        self.assertEqual(aligned["rgb_valid"].tolist(), [0, 1])
+        self.assertEqual(aligned["rgb_source_timestamps_ns"].tolist(),
+                         [-1, 1_020_000_000])
+        self.assertTrue(np.isnan(aligned["rgb_source_timestamps"][0]))
+
+    def test_event_tracker_alignment_holds_valid_across_invalid_update(self):
+        openmv_root = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "..", "openmv_cam"
+        ))
+        _, TrackerUpdate, _, align = self.mod.import_openmv_tracker_api(
+            openmv_root
+        )
+
+        def update(t_ns, valid, x, reason=""):
+            return TrackerUpdate(
+                "episode_0", 0, 0, t_ns, t_ns // 1_000_000,
+                10, 20, x, 5.0, 0.0, 0.0, 0.0, .8, valid, False,
+                10, int(valid), 2, 3, 2, 2, .7, reason,
+            )
+
+        result = align(
+            [update(1_000_000_000, True, 10.0),
+             update(1_030_000_000, False, 0.0, "no_blob"),
+             update(1_060_000_000, True, 20.0)],
+            np.asarray([1_030_000_000, 1_055_000_000, 1_060_000_000], "i8"),
+            .1,
+        )
+        self.assertEqual(result["event_2d_px"][:, 0].tolist(), [10, 10, 20])
+        self.assertEqual(result["event_valid"].tolist(), [1, 1, 1])
+        self.assertEqual(result["event_latest_update_valid"].tolist(), [0, 0, 1])
+        self.assertEqual(result["event_latest_rejection_reason"].tolist(),
+                         ["no_blob", "no_blob", ""])
+        self.assertTrue(np.all(
+            result["event_source_timestamps_ns"] <=
+            np.asarray([1_030_000_000, 1_055_000_000, 1_060_000_000], "i8")
+        ))
+
     def test_decode_compressed_image_msg_png_and_jpeg(self):
         image_bgr = np.array(
             [

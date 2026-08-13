@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add causal sparse-ball arrays to existing interception HDF5 episodes from a ROS bag."""
+"""Deprecated compatibility augmenter; use bag_to_il_intercept.py for new data."""
 import argparse
 from pathlib import Path
 import sys
@@ -51,9 +51,13 @@ def augment_episode(path, observations, args):
             if isinstance(value, list) and value and isinstance(value[0], str):
                 value = np.asarray(value, dtype=h5py.string_dtype('utf-8'))
             root.attrs[name] = value
+        source = np.full(len(grid), np.nan, dtype=np.float64)
+        usable = features[:, 2] != 0
+        source[usable] = grid[usable] - features[usable, 3]
         root.create_dataset('/observations/sparse_ball_source_timestamps',
-                            data=grid - features[:, 5], dtype=np.float64)
-        root.create_dataset('/observations/sparse_ball_valid', data=features[:, 4], dtype=np.float32)
+                            data=source, dtype=np.float64)
+        root.create_dataset('/observations/sparse_ball_valid',
+                            data=features[:, 2], dtype=np.float32)
 
 
 def main():

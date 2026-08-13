@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
+import json
 import os
+from pathlib import Path
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -29,6 +33,13 @@ from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
 from raw_event_hdf5 import RawEventStore, resolve_recording_dir
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from sparse_ball import (construct_sparse_features, default_sparse_topic,  # noqa: E402
+                         rate_contract, sparse_metadata)
 
 
 DEFAULT_RGB_TOPIC = "auto"
@@ -45,6 +56,7 @@ DEFAULT_GOTO_S_TARGET_BASE_TOPIC = (
 RAW_IMAGE_TYPE = "sensor_msgs/msg/Image"
 COMPRESSED_IMAGE_TYPE = "sensor_msgs/msg/CompressedImage"
 FLOAT64_TYPE = "std_msgs/msg/Float64"
+POINT_STAMPED_TYPE = "geometry_msgs/msg/PointStamped"
 
 ARM_JOINT_NAMES = (
     "right_fr3_joint1",
@@ -65,6 +77,7 @@ class Topics:
     current_tcp_s: str
     goto_s: str
     goto_s_target_base: str
+    rgb_2d: Optional[str] = None
 
 
 @dataclass
@@ -85,6 +98,84 @@ def log(message: str) -> None:
 
 def ns_to_sec(timestamp_ns: int) -> float:
     return float(timestamp_ns) * 1e-9
+
+
+def policy_grid_ns(start_sec: float, end_sec: float, policy_rate_hz: int):
+    """Construct the 30/60 Hz grid from a rounded rational nanosecond schedule."""
+    rate = int(policy_rate_hz)
+    if float(policy_rate_hz) != rate or rate <= 0:
+        raise ValueError("policy_rate_hz must be a positive integer")
+    origin_ns = int(round(float(start_sec) * 1e9))
+    end_ns = int(round(float(end_sec) * 1e9))
+    count = max(0, int(np.floor((end_ns - origin_ns) * rate / 1e9)) + 1)
+    indices = np.arange(count, dtype=np.int64)
+    offsets = (indices * 1_000_000_000 + rate // 2) // rate
+    grid = origin_ns + offsets
+    return grid[grid <= end_ns]
+
+
+def point_stamped_timestamp_ns(msg: Any) -> int:
+    """Return the PointStamped header time, never the bag receipt time."""
+    return int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
+
+
+def align_point_detections(detections, policy_timestamps_ns):
+    """Causally align header-stamped RGB points to an exact integer grid."""
+    ordered = sorted(detections, key=lambda item: item[0])
+    source = np.asarray([item[0] for item in ordered], dtype=np.int64)
+    grid = np.asarray(policy_timestamps_ns, dtype=np.int64)
+    indices = np.searchsorted(source, grid, side="right") - 1
+    has = indices >= 0
+    points = np.zeros((len(grid), 2), dtype=np.float32)
+    valid = np.zeros(len(grid), dtype=np.uint8)
+    source_ns = np.full(len(grid), -1, dtype=np.int64)
+    if np.any(has):
+        positions = np.flatnonzero(has)
+        selected = [ordered[indices[row]] for row in positions]
+        source_ns[positions] = [item[0] for item in selected]
+        points[positions] = [(item[1], item[2]) for item in selected]
+        valid[positions] = [item[3] for item in selected]
+    age = np.full(len(grid), np.nan, dtype=np.float64)
+    age[has] = (grid[has] - source_ns[has]).astype(np.float64) / 1e9
+    return {
+        "rgb_2d_px": points,
+        "rgb_valid": valid,
+        "rgb_source_timestamps_ns": source_ns,
+        "rgb_source_timestamps": np.where(
+            has, source_ns.astype(np.float64) / 1e9, np.nan),
+        "rgb_source_age_sec": age,
+    }
+
+
+def import_openmv_tracker_api(openmv_cam_root=None):
+    """Import the reusable OpenMV offline API with an actionable failure."""
+    if openmv_cam_root:
+        root = Path(openmv_cam_root).expanduser().resolve()
+        candidates = (root, root / "src", root.parent)
+        for candidate in candidates:
+            if (candidate / "openmv_cam").is_dir():
+                sys.path.insert(0, str(candidate))
+                break
+        else:
+            raise RuntimeError(
+                f"--openmv-cam-root does not contain the openmv_cam package: {root}"
+            )
+    try:
+        from openmv_cam.offline_dataset import (
+            Episode as OpenMVEpisode, TrackerUpdate,
+            align_tracker_updates_to_policy_grid,
+            run_tracker_updates,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        location = openmv_cam_root or "PYTHONPATH/installed environment"
+        raise RuntimeError(
+            "OpenMV event tracking was requested but openmv_cam.offline_dataset "
+            f"could not be imported from {location}. Pass --openmv-cam-root "
+            "pointing at the openmv_cam repository and install its dependencies. "
+            f"Original error: {exc}"
+        ) from exc
+    return (OpenMVEpisode, TrackerUpdate, run_tracker_updates,
+            align_tracker_updates_to_policy_grid)
 
 
 def open_reader(bag_path: str, storage_id: str) -> rosbag2_py.SequentialReader:
@@ -190,6 +281,14 @@ def validate_topics(
 
     goto_s_available = topics.goto_s in types
     target_base_available = topics.goto_s_target_base in types
+    if topics.rgb_2d is not None:
+        if topics.rgb_2d not in types:
+            raise RuntimeError(f"RGB 2D topic is missing: {topics.rgb_2d}")
+        if types[topics.rgb_2d] != POINT_STAMPED_TYPE:
+            raise RuntimeError(
+                f"Topic {topics.rgb_2d} must be {POINT_STAMPED_TYPE}, "
+                f"got {types[topics.rgb_2d]}"
+            )
 
     if collect_goto_s_debug and not goto_s_available:
         log(
@@ -410,11 +509,14 @@ def required_data_topics(
     collect_target_base_debug: bool,
 ) -> List[str]:
     tracked = [topics.rgb, topics.joint, topics.current_tcp_s]
+    if topics.rgb_2d is not None:
+        tracked.append(topics.rgb_2d)
     if collect_goto_s_debug:
         tracked.append(topics.goto_s)
     if collect_target_base_debug:
         tracked.append(topics.goto_s_target_base)
     return tracked
+
 
 def create_episode_buffer() -> Dict[str, Any]:
     return {
@@ -428,6 +530,7 @@ def create_episode_buffer() -> Dict[str, Any]:
         "goto_s": [],
         "target_base_t": [],
         "target_base": [],
+        "rgb_2d": [],
     }
 
 
@@ -455,6 +558,13 @@ def ingest_episode_message(
         data["target_base"].append(
             [float(msg.point.x), float(msg.point.y), float(msg.point.z)]
         )
+    elif topics.rgb_2d is not None and topic == topics.rgb_2d:
+        stamp_ns = point_stamped_timestamp_ns(msg)
+        x, y = float(msg.point.x), float(msg.point.y)
+        valid = int(
+            np.isfinite(x) and np.isfinite(y) and x >= 0.0 and y >= 0.0
+        )
+        data["rgb_2d"].append((stamp_ns, x, y, valid))
 
 
 def finalize_episode(
@@ -473,6 +583,12 @@ def finalize_episode(
     event_frame_mode: str = "shifted",
     event_clip_count: Optional[float] = None,
     event_packet_margin_ms: float = 50.0,
+    event_tracker_updates=None,
+    event_tracker_aligner=None,
+    sparse_source: Optional[str] = None,
+    max_observation_age_sec: float = 0.10,
+    rgb_2d_topic: Optional[str] = None,
+    event_tracker_metadata: Optional[Dict[str, Any]] = None,
 ) -> int:
     collect_sec = max(0.0, time.perf_counter() - collect_started_wall)
 
@@ -504,6 +620,14 @@ def finalize_episode(
         event_frame_mode=event_frame_mode,
         event_clip_count=event_clip_count,
         event_packet_margin_ms=event_packet_margin_ms,
+        event_tracker_updates=event_tracker_updates,
+        event_tracker_aligner=event_tracker_aligner,
+        sparse_source=sparse_source,
+        max_observation_age_sec=max_observation_age_sec,
+        event_sparse_size=(
+            int((event_tracker_metadata or {}).get("sensor_width", 320)),
+            int((event_tracker_metadata or {}).get("sensor_height", 320)),
+        ),
     )
     sample_sec = max(0.0, time.perf_counter() - sample_start)
 
@@ -521,6 +645,10 @@ def finalize_episode(
         event_frame_windows_ms=event_frame_windows_ms,
         event_frame_mode=event_frame_mode,
         event_clip_count=event_clip_count,
+        sparse_source=sparse_source,
+        max_observation_age_sec=max_observation_age_sec,
+        rgb_2d_topic=rgb_2d_topic,
+        event_tracker_metadata=event_tracker_metadata,
     )
     write_sec = max(0.0, time.perf_counter() - write_start)
     total_sec = collect_sec + sample_sec + write_sec
@@ -536,6 +664,7 @@ def finalize_episode(
     data.clear()
     gc.collect()
     return length
+
 
 def log_data_pass_progress(
     current_timestamp: float,
@@ -595,6 +724,12 @@ def sample_episode(
     event_frame_mode: str = "shifted",
     event_clip_count: Optional[float] = None,
     event_packet_margin_ms: float = 50.0,
+    event_tracker_updates=None,
+    event_tracker_aligner=None,
+    sparse_source: Optional[str] = None,
+    max_observation_age_sec: float = 0.10,
+    rgb_sparse_size: Tuple[int, int] = (1280, 720),
+    event_sparse_size: Tuple[int, int] = (320, 320),
 ) -> Dict[str, np.ndarray]:
     """Causally sample observations and measured current_tcp_s action."""
     rgb_times = np.asarray(data["rgb_t"], dtype=np.float64)
@@ -624,11 +759,11 @@ def sample_episode(
             "no overlapping interval"
         )
 
-    dt = 1.0 / fps
-    grid = np.arange(effective_start, effective_end + 1e-9, dt, dtype=np.float64)
-    if grid.size == 0:
+    policy_rate_hz = int(fps)
+    grid_ns = policy_grid_ns(effective_start, effective_end, policy_rate_hz)
+    if grid_ns.size == 0:
         raise RuntimeError(f"Episode {episode.output_idx}: empty sampling grid")
-    grid_ns = np.rint(grid * 1e9).astype(np.int64)
+    grid = grid_ns.astype(np.float64) / 1e9
 
     rgb_indices = np.searchsorted(rgb_times, grid, side="right") - 1
     joint_indices = np.searchsorted(joint_times, grid, side="right") - 1
@@ -786,6 +921,7 @@ def sample_episode(
 
     arrays = {
         "timestamps": grid,
+        "timestamps_ns": grid_ns,
         "rgb": rgb,
         "qpos": qpos,
         "action": action,
@@ -802,6 +938,38 @@ def sample_episode(
         arrays["event_source_timestamps"] = event_source_timestamps
         arrays["event_source_age_sec"] = event_source_age_sec
         arrays["event_count_per_channel"] = event_count_per_channel
+
+    if data.get("rgb_2d"):
+        rgb_tracking = align_point_detections(data["rgb_2d"], grid_ns)
+        arrays.update({f"sparse_tracking/{key}": value
+                       for key, value in rgb_tracking.items()})
+
+    if event_tracker_updates is not None:
+        if event_tracker_aligner is None:
+            raise RuntimeError("event tracker updates require the OpenMV alignment API")
+        event_tracking = event_tracker_aligner(
+            event_tracker_updates, grid_ns, max_observation_age_sec
+        )
+        arrays.update({f"sparse_tracking/{key}": value
+                       for key, value in event_tracking.items()})
+        arrays["event_tracker_updates"] = list(event_tracker_updates)
+
+    if sparse_source is not None:
+        prefix = f"sparse_tracking/{sparse_source}"
+        required = (f"{prefix}_2d_px", f"{prefix}_valid",
+                    f"{prefix}_source_timestamps")
+        missing = [name for name in required if name not in arrays]
+        if missing:
+            raise RuntimeError(
+                f"sparse source {sparse_source!r} has no aligned detections: {missing}"
+            )
+        width, height = ((int(rgb.shape[2]), int(rgb.shape[1]))
+                         if sparse_source == "rgb" else event_sparse_size)
+        arrays["sparse_ball"] = construct_sparse_features(
+            grid, arrays[required[0]], arrays[required[1]], arrays[required[2]],
+            width, height, max_observation_age_sec,
+        )
+        arrays["sparse_image_size"] = (int(width), int(height))
 
     return arrays
 
@@ -826,6 +994,10 @@ def write_episode(
     event_frame_windows_ms: Tuple[float, float, float] = (50.0, 100.0, 200.0),
     event_frame_mode: str = "shifted",
     event_clip_count: Optional[float] = None,
+    sparse_source: Optional[str] = None,
+    max_observation_age_sec: float = 0.10,
+    rgb_2d_topic: Optional[str] = None,
+    event_tracker_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     if os.path.exists(output_path) and not overwrite:
         raise RuntimeError(
@@ -844,6 +1016,29 @@ def write_episode(
             h5.attrs["sim"] = False
             h5.attrs["task"] = "ball_interception"
             h5.attrs["fps"] = float(fps)
+            policy_rate_hz = int(fps)
+            try:
+                history_frames, chunk_size, grid_period_ns = rate_contract(
+                    policy_rate_hz
+                )
+                canonical_rate = True
+            except ValueError:  # legacy direct-call tests; CLI rejects this path
+                history_frames = (-6, -3, 0)
+                chunk_size = 30
+                grid_period_ns = int(round(1e9 / policy_rate_hz))
+                canonical_rate = False
+            if canonical_rate:
+                h5.attrs["policy_rate_hz"] = policy_rate_hz
+                h5.attrs["grid_period_ns"] = grid_period_ns
+                h5.attrs["grid_origin"] = int(arrays["timestamps_ns"][0])
+                h5.attrs["history_offsets_sec"] = np.asarray(
+                    [-0.2, -0.1, 0.0], dtype=np.float64
+                )
+                h5.attrs["history_offsets_frames"] = np.asarray(
+                    history_frames, dtype=np.int64
+                )
+                h5.attrs["action_horizon_sec"] = 1.0
+                h5.attrs["chunk_size"] = chunk_size
             h5.attrs["episode_index"] = int(episode.output_idx)
             h5.attrs["source_episode_index"] = int(episode.source_idx)
             h5.attrs["episode_start"] = float(episode.start)
@@ -905,6 +1100,9 @@ def write_episode(
                 "timestamps", data=arrays["timestamps"], dtype=np.float64
             )
             observations.create_dataset(
+                "timestamps_ns", data=arrays["timestamps_ns"], dtype=np.int64
+            )
+            observations.create_dataset(
                 "qpos", data=arrays["qpos"], dtype=np.float32
             )
             images.create_dataset(
@@ -922,6 +1120,77 @@ def write_episode(
                     chunks=(1, *arrays["event"].shape[1:]),
                     **compression_kwargs,
                 )
+
+            tracking_keys = sorted(
+                key for key in arrays if key.startswith("sparse_tracking/")
+            )
+            if tracking_keys:
+                tracking = observations.create_group("sparse_tracking")
+                for key in tracking_keys:
+                    name = key.split("/", 1)[1]
+                    values = arrays[key]
+                    if name.endswith("rejection_reason"):
+                        values = np.asarray(
+                            values, dtype=h5py.string_dtype("utf-8", length=256)
+                        )
+                    tracking.create_dataset(name, data=values)
+                tracking.attrs["rgb_source_timestamp_domain"] = (
+                    "geometry_msgs/PointStamped.header.stamp"
+                )
+                tracking.attrs["event_source_timestamp_domain"] = (
+                    "tracker_packet_availability_ros_t_ns"
+                )
+
+            if "event_tracker_updates" in arrays:
+                processing = h5.require_group("processing").create_group(
+                    "event_tracker"
+                )
+                updates = arrays["event_tracker_updates"]
+                fields = (
+                    "available_ros_t_ns", "packet_id", "x_px", "y_px", "valid",
+                    "rejection_reason", "sensor_window_start_us",
+                    "sensor_window_end_us", "velocity_valid", "confidence",
+                    "window_event_count", "candidate_count",
+                )
+                field_dtypes = {
+                    "available_ros_t_ns": np.int64,
+                    "packet_id": np.int64,
+                    "x_px": np.float32, "y_px": np.float32,
+                    "valid": np.uint8, "velocity_valid": np.uint8,
+                    "sensor_window_start_us": np.int64,
+                    "sensor_window_end_us": np.int64,
+                    "confidence": np.float32,
+                    "window_event_count": np.int32,
+                    "candidate_count": np.int32,
+                }
+                for field in fields:
+                    values = [getattr(update, field) for update in updates]
+                    if field == "rejection_reason":
+                        values = np.asarray(
+                            values, dtype=h5py.string_dtype("utf-8", length=256)
+                        )
+                    else:
+                        values = np.asarray(values, dtype=field_dtypes[field])
+                    processing.create_dataset(field, data=values)
+                for key, value in (event_tracker_metadata or {}).items():
+                    processing.attrs[key] = value
+
+            if "sparse_ball" in arrays:
+                observations.create_dataset(
+                    "sparse_ball", data=arrays["sparse_ball"], dtype=np.float32
+                )
+                width, height = arrays["sparse_image_size"]
+                metadata = sparse_metadata(
+                    width, height, max_observation_age_sec,
+                    rgb_2d_topic if sparse_source == "rgb"
+                    else default_sparse_topic("event"),
+                    sparse_source=sparse_source,
+                    policy_rate_hz=policy_rate_hz,
+                )
+                for key, value in metadata.items():
+                    if isinstance(value, list) and value and isinstance(value[0], str):
+                        value = np.asarray(value, dtype=h5py.string_dtype("utf-8"))
+                    h5.attrs[key] = value
 
             h5.create_dataset("action", data=arrays["action"], dtype=np.float32)
             h5.create_dataset(
@@ -975,7 +1244,8 @@ def write_episode(
 
         os.replace(temporary_path, output_path)
     except Exception:
-        # Preserve a partially written .tmp file for diagnosis rather than deleting it.
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
         raise
 
     log(f"[INFO] wrote {output_path}")
@@ -992,7 +1262,7 @@ def output_dir_name(args: argparse.Namespace, bag_path: str) -> str:
         rec_dir = os.path.abspath(os.path.expanduser(args.rec_dir))
         rec_name = os.path.basename(os.path.normpath(rec_dir))
         if rec_name.startswith("recording_"):
-            return "hdf5_" + rec_name[len("recording_") :]
+            return "hdf5_" + rec_name[len("recording_"):]
         return rec_name
     return recording_name(bag_path)
 
@@ -1047,7 +1317,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--storage_id", choices=("mcap", "sqlite3"), default="mcap"
     )
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument(
+        "--policy-rate-hz", "--policy_rate_hz", "--fps",
+        dest="policy_rate_hz", type=int, choices=(30, 60), default=30,
+    )
     parser.add_argument(
         "--min_duration",
         type=float,
@@ -1078,13 +1351,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
 
     parser.add_argument(
-        "--raw_events_h5",
+        "--raw-events-h5", "--raw_events_h5",
         default=None,
         help=(
             "Optional raw-event sidecar HDF5. When provided (or auto-resolved via "
             "--rec_dir), event tensors are rendered from raw packets."
         ),
     )
+    parser.add_argument(
+        "--rgb-2d-topic", "--rgb_2d_topic",
+        default="/ball_tracker2/ball_2d_px",
+    )
+    parser.add_argument(
+        "--event-tracker-config", "--event_tracker_config", default=None,
+    )
+    parser.add_argument("--openmv-cam-root", default=None)
+    parser.add_argument("--sparse-source", choices=("rgb", "event"), default=None)
+    parser.add_argument("--max-observation-age-sec", type=float, default=0.10)
+    parser.add_argument("--save-event-tracker-cache", default=None)
+    parser.add_argument("--reuse-event-tracker-cache", default=None)
     parser.add_argument(
         "--event_frame_windows_ms",
         type=float,
@@ -1125,8 +1410,11 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
-    if args.fps <= 0.0:
-        parser.error("--fps must be positive")
+    args.fps = float(args.policy_rate_hz)  # legacy internal/API compatibility
+    if args.max_observation_age_sec <= 0.0:
+        parser.error("--max-observation-age-sec must be positive")
+    if args.sparse_source == "event" and args.event_tracker_config is None:
+        parser.error("--sparse-source event requires --event-tracker-config")
     if args.min_duration < 0.0:
         parser.error("--min_duration must be non-negative")
     if args.max_episodes is not None and args.max_episodes <= 0:
@@ -1156,6 +1444,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     conversion_start_wall = time.perf_counter()
     args = parse_args()
+    compatibility_defaults = {
+        "event_tracker_config": None,
+        "openmv_cam_root": None,
+        "sparse_source": None,
+        "max_observation_age_sec": 0.10,
+        "save_event_tracker_cache": None,
+        "reuse_event_tracker_cache": None,
+        "rgb_2d_topic": "/ball_tracker2/ball_2d_px",
+    }
+    for name, value in compatibility_defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, value)
     bag_path, raw_events_h5 = resolve_input_paths(args)
     output_parent = os.path.abspath(os.path.expanduser(args.out_dir))
     if not os.path.exists(bag_path):
@@ -1167,9 +1467,17 @@ def main() -> None:
         )
     if raw_events_h5 is not None and not os.path.exists(raw_events_h5):
         raise RuntimeError(f"Raw-event sidecar does not exist: {raw_events_h5}")
-    if raw_events_h5 is not None and args.event_clip_count is None:
+    tracker_requested = args.event_tracker_config is not None
+    if (raw_events_h5 is not None and args.event_clip_count is None and
+            not tracker_requested):
         raise RuntimeError(
-            "--event_clip_count is required when event conversion is enabled"
+            "--event_clip_count is required for 3CHEF rendering, or provide "
+            "--event-tracker-config for sparse event tracking"
+        )
+    if tracker_requested and raw_events_h5 is None:
+        raise RuntimeError(
+            "--event-tracker-config requires --raw-events-h5 (or an auto-resolved "
+            "raw event HDF5 in --rec_dir)"
         )
 
     log(f"[INFO] bag: {bag_path}")
@@ -1183,6 +1491,13 @@ def main() -> None:
     marker_reader = open_reader(bag_path, args.storage_id)
     types = topic_type_map(marker_reader)
     selected_rgb_topic = resolve_rgb_topic(types, args.rgb_topic)
+    selected_rgb_2d_topic = (
+        args.rgb_2d_topic if args.rgb_2d_topic in types else None
+    )
+    if args.sparse_source == "rgb" and selected_rgb_2d_topic is None:
+        raise RuntimeError(f"RGB 2D topic is missing: {args.rgb_2d_topic}")
+    if selected_rgb_2d_topic is None:
+        log(f"[INFO] optional RGB 2D topic is absent: {args.rgb_2d_topic}")
 
     topics = Topics(
         rgb=selected_rgb_topic,
@@ -1191,6 +1506,7 @@ def main() -> None:
         current_tcp_s=args.current_tcp_s_topic,
         goto_s=args.goto_s_topic,
         goto_s_target_base=args.goto_s_target_base_topic,
+        rgb_2d=selected_rgb_2d_topic,
     )
 
     collect_goto_s_debug, collect_target_base_debug = validate_topics(
@@ -1212,6 +1528,80 @@ def main() -> None:
     if args.max_episodes is not None:
         episodes = episodes[: args.max_episodes]
     validate_non_overlapping_windows(episodes)
+
+    tracker_updates_by_episode = {}
+    event_tracker_aligner = None
+    event_tracker_metadata = None
+    if tracker_requested:
+        (OpenMVEpisode, TrackerUpdate, run_tracker_updates,
+         event_tracker_aligner) = import_openmv_tracker_api(args.openmv_cam_root)
+        with open(args.event_tracker_config, "r", encoding="utf-8") as stream:
+            tracker_config = json.load(stream)
+        pre_roll_ms = float(tracker_config.pop("pre_roll_ms", 0.0))
+        tracker_config_json = json.dumps(
+            tracker_config, sort_keys=True, separators=(",", ":")
+        )
+        openmv_episodes = [
+            OpenMVEpisode(
+                Path(f"episode_{episode.output_idx}.hdf5"),
+                f"episode_{episode.output_idx}", episode.output_idx,
+                episode.source_idx, episode.start, episode.end,
+                np.empty(0, dtype=np.float64),
+            )
+            for episode in episodes
+        ]
+        if args.reuse_event_tracker_cache:
+            with open(args.reuse_event_tracker_cache, "r", encoding="utf-8") as stream:
+                cached = json.load(stream)
+            expected_hash = hashlib.sha256(
+                tracker_config_json.encode("utf-8")
+            ).hexdigest()
+            if cached.get("tracker_config_hash") != expected_hash:
+                raise RuntimeError("event tracker cache configuration hash mismatch")
+            if Path(cached.get("raw_events_h5", "")).resolve() != Path(
+                    raw_events_h5).resolve():
+                raise RuntimeError("event tracker cache raw-event path mismatch")
+            tracker_updates_by_episode = {
+                name: [TrackerUpdate(**row) for row in rows]
+                for name, rows in cached["episodes"].items()
+            }
+        else:
+            tracker_updates_by_episode = run_tracker_updates(
+                raw_events_h5, openmv_episodes, tracker_config,
+                pre_roll_ms=pre_roll_ms,
+            )
+        event_tracker_metadata = {
+            "raw_events_h5": str(Path(raw_events_h5).resolve()),
+            "tracker_config_json": tracker_config_json,
+            "tracker_config_hash": hashlib.sha256(
+                tracker_config_json.encode("utf-8")
+            ).hexdigest(),
+            "tracker_code_version": "openmv_cam.offline_dataset",
+            "availability_timestamp_domain": "packet_ros_t_ns",
+            "sensor_timestamp_domain": "genx320_microseconds",
+            "sensor_width": int(tracker_config.get("width", 320)),
+            "sensor_height": int(tracker_config.get("height", 320)),
+            "pre_roll_ms": pre_roll_ms,
+            "schema_version": "act_event_tracker_processing_v1",
+        }
+        if args.save_event_tracker_cache:
+            from dataclasses import asdict
+            cache = {
+                "schema_version": "act_event_tracker_cache_v1",
+                "raw_events_h5": str(Path(raw_events_h5).resolve()),
+                "tracker_config_hash": event_tracker_metadata[
+                    "tracker_config_hash"
+                ],
+                "episodes": {
+                    name: [asdict(update) for update in updates]
+                    for name, updates in tracker_updates_by_episode.items()
+                },
+            }
+            cache_path = Path(args.save_event_tracker_cache)
+            temporary_cache = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            with open(temporary_cache, "w", encoding="utf-8") as stream:
+                json.dump(cache, stream, sort_keys=True)
+            os.replace(temporary_cache, cache_path)
 
     marker_elapsed = max(0.0, time.perf_counter() - marker_pass_start_wall)
     log(
@@ -1254,7 +1644,7 @@ def main() -> None:
     log("[INFO] Pass 2: streaming selected episodes with one filtered data reader")
 
     raw_event_store: Optional[RawEventStore] = None
-    if raw_events_h5 is not None:
+    if raw_events_h5 is not None and args.event_clip_count is not None:
         raw_event_store = RawEventStore(raw_events_h5, logger=log)
         if episodes:
             selected_start = min(ep.start for ep in episodes)
@@ -1311,6 +1701,14 @@ def main() -> None:
                         event_frame_mode=args.event_frame_mode,
                         event_clip_count=args.event_clip_count,
                         event_packet_margin_ms=args.event_packet_margin_ms,
+                        event_tracker_updates=tracker_updates_by_episode.get(
+                            f"episode_{episode.output_idx}"
+                        ) if tracker_requested else None,
+                        event_tracker_aligner=event_tracker_aligner,
+                        sparse_source=args.sparse_source,
+                        max_observation_age_sec=args.max_observation_age_sec,
+                        rgb_2d_topic=selected_rgb_2d_topic,
+                        event_tracker_metadata=event_tracker_metadata,
                     )
                 )
                 completed_episodes += 1
@@ -1366,6 +1764,14 @@ def main() -> None:
                     event_frame_mode=args.event_frame_mode,
                     event_clip_count=args.event_clip_count,
                     event_packet_margin_ms=args.event_packet_margin_ms,
+                    event_tracker_updates=tracker_updates_by_episode.get(
+                        f"episode_{episode.output_idx}"
+                    ) if tracker_requested else None,
+                    event_tracker_aligner=event_tracker_aligner,
+                    sparse_source=args.sparse_source,
+                    max_observation_age_sec=args.max_observation_age_sec,
+                    rgb_2d_topic=selected_rgb_2d_topic,
+                    event_tracker_metadata=event_tracker_metadata,
                 )
             )
             completed_episodes += 1

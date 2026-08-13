@@ -6,7 +6,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from sparse_ball import SPARSE_FEATURE_NAMES, validate_sparse_checkpoint_contract
+from sparse_ball import (SPARSE_FEATURE_NAMES, rate_contract,
+                         validate_policy_rate,
+                         validate_sparse_checkpoint_contract)
 
 INTERCEPT_HISTORY_OFFSETS = (-6, -3, 0)
 ARM_JOINT_NAMES = (
@@ -339,6 +341,11 @@ def validate_intercept_stats_and_config(
     modality = str(policy_config.get("input_modality", "rgb"))
     arrays: Dict[str, np.ndarray] = {}
     expected_metadata = dict(EXPECTED_INTERCEPT_METADATA)
+    has_saved_rate = "policy_rate_hz" in stats
+    saved_rate = validate_policy_rate(stats.get("policy_rate_hz", 30))
+    saved_offsets, saved_rate_chunk, _ = rate_contract(saved_rate)
+    expected_metadata["rgb_history_offsets"] = list(saved_offsets)
+    expected_metadata["qpos_history_offsets"] = list(saved_offsets)
     if modality == "sparse_ball":
         expected_metadata.pop("rgb_history_frames")
         expected_metadata.pop("rgb_history_offsets")
@@ -402,6 +409,7 @@ def validate_intercept_stats_and_config(
             runtime.get("image_width"),
             runtime.get("image_height"),
             runtime.get("max_observation_age_sec"),
+            runtime.get("policy_rate_hz"),
         )
         arrays["_validated_metadata"] = np.asarray(validated, dtype=object)
         arrays["_unavailable_metadata"] = np.asarray(unavailable, dtype=object)
@@ -419,6 +427,31 @@ def validate_intercept_stats_and_config(
         raise ValueError(
             f"Checkpoint chunk_size mismatch: requested {expected_chunk_size}, "
             f"checkpoint {stats['chunk_size']}"
+        )
+    runtime_rate = (sparse_runtime or {}).get("policy_rate_hz")
+    if runtime_rate is not None:
+        rate = validate_policy_rate(runtime_rate)
+        _, rate_chunk_size, _ = rate_contract(rate)
+        if int(expected_chunk_size) != rate_chunk_size:
+            raise ValueError(
+                f"Runtime chunk_size {expected_chunk_size} does not match "
+                f"policy_rate_hz {rate}; expected {rate_chunk_size}"
+            )
+        if int(stats.get("policy_rate_hz", -1)) != rate:
+            raise ValueError(
+                "Checkpoint policy rate mismatch: "
+                f"runtime={rate}, checkpoint={stats.get('policy_rate_hz')}"
+            )
+    if has_saved_rate and int(expected_chunk_size) != saved_rate_chunk:
+        raise ValueError(
+            f"Checkpoint policy rate {saved_rate} requires chunk_size "
+            f"{saved_rate_chunk}, got {expected_chunk_size}"
+        )
+    configured_rate = int(policy_config.get("policy_rate_hz", saved_rate))
+    if has_saved_rate and configured_rate != saved_rate:
+        raise ValueError(
+            f"Policy/checkpoint rate mismatch: configured={configured_rate}, "
+            f"checkpoint={saved_rate}"
         )
 
     required_config = {

@@ -7,7 +7,9 @@ import h5py
 import cv2
 from torch.utils.data import DataLoader
 import torchvision.transforms.v2 as transforms
-from sparse_ball import SPARSE_BALL_FEATURE_DIM, SPARSE_BALL_FEATURE_NAMES
+from sparse_ball import (SPARSE_BALL_FEATURE_DIM, SPARSE_BALL_FEATURE_NAMES,
+                         SPARSE_HISTORY_OFFSETS_SEC, rate_contract,
+                         validate_policy_rate)
 
 import IPython
 e = IPython.embed
@@ -341,6 +343,23 @@ def _validate_intercept_episode_structure(
         raise ValueError(
             f"Interception /observations/timestamps must have shape (T,) in {dataset_path}, got {obs_timestamps.shape}"
         )
+    if 'policy_rate_hz' in root.attrs:
+        rate = validate_policy_rate(root.attrs['policy_rate_hz'])
+        if '/observations/timestamps_ns' not in root:
+            raise ValueError(f'Missing authoritative timestamps_ns in {dataset_path}')
+        timestamps_ns = np.asarray(
+            root['/observations/timestamps_ns'][()], dtype=np.int64
+        )
+        if timestamps_ns.shape != (T,):
+            raise ValueError(f'timestamps_ns must have shape (T,) in {dataset_path}')
+        if not np.array_equal(
+                np.rint(obs_timestamps * 1e9).astype(np.int64), timestamps_ns):
+            raise ValueError(f'float and integer policy timestamps disagree in {dataset_path}')
+        indices = np.arange(T, dtype=np.int64)
+        expected = (timestamps_ns[0] +
+                    (indices * 1_000_000_000 + rate // 2) // rate)
+        if not np.array_equal(timestamps_ns, expected):
+            raise ValueError(f'policy grid drift or spacing mismatch in {dataset_path}')
 
     if not np.isfinite(action).all():
         raise ValueError(f"Non-finite values found in /action for {dataset_path}")
@@ -349,17 +368,29 @@ def _validate_intercept_episode_structure(
 
     if modality == 'sparse_ball':
         if image_ds.shape != (T, SPARSE_BALL_FEATURE_DIM):
-            raise ValueError(f"Interception sparse_ball must have shape (T,6), got {image_ds.shape}")
-        required = ('input_modality', 'sparse_feature_names', 'sparse_history_offsets',
-                    'image_width', 'image_height', 'coordinate_convention', 'velocity_convention',
-                    'max_observation_age_sec', 'ball_source_topic', 'source_timestamp_policy')
-        required = required + ('missing_observation_policy',)
+            raise ValueError(f"Interception sparse_ball must have shape (T,4), got {image_ds.shape}")
+        required = (
+            'input_modality', 'sparse_source', 'sparse_feature_dim',
+            'sparse_feature_names', 'sparse_history_offsets_sec',
+            'sparse_history_offsets_frames', 'sparse_image_width',
+            'sparse_image_height', 'sparse_max_observation_age_sec',
+            'sparse_topic', 'source_timestamp_policy',
+            'missing_observation_policy', 'policy_rate_hz',
+        )
         missing = [key for key in required if key not in root.attrs]
         if missing:
             raise ValueError(f"Missing sparse_ball metadata in {dataset_path}: {missing}")
         names = [_decode_h5_attr(item) for item in np.asarray(root.attrs['sparse_feature_names']).reshape(-1)]
         if tuple(names) != SPARSE_BALL_FEATURE_NAMES:
             raise ValueError(f"sparse feature order mismatch: {names}")
+        if int(root.attrs['sparse_feature_dim']) != 4:
+            raise ValueError('sparse_feature_dim must be 4; six-feature datasets are unsupported')
+        rate = validate_policy_rate(root.attrs['policy_rate_hz'])
+        offsets, expected_chunk, _ = rate_contract(rate)
+        if tuple(root.attrs['sparse_history_offsets_frames']) != offsets:
+            raise ValueError('sparse history frame offsets do not match policy rate')
+        if int(root.attrs.get('chunk_size', expected_chunk)) != expected_chunk:
+            raise ValueError('chunk_size does not match one-second policy horizon')
 
     event_metadata = None
     if modality == 'event':
@@ -1166,7 +1197,7 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         action_data = torch.from_numpy(padded_action).float()
         is_pad = torch.from_numpy(is_pad).bool()
 
-        expected_input_shape = (3, 6) if self.input_modality == 'sparse_ball' else (1, 9, self.image_size[0], self.image_size[1])
+        expected_input_shape = (3, 4) if self.input_modality == 'sparse_ball' else (1, 9, self.image_size[0], self.image_size[1])
         assert image_data.shape == expected_input_shape, image_data.shape
         assert qpos_data.shape == (21,), qpos_data.shape
         assert action_data.shape == (self.chunk_size, 1), action_data.shape
@@ -1249,9 +1280,12 @@ def get_intercept_norm_stats(
     sparse_histories = []
     sparse_checkpoint_metadata = None
     delta_tokens = []
+    policy_rates = set()
 
     for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
+            if 'policy_rate_hz' in root.attrs:
+                policy_rates.add(validate_policy_rate(root.attrs['policy_rate_hz']))
             qpos_full, action_full, _ = _validate_intercept_episode_structure(
                 root,
                 dataset_path,
@@ -1263,9 +1297,14 @@ def get_intercept_norm_stats(
             if input_modality == 'sparse_ball' and sparse_checkpoint_metadata is None:
                 sparse_checkpoint_metadata = {
                     key: _decode_h5_attr(root.attrs[key])
-                    for key in ('image_width', 'image_height', 'coordinate_convention', 'velocity_convention',
-                                'max_observation_age_sec', 'ball_source_topic', 'source_timestamp_policy',
-                                'missing_observation_policy')
+                    for key in (
+                        'sparse_source', 'sparse_image_width',
+                        'sparse_image_height', 'sparse_max_observation_age_sec',
+                        'sparse_topic', 'source_timestamp_policy',
+                        'missing_observation_policy', 'policy_rate_hz',
+                        'sparse_history_offsets_sec',
+                        'sparse_history_offsets_frames', 'chunk_size',
+                    )
                 }
 
         T = action_full.shape[0]
@@ -1281,6 +1320,8 @@ def get_intercept_norm_stats(
             if delta_values.size > 0:
                 delta_tokens.append(delta_values)
 
+    if len(policy_rates) > 1:
+        raise ValueError(f'Mixed policy-rate datasets are unsupported: {sorted(policy_rates)}')
     if len(qpos_histories) == 0:
         raise ValueError('No valid interception anchors found while computing normalization stats.')
     if len(delta_tokens) == 0:
@@ -1324,15 +1365,19 @@ def get_intercept_norm_stats(
         'action_positive_direction': 'robot_base_positive_x',
         'action_units': 'm',
         'camera_names': {'rgb': ['rgb'], 'event': ['event'], 'sparse_ball': ['sparse_ball']}[str(input_modality)],
+        'policy_rate_hz': next(iter(policy_rates), 30),
+        'chunk_size': int(chunk_size),
+        'action_horizon_sec': 1.0,
     }
 
     if str(input_modality) == 'sparse_ball':
         values = np.concatenate(sparse_histories, axis=0)
         stats['sparse_mean'] = values.mean(axis=0).astype(np.float32)
         stats['sparse_std'] = values.std(axis=0).clip(1e-2, np.inf).astype(np.float32)
-        stats['sparse_feature_dim'] = 6
+        stats['sparse_feature_dim'] = 4
         stats['sparse_feature_names'] = list(SPARSE_BALL_FEATURE_NAMES)
         stats['sparse_history_offsets'] = list(history_offsets)
+        stats['sparse_history_offsets_sec'] = list(SPARSE_HISTORY_OFFSETS_SEC)
         stats['sparse_history_length'] = 3
         stats['image_channels'] = 0
         stats['image_normalization'] = 'none'
@@ -1570,15 +1615,30 @@ def load_intercept_data(
         )
 
     history_offsets = tuple(int(offset) for offset in history_offsets)
-    if history_offsets != INTERCEPT_HISTORY_OFFSETS_DEFAULT:
-        raise ValueError(
-            f"Interception history_offsets must be {INTERCEPT_HISTORY_OFFSETS_DEFAULT}, got {history_offsets}"
-        )
+    if len(history_offsets) != 3:
+        raise ValueError(f"Interception requires three history offsets, got {history_offsets}")
 
     episode_paths = collect_episode_paths(dataset_dirs)
     total_episode_count = len(episode_paths)
     if total_episode_count < 2:
         raise ValueError('Need at least 2 episodes for train/val split')
+
+    dataset_rates = set()
+    for dataset_path in episode_paths:
+        with h5py.File(dataset_path, 'r') as root:
+            if 'policy_rate_hz' in root.attrs:
+                dataset_rates.add(validate_policy_rate(root.attrs['policy_rate_hz']))
+    if len(dataset_rates) > 1:
+        raise ValueError(f'Mixed policy-rate datasets are unsupported: {sorted(dataset_rates)}')
+    policy_rate_hz = next(iter(dataset_rates), 30)
+    expected_offsets, expected_chunk, _ = rate_contract(policy_rate_hz)
+    if dataset_rates and history_offsets != expected_offsets:
+        history_offsets = expected_offsets
+    if dataset_rates and int(chunk_size) != expected_chunk:
+        raise ValueError(
+            f'chunk_size {chunk_size} does not match policy_rate_hz '
+            f'{policy_rate_hz}; expected {expected_chunk}'
+        )
 
     if isinstance(dataset_dirs, str):
         source_dataset_dirs = [dataset_dirs]

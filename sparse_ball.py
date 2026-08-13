@@ -9,6 +9,8 @@ import numpy as np
 
 
 SPARSE_FEATURE_DIM = 4
+SUPPORTED_POLICY_RATES_HZ = (30, 60)
+SPARSE_HISTORY_OFFSETS_SEC = (-0.2, -0.1, 0.0)
 SPARSE_HISTORY_OFFSETS = (-6, -3, 0)
 SPARSE_HISTORY_LENGTH = 3
 SPARSE_FEATURE_NAMES = ("u", "v", "valid", "observation_age")
@@ -20,6 +22,25 @@ SPARSE_SOURCE_TIMESTAMP_POLICY = "point_stamped_header_latest_at_or_before_polic
 DEFAULT_MAX_OBSERVATION_AGE_SEC = 0.10
 DEFAULT_RGB_SPARSE_TOPIC = "/ball_tracker2/ball_2d_px"
 DEFAULT_EVENT_SPARSE_TOPIC = "/openmv_cam/event_tracker/ball_2d_px"
+
+
+def validate_policy_rate(policy_rate_hz) -> int:
+    """Return a supported integral policy rate."""
+    rate = int(policy_rate_hz)
+    if float(policy_rate_hz) != rate or rate not in SUPPORTED_POLICY_RATES_HZ:
+        raise ValueError(
+            f"policy_rate_hz must be one of {SUPPORTED_POLICY_RATES_HZ}, "
+            f"got {policy_rate_hz!r}"
+        )
+    return rate
+
+
+def rate_contract(policy_rate_hz):
+    """Return frame offsets, one-second chunk size, and rounded grid period."""
+    rate = validate_policy_rate(policy_rate_hz)
+    offsets = tuple(int(round(value * rate))
+                    for value in SPARSE_HISTORY_OFFSETS_SEC)
+    return offsets, rate, int(round(1_000_000_000 / rate))
 
 
 def default_sparse_topic(source: str) -> str:
@@ -110,21 +131,34 @@ def sparse_feature_at_time(points, target_time, image_width, image_height,
 
 
 def sparse_metadata(image_width, image_height, max_observation_age_sec,
-                    source_topic, sparse_source=None):
+                    source_topic, sparse_source=None, policy_rate_hz=30):
     """Return checkpoint metadata using the committed DLAB key names."""
     source = sparse_source
     if source is None:
         source = "event" if source_topic == DEFAULT_EVENT_SPARSE_TOPIC else "rgb"
+    offsets, chunk_size, _ = rate_contract(policy_rate_hz)
     return {
         "input_modality": "sparse_ball",
         "sparse_source": source,
         "sparse_feature_dim": SPARSE_FEATURE_DIM,
         "sparse_feature_names": list(SPARSE_FEATURE_NAMES),
         "sparse_history_length": SPARSE_HISTORY_LENGTH,
+        "sparse_history_offsets_sec": list(SPARSE_HISTORY_OFFSETS_SEC),
+        "sparse_history_offsets_frames": list(offsets),
         "sparse_image_width": int(image_width),
         "sparse_image_height": int(image_height),
         "sparse_max_observation_age_sec": float(max_observation_age_sec),
         "sparse_topic": str(source_topic),
+        "source_timestamp_policy": SPARSE_SOURCE_TIMESTAMP_POLICY,
+        "missing_observation_policy": "[0,0,0,max_observation_age_sec]",
+        "policy_rate_hz": validate_policy_rate(policy_rate_hz),
+        "chunk_size": chunk_size,
+        # Read-only compatibility aliases for existing tooling.
+        "sparse_history_offsets": list(offsets),
+        "image_width": int(image_width),
+        "image_height": int(image_height),
+        "max_observation_age_sec": float(max_observation_age_sec),
+        "ball_source_topic": str(source_topic),
     }
 
 
@@ -161,7 +195,8 @@ def construct_causal_sparse_history(
 
 
 def validate_sparse_checkpoint_contract(
-    stats, source, image_width, image_height, max_observation_age_sec
+    stats, source, image_width, image_height, max_observation_age_sec,
+    policy_rate_hz=None,
 ):
     """Reject incompatible dense or sparse checkpoint metadata."""
     required = {
@@ -186,3 +221,23 @@ def validate_sparse_checkpoint_contract(
             "Sparse checkpoint contract mismatch for max observation age: "
             f"configured={max_observation_age_sec}, saved={saved_age}"
         )
+    if policy_rate_hz is not None:
+        rate = validate_policy_rate(policy_rate_hz)
+        saved_rate = int(stats.get("policy_rate_hz", -1))
+        if saved_rate != rate:
+            raise ValueError(
+                "Sparse checkpoint contract mismatch for policy_rate_hz: "
+                f"configured={rate}, saved={saved_rate}"
+            )
+        expected_offsets, expected_chunk, _ = rate_contract(rate)
+        saved_offsets = stats.get("sparse_history_offsets_frames")
+        if saved_offsets is not None and tuple(saved_offsets) != expected_offsets:
+            raise ValueError(
+                "Sparse checkpoint history frame offsets mismatch: "
+                f"expected={expected_offsets}, saved={saved_offsets}"
+            )
+        if int(stats.get("chunk_size", -1)) != expected_chunk:
+            raise ValueError(
+                "Sparse checkpoint chunk size does not match its policy rate: "
+                f"expected={expected_chunk}, saved={stats.get('chunk_size')}"
+            )
