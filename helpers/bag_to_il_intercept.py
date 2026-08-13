@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+from pathlib import Path
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -29,6 +31,10 @@ from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
 from raw_event_hdf5 import RawEventStore, resolve_recording_dir
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from sparse_ball import policy_period_ns, validate_policy_rate
 
