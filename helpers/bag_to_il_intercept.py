@@ -1354,10 +1354,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--event_clip_count",
         type=float,
-        default=None,
+        default=16.0,
         help=(
             "Fixed clip denominator for signed_log1p_fixed_clip rendering. "
-            "Required when event conversion is enabled."
+            "Default: 16."
         ),
     )
     parser.add_argument(
@@ -1459,11 +1459,6 @@ def main() -> None:
     output_dir = resolve_output_dir(args.out_dir)
     if not os.path.exists(bag_path):
         raise RuntimeError(f"Bag path does not exist: {bag_path}")
-    if args.event_clip_count is not None and raw_events_h5 is None:
-        raise RuntimeError(
-            "--event_clip_count was provided but no raw-event sidecar could be resolved. "
-            "Provide --raw_events_h5 or use --rec_dir with <recording_name>_raw_events.h5 present."
-        )
     if raw_events_h5 is not None and not os.path.exists(raw_events_h5):
         raise RuntimeError(f"Raw-event sidecar does not exist: {raw_events_h5}")
     if raw_events_h5 is not None and args.event_clip_count is None:

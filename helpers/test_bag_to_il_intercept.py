@@ -965,6 +965,20 @@ class BagToIlInterceptTests(unittest.TestCase):
         finally:
             sys.argv = argv
 
+    def test_fps_and_event_clip_count_defaults(self):
+        argv = list(sys.argv)
+        try:
+            sys.argv = [
+                "bag_to_il_intercept.py",
+                "--bag", "/tmp/bag",
+                "--out_dir", "/tmp/out",
+            ]
+            args = self.mod.parse_args()
+            self.assertEqual(args.fps, 30.0)
+            self.assertEqual(args.event_clip_count, 16.0)
+        finally:
+            sys.argv = argv
+
     def test_out_dir_is_the_exact_episode_destination(self):
         argv = list(sys.argv)
         try:
