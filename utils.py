@@ -10,7 +10,7 @@ import torchvision.transforms.v2 as transforms
 
 from sparse_ball import (
     SPARSE_FEATURE_DIM, SPARSE_FEATURE_NAMES, SPARSE_HISTORY_LENGTH,
-    SPARSE_HISTORY_OFFSETS, SPARSE_SOURCE_TIMESTAMP_POLICY,
+    SPARSE_HISTORY_OFFSETS, SPARSE_HISTORY_OFFSETS_SEC, SPARSE_SOURCE_TIMESTAMP_POLICY,
     construct_sparse_features, sparse_dataset_paths,
 )
 
@@ -1252,8 +1252,12 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         if self.input_modality == 'sparse_ball':
             if self.sparse_source not in ('rgb', 'event'):
                 raise ValueError("sparse_source must be 'rgb' or 'event'")
-            if self.visual_history_offsets != SPARSE_HISTORY_OFFSETS:
-                raise ValueError(f"Sparse history offsets must be {SPARSE_HISTORY_OFFSETS}")
+            if (len(self.visual_history_offsets) != SPARSE_HISTORY_LENGTH
+                    or self.visual_history_offsets[-1] != 0
+                    or tuple(sorted(self.visual_history_offsets)) != self.visual_history_offsets):
+                raise ValueError(
+                    "Sparse history offsets must be three ascending frame offsets ending at 0"
+                )
 
         if self.input_modality != 'sparse_ball':
             _print_image_pipeline_info(self.camera_names, target_size=self.image_size)
@@ -1507,12 +1511,16 @@ def get_intercept_norm_stats(
             'sparse_std': all_sparse.std(axis=0).clip(1e-4, np.inf),
             'sparse_feature_dim': SPARSE_FEATURE_DIM,
             'sparse_feature_names': list(SPARSE_FEATURE_NAMES),
-            'sparse_history_offsets': list(SPARSE_HISTORY_OFFSETS),
+            'sparse_history_offsets_sec': list(SPARSE_HISTORY_OFFSETS_SEC),
             'sparse_history_length': SPARSE_HISTORY_LENGTH,
             'sparse_source': sparse_source,
             'sparse_image_width': sparse_width,
             'sparse_image_height': sparse_height,
             'sparse_coordinate_convention': 'u_right_v_down_pixel_centers_normalized_minus1_plus1',
+            'sparse_raw_coordinate_names': ['u_px', 'v_px'],
+            'sparse_raw_coordinate_units': 'pixels',
+            'sparse_observation_age_units': 'seconds',
+            'sparse_valid_semantics': '1=finite_in_bounds_causal_and_fresh;0=invalid_or_stale',
             'sparse_max_observation_age_sec': float(max_observation_age_sec),
             'sparse_source_timestamp_policy': SPARSE_SOURCE_TIMESTAMP_POLICY,
             'camera_names': ['sparse_ball'],

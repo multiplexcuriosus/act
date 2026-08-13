@@ -30,6 +30,8 @@ from rosidl_runtime_py.utilities import get_message
 
 from raw_event_hdf5 import RawEventStore, resolve_recording_dir
 
+from sparse_ball import policy_period_ns, validate_policy_rate
+
 
 DEFAULT_RGB_TOPIC = "auto"
 DEFAULT_RGB_TOPIC_RAW = "/top_cam/camera/color/image_raw"
@@ -91,6 +93,20 @@ def log(message: str) -> None:
 
 def ns_to_sec(timestamp_ns: int) -> float:
     return float(timestamp_ns) * 1e-9
+
+
+def policy_grid_ns(start_sec: float, end_sec: float, rate_hz: int) -> np.ndarray:
+    """Build a drift-free 30/60 Hz HDF5 grid with rational integer offsets."""
+    rate = int(rate_hz)
+    if float(rate_hz) != rate or rate <= 0:
+        raise ValueError("policy grid rate must be a positive integer")
+    origin_ns = int(round(float(start_sec) * 1e9))
+    end_ns = int(round(float(end_sec) * 1e9))
+    count = max(0, ((end_ns - origin_ns) * rate) // 1_000_000_000 + 1)
+    indices = np.arange(count, dtype=np.int64)
+    offsets = (indices * 1_000_000_000 + rate // 2) // rate
+    grid = origin_ns + offsets
+    return grid[grid <= end_ns]
 
 
 def header_stamp_to_sec(msg: Any) -> float:
@@ -723,11 +739,13 @@ def sample_episode(
             "no overlapping interval"
         )
 
-    dt = 1.0 / fps
-    grid = np.arange(effective_start, effective_end + 1e-9, dt, dtype=np.float64)
-    if grid.size == 0:
+    rate_hz = int(fps)
+    if float(fps) != rate_hz or rate_hz <= 0:
+        raise ValueError("fps must be a positive integer")
+    grid_ns = policy_grid_ns(effective_start, effective_end, rate_hz)
+    if grid_ns.size == 0:
         raise RuntimeError(f"Episode {episode.output_idx}: empty sampling grid")
-    grid_ns = np.rint(grid * 1e9).astype(np.int64)
+    grid = grid_ns.astype(np.float64) * 1e-9
 
     rgb_indices = np.searchsorted(rgb_times, grid, side="right") - 1
     joint_indices = np.searchsorted(joint_times, grid, side="right") - 1
@@ -1018,6 +1036,12 @@ def write_episode(
             h5.attrs["sim"] = False
             h5.attrs["task"] = "ball_interception"
             h5.attrs["fps"] = float(fps)
+            h5.attrs["policy_rate_hz"] = int(fps)
+            h5.attrs["policy_period_ns"] = (
+                policy_period_ns(fps)
+                if int(fps) in (30, 60)
+                else int(round(1_000_000_000 / float(fps)))
+            )
             h5.attrs["episode_index"] = int(episode.output_idx)
             h5.attrs["source_episode_index"] = int(episode.source_idx)
             h5.attrs["episode_start"] = float(episode.start)
@@ -1128,6 +1152,10 @@ def write_episode(
                     max_rgb_2d_age_sec
                 )
                 sparse.attrs["rgb_invalid_coordinate_fill"] = 0.0
+                sparse.attrs["raw_coordinate_names"] = np.asarray(
+                    ["u_px", "v_px"], dtype=h5py.string_dtype("utf-8")
+                )
+                sparse.attrs["raw_coordinate_units"] = "pixels"
                 sparse.attrs["rgb_width_px"] = int(arrays["rgb"].shape[2])
                 sparse.attrs["rgb_height_px"] = int(arrays["rgb"].shape[1])
             images.create_dataset(

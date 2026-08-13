@@ -4,8 +4,10 @@ import numpy as np
 import pytest
 
 from sparse_ball import (
+    SPARSE_FEATURE_NAMES, policy_period_ns, policy_period_sec,
     SparsePoint, construct_causal_sparse_history, construct_sparse_features,
-    default_sparse_topic, sparse_dataset_paths, validate_sparse_checkpoint_contract,
+    default_sparse_topic, sparse_dataset_paths, sparse_history_offsets_frames,
+    validate_sparse_checkpoint_contract,
 )
 
 
@@ -57,6 +59,7 @@ def test_source_paths_and_checkpoint_contract_are_source_specific():
     stats = {
         "input_modality": "sparse_ball", "sparse_source": "rgb",
         "sparse_feature_dim": 4, "sparse_history_length": 3,
+        "sparse_feature_names": list(SPARSE_FEATURE_NAMES),
         "sparse_image_width": 1280, "sparse_image_height": 720,
         "sparse_max_observation_age_sec": 0.10,
     }
@@ -67,3 +70,16 @@ def test_source_paths_and_checkpoint_contract_are_source_specific():
         validate_sparse_checkpoint_contract(
             {**stats, "sparse_feature_dim": 6}, "rgb", 1280, 720, 0.10
         )
+
+
+@pytest.mark.parametrize(
+    "rate,period_ns,offsets", [(30, 33333333, (-6, -3, 0)),
+                               (60, 16666667, (-12, -6, 0))],
+)
+def test_explicit_30_60_hz_contract(rate, period_ns, offsets):
+    assert policy_period_ns(rate) == period_ns
+    assert policy_period_sec(rate) == pytest.approx(1.0 / rate)
+    assert sparse_history_offsets_frames(rate) == offsets
+    assert SPARSE_FEATURE_NAMES == (
+        "u_norm", "v_norm", "valid", "observation_age_sec"
+    )

@@ -24,7 +24,10 @@ from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from utils import INTERCEPT_HISTORY_OFFSETS_DEFAULT
 from policy import ACTPolicy, ACTTaskPolicy, CNNMLPPolicy
-from sparse_ball import validate_sparse_checkpoint_contract
+from sparse_ball import (
+    policy_period_ns, policy_period_sec, sparse_history_offsets_frames,
+    validate_policy_rate, validate_sparse_checkpoint_contract,
+)
 from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
@@ -424,6 +427,7 @@ def main(args):
     sparse_feature_dim = int(args.get('sparse_feature_dim', 4))
     sparse_history_length = int(args.get('sparse_history_length', 3))
     max_observation_age_sec = float(args.get('max_observation_age_sec', 0.10))
+    policy_rate_hz = validate_policy_rate(args.get('policy_rate_hz', 30))
     if input_modality == 'sparse_ball':
         if sparse_source not in ('rgb', 'event'):
             raise ValueError('--sparse_source rgb|event is required for sparse_ball')
@@ -434,6 +438,8 @@ def main(args):
         if intercept_visual_config is not None
         else (list(INTERCEPT_HISTORY_OFFSETS_DEFAULT) if visual_history_frames == 3 else [0])
     )
+    if input_modality == 'sparse_ball':
+        visual_history_offsets = list(sparse_history_offsets_frames(policy_rate_hz))
     visual_frame_order = 'oldest_to_newest'
     channels_per_visual_frame = (
         int(intercept_visual_config['channels_per_visual_frame'])
@@ -573,6 +579,8 @@ def main(args):
                          'sparse_feature_dim': sparse_feature_dim,
                          'sparse_history_length': sparse_history_length,
                          'max_observation_age_sec': max_observation_age_sec,
+                         'policy_rate_hz': policy_rate_hz,
+                         'policy_period_sec': policy_period_sec(policy_rate_hz),
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -721,7 +729,11 @@ def main(args):
             image_size=image_size,
             rgb_history_frames=rgb_history_frames,
             visual_history_frames=visual_history_frames,
-            history_offsets=INTERCEPT_HISTORY_OFFSETS_DEFAULT,
+            history_offsets=(
+                sparse_history_offsets_frames(policy_rate_hz)
+                if input_modality == 'sparse_ball'
+                else INTERCEPT_HISTORY_OFFSETS_DEFAULT
+            ),
             input_modality=input_modality,
             sparse_source=sparse_source,
             sparse_feature_dim=sparse_feature_dim,
@@ -768,6 +780,13 @@ def main(args):
     stats['image_size'] = image_size
     stats['event_channel_selection'] = event_channel_selection
     stats['event_channel_indices'] = event_channel_indices
+    stats['policy_rate_hz'] = policy_rate_hz
+    stats['policy_period_ns'] = policy_period_ns(policy_rate_hz)
+    stats['policy_period_sec'] = policy_period_sec(policy_rate_hz)
+    if input_modality == 'sparse_ball':
+        stats['sparse_history_offsets_frames'] = list(
+            sparse_history_offsets_frames(policy_rate_hz)
+        )
     stats['input_modality'] = input_modality
     stats['visual_history_frames'] = visual_history_frames
     stats['visual_history_offsets'] = list(visual_history_offsets)
@@ -1594,6 +1613,7 @@ if __name__ == '__main__':
     parser.add_argument('--sparse_feature_dim', type=int, default=4)
     parser.add_argument('--sparse_history_length', type=int, default=3)
     parser.add_argument('--max_observation_age_sec', type=float, default=0.10)
+    parser.add_argument('--policy_rate_hz', type=int, choices=[30, 60], default=30)
     parser.add_argument(
         '--event_channel_selection',
         type=int,

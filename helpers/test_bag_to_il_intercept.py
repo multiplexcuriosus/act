@@ -76,6 +76,14 @@ def load_converter_module():
 
 
 class BagToIlInterceptTests(unittest.TestCase):
+    def test_policy_grids_are_exact_for_30_and_60_hz(self):
+        for rate in (30, 60):
+            grid = self.mod.policy_grid_ns(10.0, 11.0, rate)
+            self.assertEqual(len(grid), rate + 1)
+            self.assertEqual(int(grid[0]), 10_000_000_000)
+            self.assertEqual(int(grid[-1]), 11_000_000_000)
+            self.assertTrue(np.all(np.diff(grid) > 0))
+
     @classmethod
     def setUpClass(cls):
         cls.mod = load_converter_module()

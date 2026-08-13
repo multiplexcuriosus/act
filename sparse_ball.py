@@ -9,13 +9,42 @@ import numpy as np
 
 
 SPARSE_FEATURE_DIM = 4
+SUPPORTED_POLICY_RATES_HZ = (30, 60)
+SPARSE_HISTORY_OFFSETS_SEC = (-0.2, -0.1, 0.0)
 SPARSE_HISTORY_OFFSETS = (-6, -3, 0)
 SPARSE_HISTORY_LENGTH = 3
-SPARSE_FEATURE_NAMES = ("u", "v", "valid", "observation_age")
+SPARSE_FEATURE_NAMES = ("u_norm", "v_norm", "valid", "observation_age_sec")
 SPARSE_SOURCE_TIMESTAMP_POLICY = "point_stamped_header_latest_at_or_before_policy_time"
 DEFAULT_MAX_OBSERVATION_AGE_SEC = 0.10
 DEFAULT_RGB_SPARSE_TOPIC = "/ball_tracker2/ball_2d_px"
 DEFAULT_EVENT_SPARSE_TOPIC = "/openmv_cam/event_tracker/ball_2d_px"
+
+
+def validate_policy_rate(rate_hz) -> int:
+    """Return a supported integral dataset/runtime policy rate."""
+    rate = int(rate_hz)
+    if float(rate_hz) != rate or rate not in SUPPORTED_POLICY_RATES_HZ:
+        raise ValueError(
+            f"policy rate must be one of {SUPPORTED_POLICY_RATES_HZ}, got {rate_hz!r}"
+        )
+    return rate
+
+
+def policy_period_ns(rate_hz) -> int:
+    """Rounded integer nanoseconds used to describe an HDF5 policy grid."""
+    rate = validate_policy_rate(rate_hz)
+    return int(round(1_000_000_000 / rate))
+
+
+def policy_period_sec(rate_hz) -> float:
+    """Floating-point seconds used for runtime timing."""
+    return 1.0 / validate_policy_rate(rate_hz)
+
+
+def sparse_history_offsets_frames(rate_hz):
+    """Return the fixed-time sparse history offsets at the selected rate."""
+    rate = validate_policy_rate(rate_hz)
+    return tuple(int(round(offset * rate)) for offset in SPARSE_HISTORY_OFFSETS_SEC)
 
 
 def default_sparse_topic(source: str) -> str:
@@ -134,6 +163,7 @@ def validate_sparse_checkpoint_contract(
         "sparse_source": source,
         "sparse_feature_dim": SPARSE_FEATURE_DIM,
         "sparse_history_length": SPARSE_HISTORY_LENGTH,
+        "sparse_feature_names": list(SPARSE_FEATURE_NAMES),
         "sparse_image_width": int(image_width),
         "sparse_image_height": int(image_height),
     }

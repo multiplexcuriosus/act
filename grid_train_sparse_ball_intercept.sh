@@ -24,12 +24,13 @@ mkdir -p "$RUN_ROOT"
 
 cp -- "$SCRIPT_PATH" "$RUN_ROOT/grid_train_sparse_ball_intercept.sh"
 
+for POLICY_RATE_HZ in 30 60; do
 for SPARSE_SOURCE in event; do
   for LR in 1e-5; do
     for BS in 8; do
       for KL in 1; do
 
-        RUN_NAME="sparse_${SPARSE_SOURCE}_uv_valid_age_hist3_chunk30_lr${LR}_bs${BS}_kl${KL}"
+        RUN_NAME="sparse_${SPARSE_SOURCE}_uvnorm_valid_age_hist3_${POLICY_RATE_HZ}hz_lr${LR}_bs${BS}_kl${KL}"
         CKPT_DIR="${RUN_ROOT}/${SPARSE_SOURCE}/${RUN_NAME}"
         mkdir -p "$CKPT_DIR"
 
@@ -55,10 +56,11 @@ for SPARSE_SOURCE in event; do
           --sparse_feature_dim 4
           --sparse_history_length 3
           --max_observation_age_sec 0.10
+          --policy_rate_hz "$POLICY_RATE_HZ"
 
           --state_dim 21
           --action_dim 1
-          --chunk_size 30
+          --chunk_size "$POLICY_RATE_HZ"
 
           --hidden_dim 512
           --dim_feedforward 3200
@@ -82,6 +84,7 @@ for SPARSE_SOURCE in event; do
       done
     done
   done
+done
 done
 
 echo
