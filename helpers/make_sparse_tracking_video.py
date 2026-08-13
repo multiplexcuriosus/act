@@ -12,6 +12,8 @@ The expected HDF5 layout is:
 
 The RGB and event images are read frame-by-frame.  The corresponding 2-D
 tracker estimate is drawn on each panel before the panels are concatenated.
+The event panel also marks the configured tracker crop region without cropping
+the image itself.
 
 Examples:
 
@@ -26,6 +28,7 @@ HDF5 file(s).  Thus, for ``/data/run/episode_0.hdf5``, the default output is
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
@@ -38,6 +41,70 @@ import numpy as np
 EVENT_IMAGE = "observations/images/event"
 RGB_IMAGE = "observations/images/rgb"
 TRACKING_GROUP = "observations/sparse_tracking"
+DEFAULT_EVENT_TRACKER_CONFIG = Path(
+    "/home/dyros/jg_ws/src/openmv_cam/config/offline_tracker_example.json"
+)
+
+
+def _load_event_crop_polygon(config_path: Path) -> Optional[np.ndarray]:
+    """Load the event tracker's half-open crop boundary as an OpenCV polygon."""
+    if not config_path.is_file():
+        print(
+            f"ERROR: event tracker config is absent: {config_path}; "
+            "continuing without a crop-region border",
+            file=sys.stderr,
+        )
+        return None
+
+    with config_path.open("r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+
+    try:
+        width = int(config["width"])
+        height = int(config["height"])
+        x_crop = tuple(int(value) for value in config["x_crop"])
+        y_crop = tuple(int(value) for value in config["y_crop"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"invalid event crop configuration in {config_path}: {error}"
+        ) from error
+
+    if len(x_crop) != 2:
+        raise ValueError(f"x_crop in {config_path} must contain two values")
+    if len(y_crop) != 4:
+        raise ValueError(f"y_crop in {config_path} must contain four values")
+    lower_x, upper_x = x_crop
+    left_lower, left_upper, right_lower, right_upper = y_crop
+    if not 0 <= lower_x < upper_x <= width:
+        raise ValueError(
+            f"x_crop in {config_path} must satisfy 0 <= lower < upper <= {width}"
+        )
+    if not (
+        0 <= left_lower < left_upper <= height
+        and 0 <= right_lower < right_upper <= height
+    ):
+        raise ValueError(
+            f"y_crop endpoint pairs in {config_path} must satisfy "
+            f"0 <= lower < upper <= {height}"
+        )
+
+    return np.asarray(
+        [
+            (lower_x, left_lower),
+            (upper_x - 1, right_lower),
+            (upper_x - 1, right_upper - 1),
+            (lower_x, left_upper - 1),
+        ],
+        dtype=np.int32,
+    ).reshape(-1, 1, 2)
+
+
+def _draw_event_crop_border(
+    image: np.ndarray, crop_polygon: Optional[np.ndarray]
+) -> None:
+    """Mark, but do not remove, the event tracker crop region."""
+    if crop_polygon is not None:
+        cv2.polylines(image, [crop_polygon], True, (255, 0, 255), 2, cv2.LINE_AA)
 
 
 def _dataset(h5_file: h5py.File, path: str) -> h5py.Dataset:
@@ -235,6 +302,7 @@ def create_video(
     panel_height: int,
     fps_override: Optional[float],
     rgb_color_order: str,
+    event_crop_polygon: Optional[np.ndarray] = None,
 ) -> int:
     """Create one video and return the number of written frames."""
     if panel_height <= 0:
@@ -265,10 +333,11 @@ def create_video(
             )
 
         # Read one pair only to establish the fixed video dimensions.
-        event0 = cv2.rotate(
-            _as_bgr(event_images[0], rgb_color_order=rgb_color_order, is_event=True),
-            cv2.ROTATE_90_COUNTERCLOCKWISE,
+        event0 = _as_bgr(
+            event_images[0], rgb_color_order=rgb_color_order, is_event=True
         )
+        _draw_event_crop_border(event0, event_crop_polygon)
+        event0 = cv2.rotate(event0, cv2.ROTATE_90_COUNTERCLOCKWISE)
         rgb0 = _as_bgr(rgb_images[0], rgb_color_order=rgb_color_order, is_event=False)
         event_panel0 = _resize_to_height(event0, panel_height, is_event=True)
         rgb_panel0 = _resize_to_height(rgb0, panel_height, is_event=False)
@@ -295,14 +364,13 @@ def create_video(
                     event_panel = event_panel0.copy()
                     rgb_panel = rgb_panel0.copy()
                 else:
-                    event = cv2.rotate(
-                        _as_bgr(
-                            event_images[index],
-                            rgb_color_order=rgb_color_order,
-                            is_event=True,
-                        ),
-                        cv2.ROTATE_90_COUNTERCLOCKWISE,
+                    event = _as_bgr(
+                        event_images[index],
+                        rgb_color_order=rgb_color_order,
+                        is_event=True,
                     )
+                    _draw_event_crop_border(event, event_crop_polygon)
+                    event = cv2.rotate(event, cv2.ROTATE_90_COUNTERCLOCKWISE)
                     rgb = _as_bgr(
                         rgb_images[index],
                         rgb_color_order=rgb_color_order,
@@ -392,6 +460,15 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="output video frame rate (default: 10)",
     )
     parser.add_argument(
+        "--event-tracker-config",
+        type=Path,
+        default=DEFAULT_EVENT_TRACKER_CONFIG,
+        help=(
+            "JSON providing x_crop/y_crop for the event-image border "
+            f"(default: {DEFAULT_EVENT_TRACKER_CONFIG})"
+        ),
+    )
+    parser.add_argument(
         "--rgb-color-order",
         choices=("rgb", "bgr"),
         default="rgb",
@@ -416,6 +493,15 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
 
+    try:
+        event_crop_polygon = _load_event_crop_polygon(args.event_tracker_config)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        print(
+            f"ERROR: {error}; continuing without a crop-region border",
+            file=sys.stderr,
+        )
+        event_crop_polygon = None
+
     if args.top_dir is not None:
         inputs = _episode_files(args.top_dir)
         if args.num_videos is not None:
@@ -439,6 +525,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 panel_height=args.height,
                 fps_override=args.fps,
                 rgb_color_order=args.rgb_color_order,
+                event_crop_polygon=event_crop_polygon,
             )
             print(f"  wrote {frame_count} frames")
         except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
