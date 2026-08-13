@@ -17,7 +17,8 @@ from intercept_rollout_contract import (EXPECTED_INTERCEPT_METADATA,
                                         validate_intercept_stats_and_config)
 from policy import ACTPolicy
 from sparse_ball import (SPARSE_FEATURE_NAMES, SparsePoint,
-                         construct_causal_sparse_history, construct_sparse_features)
+                         construct_causal_sparse_history, construct_sparse_features,
+                         rate_contract, validate_policy_rate)
 
 
 @pytest.mark.parametrize("width,height", [(1280, 720), (320, 320)])
@@ -28,7 +29,9 @@ def test_rgb_and_event_pixel_centers_normalize_to_minus_one_plus_one(width, heig
         [1.0, 1.1, 1.2], points, [1, 1, 1], [.95, 1.08, 1.2],
         width, height, .1,
     )
-    assert SPARSE_FEATURE_NAMES == ("u", "v", "valid", "observation_age")
+    assert SPARSE_FEATURE_NAMES == (
+        "u_normalized", "v_normalized", "valid", "observation_age_seconds"
+    )
     assert features.shape == (3, 4)
     np.testing.assert_allclose(features[:, :2], [[-1, -1], [0, 0], [1, 1]])
     np.testing.assert_allclose(features[:, 2:], [[1, .05], [1, .02], [1, 0]], atol=1e-6)
@@ -121,3 +124,30 @@ def test_four_feature_checkpoint_loads_and_six_feature_or_source_mismatch_reject
         validate_intercept_stats_and_config(bad, config, 30, runtime)
     with pytest.raises(ValueError, match="sparse_source"):
         validate_intercept_stats_and_config(_sparse_stats("event"), config, 30, runtime)
+
+
+@pytest.mark.parametrize(
+    "rate,offsets,chunk,period",
+    [(30, (-6, -3, 0), 30, 1 / 30), (60, (-12, -6, 0), 60, 1 / 60)],
+)
+def test_supported_rate_contracts(rate, offsets, chunk, period):
+    assert rate_contract(rate) == (offsets, chunk, period)
+    assert validate_policy_rate(rate) == rate
+
+
+@pytest.mark.parametrize("rate", [0, 29, 59, 61, 30.5])
+def test_unsupported_policy_rates_rejected(rate):
+    with pytest.raises(ValueError, match="policy_rate_hz"):
+        validate_policy_rate(rate)
+
+
+def test_checkpoint_rate_and_chunk_mismatch_rejected():
+    stats = _sparse_stats()
+    stats.update(policy_rate_hz=30, sparse_history_offsets_frames=[-6, -3, 0])
+    runtime = {"sparse_source": "rgb", "max_observation_age_sec": .1,
+               "image_width": 1280, "image_height": 720,
+               "policy_rate_hz": 60}
+    config = _model_config()
+    config.update(num_queries=60, policy_rate_hz=60)
+    with pytest.raises(ValueError, match="policy_rate_hz|policy rate|chunk size"):
+        validate_intercept_stats_and_config(stats, config, 60, runtime)

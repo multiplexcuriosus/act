@@ -58,6 +58,9 @@ def test_sparse_fixed_clock_never_skips_a_duplicate_detection_timestamp():
     assert skip_duplicate_source_frame("sparse_ball") is False
     assert skip_duplicate_source_frame("rgb") is True
     assert policy_period_sec(30) == pytest.approx(1 / 30)
+    assert policy_period_sec(60) == pytest.approx(1 / 60)
+    with pytest.raises(ValueError, match="policy_rate_hz"):
+        policy_period_sec(20)
 
 
 def test_sparse_readiness_does_not_require_a_detection():
@@ -84,7 +87,8 @@ def test_two_sparse_timer_ticks_infer_without_a_new_message():
     class FakeNode:
         input_modality = "sparse_ball"
         sparse_source = "rgb"
-        sparse_buffer = []
+        # The same cached sparse message remains present for both timer ticks.
+        sparse_buffer = [(1.0, object())]
         rgb_buffer = []
         running = True
         latency_tracer = FakeTracer()

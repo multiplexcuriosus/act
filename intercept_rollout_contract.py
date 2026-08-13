@@ -6,7 +6,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from sparse_ball import SPARSE_FEATURE_NAMES, validate_sparse_checkpoint_contract
+from sparse_ball import (SPARSE_FEATURE_NAMES, rate_contract,
+                         validate_policy_rate,
+                         validate_sparse_checkpoint_contract)
 
 INTERCEPT_HISTORY_OFFSETS = (-6, -3, 0)
 ARM_JOINT_NAMES = (
@@ -339,6 +341,17 @@ def validate_intercept_stats_and_config(
     modality = str(policy_config.get("input_modality", "rgb"))
     arrays: Dict[str, np.ndarray] = {}
     expected_metadata = dict(EXPECTED_INTERCEPT_METADATA)
+    runtime_rate = (sparse_runtime or {}).get("policy_rate_hz")
+    if runtime_rate is not None:
+        runtime_rate = validate_policy_rate(runtime_rate)
+        runtime_offsets, runtime_chunk, _ = rate_contract(runtime_rate)
+        if int(expected_chunk_size) != runtime_chunk:
+            raise ValueError(
+                f"Runtime chunk_size {expected_chunk_size} does not match "
+                f"policy_rate_hz {runtime_rate}; expected {runtime_chunk}"
+            )
+        expected_metadata["rgb_history_offsets"] = list(runtime_offsets)
+        expected_metadata["qpos_history_offsets"] = list(runtime_offsets)
     if modality == "sparse_ball":
         expected_metadata.pop("rgb_history_frames")
         expected_metadata.pop("rgb_history_offsets")
@@ -402,6 +415,7 @@ def validate_intercept_stats_and_config(
             runtime.get("image_width"),
             runtime.get("image_height"),
             runtime.get("max_observation_age_sec"),
+            runtime_rate,
         )
         arrays["_validated_metadata"] = np.asarray(validated, dtype=object)
         arrays["_unavailable_metadata"] = np.asarray(unavailable, dtype=object)
@@ -419,6 +433,11 @@ def validate_intercept_stats_and_config(
         raise ValueError(
             f"Checkpoint chunk_size mismatch: requested {expected_chunk_size}, "
             f"checkpoint {stats['chunk_size']}"
+        )
+    if runtime_rate is not None and int(stats.get("policy_rate_hz", -1)) != runtime_rate:
+        raise ValueError(
+            "Checkpoint policy rate mismatch: "
+            f"runtime={runtime_rate}, checkpoint={stats.get('policy_rate_hz')}"
         )
 
     required_config = {

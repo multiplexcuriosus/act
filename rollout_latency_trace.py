@@ -211,7 +211,7 @@ class RolloutLatencyTracer:
         msg.run_id = self._run_id
         msg.stage = "act_rollout"
         msg.event = "accepted" if valid else "rejected"
-        msg.modality = self._modality
+        msg.modality = trace.source_modality
         msg.node_name = self._node.get_name()
         msg.sequence = trace.sequence
         msg.parent_sequence = 0
