@@ -7,6 +7,10 @@ can include held values.  This tool measures temporal presence as visible to the
 policy grid; native event-tracker gaps faster than the observation grid require
 analysis of the tracker sidecar.
 
+With ``--analysis-source sidecar``, the tool instead measures recorded native
+tracker-output rows.  That mode can describe output cadence and observed sensor
+window spans, but cannot reconstruct empty 1 ms bins or internal CPU latency.
+
 Only the Python standard library, NumPy, and h5py are required.
 """
 
@@ -34,7 +38,24 @@ REQUIRED_DATASETS = (
     "observations/sparse_tracking/event_source_age_sec",
 )
 GAP_THRESHOLDS_MS = (33.0, 50.0, 100.0, 200.0)
+SIDECAR_GAP_THRESHOLDS_MS = (33.0, 50.0, 100.0, 200.0, 500.0)
 ONE_SAMPLE_PERIOD_SEC = 1.0 / 30.0
+SIDECAR_CORE_DATASETS = (
+    "available_ros_t_ns", "packet_id", "sensor_window_start_us",
+    "sensor_window_end_us", "valid",
+)
+SIDECAR_OPTIONAL_DATASETS = (
+    "x_px", "y_px", "vx_px_s", "vy_px_s", "speed_px_s", "confidence",
+    "velocity_valid", "window_event_count", "candidate_count", "blob_area_px",
+    "blob_event_count", "blob_width_px", "blob_height_px", "circularity",
+    "rejection_reason",
+)
+SIDECAR_NUMERIC_FIELDS = (
+    "sensor_window_duration_ms", "window_event_count", "blob_event_count",
+    "candidate_count", "blob_area_px", "blob_width_px", "blob_height_px",
+    "circularity", "confidence", "speed_px_s", "vx_px_s", "vy_px_s",
+    "velocity_valid", "valid",
+)
 
 
 def detect_new_updates(
@@ -577,6 +598,434 @@ def write_plots(
     return paths
 
 
+def stable_sort_sidecar_rows(arrays: Mapping[str, np.ndarray]) -> tuple[dict[str, np.ndarray], bool]:
+    """Stable-sort sidecar rows by ROS time, packet id, and original row index."""
+    result = {key: np.asarray(value).reshape(-1) for key, value in arrays.items()}
+    times = np.asarray(result["available_ros_t_ns"], dtype=np.float64)
+    packet = np.asarray(result.get("packet_id", np.zeros(times.size)), dtype=np.float64)
+    nonmonotonic = bool(times.size > 1 and np.any(np.diff(times) < 0))
+    if nonmonotonic:
+        packet_key = np.where(np.isfinite(packet), packet, np.inf)
+        order = np.lexsort((np.arange(times.size), packet_key, times))
+        result = {key: value[order] for key, value in result.items()}
+    return result, nonmonotonic
+
+
+def validate_sidecar_arrays(arrays: Mapping[str, np.ndarray]) -> None:
+    """Validate one loaded sidecar group without changing row multiplicity."""
+    missing = [name for name in SIDECAR_CORE_DATASETS if name not in arrays]
+    if missing:
+        raise ValueError("missing required sidecar datasets: " + ", ".join(missing))
+    dimensions = {name: np.asarray(value).ndim for name, value in arrays.items()}
+    wrong = [name for name, ndim in dimensions.items() if ndim != 1]
+    if wrong:
+        raise ValueError("sidecar datasets must be one-dimensional: " + ", ".join(wrong))
+    lengths = {name: len(np.asarray(value)) for name, value in arrays.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"sidecar dataset lengths differ: {lengths}")
+    times = np.asarray(arrays["available_ros_t_ns"], dtype=np.float64)
+    if not np.all(np.isfinite(times)):
+        raise ValueError("available_ros_t_ns contains non-finite values")
+    packet = np.asarray(arrays["packet_id"], dtype=np.float64)
+    if not np.all(np.isfinite(packet)):
+        raise ValueError("packet_id contains non-finite values")
+    starts = np.asarray(arrays["sensor_window_start_us"], dtype=np.float64)
+    ends = np.asarray(arrays["sensor_window_end_us"], dtype=np.float64)
+    if np.any(np.isfinite(starts) & np.isfinite(ends) & (ends < starts)):
+        raise ValueError("sensor window end is earlier than its start")
+
+
+def load_sidecar_group(path: Path | str, group_name: str) -> tuple[dict[str, np.ndarray], dict[str, Any], bool]:
+    """Load, validate, and time-sort a sidecar episode group."""
+    with h5py.File(path, "r") as h5:
+        if group_name not in h5 or not isinstance(h5[group_name], h5py.Group):
+            raise ValueError(f"sidecar group does not exist: {group_name}")
+        group = h5[group_name]
+        names = SIDECAR_CORE_DATASETS + SIDECAR_OPTIONAL_DATASETS
+        arrays = {name: np.asarray(group[name]) for name in names if name in group}
+        attrs = {str(key): _json_value(value) for key, value in group.attrs.items()}
+        for key, value in h5.attrs.items():
+            attrs.setdefault(str(key), _json_value(value))
+    validate_sidecar_arrays(arrays)
+    sorted_arrays, reordered = stable_sort_sidecar_rows(arrays)
+    return sorted_arrays, attrs, reordered
+
+
+def sidecar_group_names(path: Path | str) -> list[str]:
+    """Return groups that look like native tracker episode groups."""
+    with h5py.File(path, "r") as h5:
+        if "episodes" not in h5 or not isinstance(h5["episodes"], h5py.Group):
+            return []
+        return [f"/episodes/{name}" for name in sorted(h5["episodes"])
+                if isinstance(h5[f"/episodes/{name}"], h5py.Group)]
+
+
+def match_episode_to_sidecar_group(
+    episode_path: Path | str, episode_attrs: Mapping[str, Any],
+    groups: Sequence[tuple[str, Mapping[str, Any]]],
+) -> str | None:
+    """Match an episode using indices, conventional group names, then filename."""
+    candidates = []
+    for key in ("episode_index", "source_episode_index"):
+        if key in episode_attrs:
+            try:
+                candidates.append(int(episode_attrs[key]))
+            except (TypeError, ValueError):
+                pass
+    for group_name, attrs in groups:
+        for key in ("episode_index", "source_episode_index"):
+            try:
+                if key in attrs and int(attrs[key]) in candidates:
+                    return group_name
+            except (TypeError, ValueError):
+                pass
+    for index in candidates:
+        wanted = f"episode_{index}"
+        for group_name, _ in groups:
+            if Path(group_name).name == wanted:
+                return group_name
+    stem = Path(episode_path).stem
+    for group_name, attrs in groups:
+        filename_values = [value for key, value in attrs.items()
+                           if "file" in str(key).lower() or "path" in str(key).lower()]
+        if Path(group_name).name == stem or any(Path(str(value)).stem == stem for value in filename_values):
+            return group_name
+    return None
+
+
+def extract_active_interval(arrays: Mapping[str, np.ndarray]) -> tuple[int, int] | None:
+    """Return inclusive row bounds from first through last valid row."""
+    indices = np.flatnonzero(np.asarray(arrays["valid"]).reshape(-1) != 0)
+    return None if indices.size == 0 else (int(indices[0]), int(indices[-1]))
+
+
+def _unique_valid_indices(arrays: Mapping[str, np.ndarray]) -> np.ndarray:
+    valid_indices = np.flatnonzero(np.asarray(arrays["valid"]).reshape(-1) != 0)
+    if valid_indices.size == 0:
+        return valid_indices
+    key_name = "packet_id" if "packet_id" in arrays else "available_ros_t_ns"
+    values = np.asarray(arrays[key_name])[valid_indices]
+    seen: set[Any] = set()
+    kept = []
+    for index, value in zip(valid_indices, values):
+        key = value.item() if isinstance(value, np.generic) else value
+        if key not in seen:
+            seen.add(key)
+            kept.append(int(index))
+    return np.asarray(kept, dtype=np.int64)
+
+
+def calculate_valid_detection_gaps(
+    arrays: Mapping[str, np.ndarray], episode_id: str = ""
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    """Calculate gaps between unique recorded valid tracker outputs."""
+    indices = _unique_valid_indices(arrays)
+    times = np.asarray(arrays["available_ros_t_ns"], dtype=np.float64) * 1e-9
+    packets = np.asarray(arrays.get("packet_id", np.full(times.size, np.nan)))
+    rows = []
+    if indices.size:
+        origin = float(times[indices[0]])
+        for detection_index, (previous, following) in enumerate(zip(indices[:-1], indices[1:])):
+            between = slice(int(previous) + 1, int(following))
+            interval = float(times[following] - times[previous])
+            middle_packets = packets[between]
+            rows.append({
+                "episode_id": episode_id, "detection_index": detection_index,
+                "previous_detection_time": float(times[previous]),
+                "next_detection_time": float(times[following]),
+                "previous_detection_offset_sec": float(times[previous] - origin),
+                "next_detection_offset_sec": float(times[following] - origin),
+                "inter_detection_interval_sec": interval,
+                "inter_detection_interval_ms": interval * 1000.0,
+                "sidecar_rows_between_detections": int(following - previous - 1),
+                "invalid_rows_between_detections": int(np.count_nonzero(np.asarray(arrays["valid"])[between] == 0)),
+                "unique_packets_between_detections": int(np.unique(middle_packets).size),
+            })
+    return rows, indices
+
+
+def sidecar_run_length_encode(arrays: Mapping[str, np.ndarray], episode_id: str = "") -> list[dict[str, Any]]:
+    """RLE the original active-interval row sequence (not continuous time)."""
+    bounds = extract_active_interval(arrays)
+    if bounds is None:
+        return []
+    lo, hi = bounds
+    valid = np.asarray(arrays["valid"]).reshape(-1) != 0
+    times = np.asarray(arrays["available_ros_t_ns"], dtype=np.float64) * 1e-9
+    packet = np.asarray(arrays.get("packet_id", np.full(valid.size, np.nan)))
+    active = valid[lo:hi + 1]
+    starts = np.r_[0, np.flatnonzero(active[1:] != active[:-1]) + 1]
+    ends = np.r_[starts[1:], active.size]
+    rows = []
+    for run_index, (start, end) in enumerate(zip(starts, ends)):
+        first, stop = lo + int(start), lo + int(end)
+        span = float(times[stop - 1] - times[first])
+        rows.append({
+            "episode_id": episode_id, "signal_source": "sidecar_rows", "run_index": run_index,
+            "state": "present" if valid[first] else "absent", "start_row_index": first,
+            "end_row_index_exclusive": stop, "row_count": stop - first,
+            "first_row_timestamp": float(times[first]), "last_row_timestamp": float(times[stop - 1]),
+            "row_span_sec": span, "row_span_ms": span * 1000.0,
+            "first_row_packet_id": _json_value(packet[first]), "last_row_packet_id": _json_value(packet[stop - 1]),
+            "invalid_row_count": int(np.count_nonzero(~valid[first:stop])),
+        })
+    return rows
+
+
+def segment_dense_phases(
+    arrays: Mapping[str, np.ndarray], episode_id: str = "", phase_gap_ms: float = 250.0,
+    min_phase_detections: int = 3,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    """Split unique valid detections at gaps larger than phase_gap_ms."""
+    _, indices = calculate_valid_detection_gaps(arrays, episode_id)
+    if indices.size == 0:
+        return [], indices
+    times = np.asarray(arrays["available_ros_t_ns"], dtype=np.float64) * 1e-9
+    split = np.flatnonzero(np.diff(times[indices]) > phase_gap_ms / 1000.0) + 1
+    chunks = np.split(indices, split)
+    valid = np.asarray(arrays["valid"]).reshape(-1) != 0
+    packet = np.asarray(arrays.get("packet_id", np.full(valid.size, np.nan)))
+    origin = float(times[indices[0]])
+    phases = []
+    for phase_id, chunk in enumerate(chunks):
+        first, last = int(chunk[0]), int(chunk[-1])
+        phase_times = times[chunk]
+        intervals_ms = np.diff(phase_times) * 1000.0
+        span = float(phase_times[-1] - phase_times[0])
+        count = int(chunk.size)
+        rows = slice(first, last + 1)
+        phases.append({
+            "episode_id": episode_id, "phase_id": phase_id,
+            "is_dense": count >= min_phase_detections,
+            "first_detection_time": float(phase_times[0]), "last_detection_time": float(phase_times[-1]),
+            "phase_start_offset_sec": float(phase_times[0] - origin),
+            "phase_end_offset_sec": float(phase_times[-1] - origin), "phase_span_sec": span,
+            "valid_detection_count": count, "unique_valid_packet_count": int(np.unique(packet[chunk]).size),
+            "interval_count": max(count - 1, 0),
+            "interval_rate_hz": (count - 1) / span if count >= 2 and span > 0 else None,
+            "endpoint_count_rate_hz": count / span if span > 0 else None,
+            "median_inter_detection_interval_ms": _percentile(intervals_ms.tolist(), 50),
+            "p90_inter_detection_interval_ms": _percentile(intervals_ms.tolist(), 90),
+            "maximum_inter_detection_interval_ms": float(np.max(intervals_ms)) if intervals_ms.size else None,
+            "invalid_sidecar_rows_in_phase": int(np.count_nonzero(~valid[rows])),
+            "sidecar_rows_in_phase": last - first + 1,
+            "valid_row_fraction_in_phase": float(np.mean(valid[rows])),
+            "_detection_indices": chunk,
+        })
+    return phases, indices
+
+
+def calculate_phase_window_rates(
+    phases: Sequence[Mapping[str, Any]], arrays: Mapping[str, np.ndarray], rate_window_ms: float = 250.0
+) -> list[dict[str, Any]]:
+    """Partition dense phases into non-overlapping, phase-anchored rate windows."""
+    times = np.asarray(arrays["available_ros_t_ns"], dtype=np.float64) * 1e-9
+    packet = np.asarray(arrays.get("packet_id", np.full(times.size, np.nan)))
+    width = rate_window_ms / 1000.0
+    rows = []
+    for phase in phases:
+        if not phase["is_dense"]:
+            continue
+        indices = np.asarray(phase["_detection_indices"], dtype=np.int64)
+        start, last = float(times[indices[0]]), float(times[indices[-1]])
+        count_windows = max(1, int(math.floor(max(last - start, 0.0) / width)) + 1)
+        for window_index in range(count_windows):
+            window_start = start + window_index * width
+            window_end = window_start + width
+            mask = (times[indices] >= window_start) & (times[indices] < window_end)
+            selected = indices[mask]
+            rows.append({
+                "episode_id": phase["episode_id"], "phase_id": phase["phase_id"],
+                "window_index": window_index, "window_start_time": window_start,
+                "window_end_time": window_end, "window_start_offset_sec": window_start - start,
+                "window_end_offset_sec": window_end - start, "window_duration_sec": width,
+                "valid_detection_count": int(selected.size),
+                "unique_valid_packet_count": int(np.unique(packet[selected]).size),
+                "detection_rate_hz": float(selected.size / width),
+            })
+    return rows
+
+
+def _numeric_stats(values: Sequence[Any]) -> dict[str, Any]:
+    raw = np.asarray(values).reshape(-1)
+    try:
+        numeric = np.asarray(raw, dtype=np.float64)
+        finite = numeric[np.isfinite(numeric)]
+    except (TypeError, ValueError):
+        finite = np.asarray([], dtype=np.float64)
+    return {
+        "count": int(raw.size), "valid_finite_count": int(finite.size),
+        "median": _percentile(finite.tolist(), 50),
+        "mean": float(np.mean(finite)) if finite.size else None,
+        "p90": _percentile(finite.tolist(), 90), "p95": _percentile(finite.tolist(), 95),
+        "minimum": float(np.min(finite)) if finite.size else None,
+        "maximum": float(np.max(finite)) if finite.size else None,
+    }
+
+
+def detection_window_statistics(arrays: Mapping[str, np.ndarray], episode_id: str = "") -> list[dict[str, Any]]:
+    """Return tidy per-field statistics for observed sidecar detection windows."""
+    derived = dict(arrays)
+    derived["sensor_window_duration_ms"] = (
+        np.asarray(arrays["sensor_window_end_us"], dtype=np.float64)
+        - np.asarray(arrays["sensor_window_start_us"], dtype=np.float64)
+    ) / 1000.0
+    rows = []
+    for field in SIDECAR_NUMERIC_FIELDS:
+        if field in derived:
+            rows.append({"episode_id": episode_id, "field": field, **_numeric_stats(derived[field])})
+    return rows
+
+
+def _interval_distribution(intervals_sec: Sequence[float], prefix: str) -> dict[str, Any]:
+    values = np.asarray(intervals_sec, dtype=np.float64)
+    stats = _numeric_stats(values)
+    result = {f"{prefix}_interval_{key}_sec": value for key, value in stats.items()
+              if key not in ("count", "valid_finite_count")}
+    result[f"{prefix}_interval_count"] = int(values.size)
+    median = stats["median"]
+    result[f"{prefix}_observed_rate_hz"] = 1.0 / median if median is not None and median > 0 else None
+    return result
+
+
+def summarize_sidecar_episode(
+    arrays: Mapping[str, np.ndarray], episode_id: str, sidecar_path: Path | str,
+    sidecar_group: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Summarize native tracker rows and gaps for one sidecar episode."""
+    times = np.asarray(arrays["available_ros_t_ns"], dtype=np.float64) * 1e-9
+    valid = np.asarray(arrays["valid"]).reshape(-1) != 0
+    packets = np.asarray(arrays["packet_id"])
+    gaps, unique_indices = calculate_valid_detection_gaps(arrays, episode_id)
+    runs = sidecar_run_length_encode(arrays, episode_id)
+    metric: dict[str, Any] = {
+        "episode_id": episode_id, "sidecar_path": str(sidecar_path), "sidecar_group": sidecar_group,
+        "total_sidecar_rows": int(times.size), "valid_row_count": int(np.count_nonzero(valid)),
+        "invalid_row_count": int(np.count_nonzero(~valid)),
+        "valid_row_fraction": float(np.mean(valid)) if times.size else None,
+        "invalid_row_fraction": float(np.mean(~valid)) if times.size else None,
+        "unique_packet_count": int(np.unique(packets).size),
+        "unique_timestamp_count": int(np.unique(times).size),
+        "first_sidecar_row_time": float(times[0]) if times.size else None,
+        "last_sidecar_row_time": float(times[-1]) if times.size else None,
+        "sidecar_row_span_sec": float(times[-1] - times[0]) if times.size else None,
+        "sidecar_update_rate_hz": ((times.size - 1) / (times[-1] - times[0])
+                                   if times.size > 1 and times[-1] > times[0] else None),
+        "valid_detection_count": int(unique_indices.size),
+        "valid_unique_packet_count": int(np.unique(packets[unique_indices]).size),
+    }
+    if unique_indices.size:
+        first, last = float(times[unique_indices[0]]), float(times[unique_indices[-1]])
+        metric.update({
+            "first_valid_detection_time": first, "last_valid_detection_time": last,
+            "first_valid_detection_offset_sec": first - float(times[0]),
+            "last_valid_detection_offset_sec": last - float(times[0]),
+            "valid_detection_span_sec": last - first,
+            "active_interval_start": first, "active_interval_end": last,
+            "active_interval_duration_sec": last - first,
+        })
+        lo, hi = extract_active_interval(arrays)  # type: ignore[misc]
+        active_valid = valid[lo:hi + 1]
+        metric.update({
+            "active_interval_sidecar_row_count": int(active_valid.size),
+            "active_interval_valid_row_count": int(np.count_nonzero(active_valid)),
+            "active_interval_invalid_row_count": int(np.count_nonzero(~active_valid)),
+            "active_interval_valid_row_fraction": float(np.mean(active_valid)),
+            "number_of_present_runs": sum(run["state"] == "present" for run in runs),
+            "number_of_absent_runs": sum(run["state"] == "absent" for run in runs),
+            "longest_present_run_rows": max((run["row_count"] for run in runs if run["state"] == "present"), default=0),
+            "longest_absent_run_rows": max((run["row_count"] for run in runs if run["state"] == "absent"), default=0),
+            "longest_present_run_ms": max((run["row_span_ms"] for run in runs if run["state"] == "present"), default=0.0),
+        })
+    else:
+        for key in ("first_valid_detection_time", "last_valid_detection_time",
+                    "first_valid_detection_offset_sec", "last_valid_detection_offset_sec",
+                    "valid_detection_span_sec", "active_interval_start", "active_interval_end",
+                    "active_interval_duration_sec", "active_interval_sidecar_row_count",
+                    "active_interval_valid_row_count", "active_interval_invalid_row_count",
+                    "active_interval_valid_row_fraction", "number_of_present_runs",
+                    "number_of_absent_runs", "longest_present_run_rows", "longest_absent_run_rows"):
+            metric[key] = None
+        metric["longest_present_run_ms"] = None
+    gap_ms = [float(row["inter_detection_interval_ms"]) for row in gaps]
+    gap_stats = _numeric_stats(gap_ms)
+    metric.update({
+        "inter_detection_count": len(gaps),
+        "median_inter_detection_interval_ms": gap_stats["median"],
+        "mean_inter_detection_interval_ms": gap_stats["mean"],
+        "p90_inter_detection_interval_ms": gap_stats["p90"],
+        "p95_inter_detection_interval_ms": gap_stats["p95"],
+        "minimum_inter_detection_interval_ms": gap_stats["minimum"],
+        "maximum_inter_detection_interval_ms": gap_stats["maximum"],
+    })
+    for threshold in SIDECAR_GAP_THRESHOLDS_MS:
+        count = sum(value > threshold for value in gap_ms)
+        metric[f"gaps_gt_{int(threshold)}ms_count"] = count
+        metric[f"gaps_gt_{int(threshold)}ms_fraction"] = count / len(gap_ms) if gap_ms else None
+    metric.update(_interval_distribution(np.diff(times), "all_sidecar_row"))
+    metric.update(_interval_distribution(np.diff(times[valid]), "valid_sidecar_row"))
+    metric.update(_interval_distribution(np.diff(times[~valid]), "invalid_sidecar_row"))
+    return metric, gaps, runs
+
+
+def summarize_sidecar_aggregate(
+    metrics: Sequence[Mapping[str, Any]], intervals: Sequence[Mapping[str, Any]],
+    phases: Sequence[Mapping[str, Any]], windows: Sequence[Mapping[str, Any]],
+    window_stats: Sequence[Mapping[str, Any]], sidecar_paths: Sequence[str],
+    discovered_count: int, skipped_count: int,
+) -> dict[str, Any]:
+    """Combine episode-weighted summaries and explicitly pooled observations."""
+    def metric_values(name: str) -> list[float]:
+        return [float(row[name]) for row in metrics if row.get(name) is not None]
+    pooled_gaps = [float(row["inter_detection_interval_ms"]) for row in intervals]
+    pooled_phase_rates = [float(row["interval_rate_hz"]) for row in phases
+                          if row.get("is_dense") and row.get("interval_rate_hz") is not None]
+    pooled_window_rates = [float(row["detection_rate_hz"]) for row in windows]
+    all_update_ms = []
+    for metric in metrics:
+        # Reconstructing the pooled distribution is impossible from summaries, so callers
+        # attach it transiently when exact row-level intervals are available.
+        all_update_ms.extend(metric.get("_all_update_intervals_ms", []))
+
+    def field_values(field: str) -> list[float]:
+        return [float(value) for row in window_stats if row["field"] == field
+                for value in row.get("_finite_values", [])]
+    # _finite_values is optional; orchestration supplies exact pools.
+    sensor = field_values("sensor_window_duration_ms")
+    events = field_values("window_event_count")
+    dense_counts = [sum(bool(p["is_dense"]) and p["episode_id"] == m["episode_id"] for p in phases)
+                    for m in metrics]
+    return {
+        "analysis_source": "sidecar", "sidecar_paths": sorted(set(sidecar_paths)),
+        "number_of_discovered_files": int(discovered_count),
+        "number_of_analyzed_episodes": len(metrics), "number_of_skipped_episodes": int(skipped_count),
+        "episodes_without_valid_detections": sum(int(m["valid_detection_count"]) == 0 for m in metrics),
+        "total_sidecar_rows": sum(int(m["total_sidecar_rows"]) for m in metrics),
+        "total_valid_detection_count": sum(int(m["valid_detection_count"]) for m in metrics),
+        "median_valid_detection_count_per_episode": _percentile(metric_values("valid_detection_count"), 50),
+        "median_active_span_sec": _percentile(metric_values("valid_detection_span_sec"), 50),
+        "p25_active_span_sec": _percentile(metric_values("valid_detection_span_sec"), 25),
+        "p75_active_span_sec": _percentile(metric_values("valid_detection_span_sec"), 75),
+        "median_inter_detection_interval_ms": _percentile(pooled_gaps, 50),
+        "p90_inter_detection_interval_ms": _percentile(pooled_gaps, 90),
+        "p95_inter_detection_interval_ms": _percentile(pooled_gaps, 95),
+        "maximum_inter_detection_interval_ms": max(pooled_gaps) if pooled_gaps else None,
+        "median_sidecar_update_interval_ms": _percentile(all_update_ms, 50),
+        "p90_sidecar_update_interval_ms": _percentile(all_update_ms, 90),
+        "p95_sidecar_update_interval_ms": _percentile(all_update_ms, 95),
+        "median_sensor_window_duration_ms": _percentile(sensor, 50),
+        "p90_sensor_window_duration_ms": _percentile(sensor, 90),
+        "median_window_event_count": _percentile(events, 50), "p90_window_event_count": _percentile(events, 90),
+        "median_dense_phase_count_per_episode": _percentile(dense_counts, 50),
+        "median_phase_interval_rate_hz": _percentile(pooled_phase_rates, 50),
+        "p90_phase_interval_rate_hz": _percentile(pooled_phase_rates, 90),
+        "pooled_inter_detection_intervals": _numeric_stats(pooled_gaps),
+        "pooled_phase_rates": _numeric_stats(pooled_phase_rates),
+        "pooled_phase_window_rates": _numeric_stats(pooled_window_rates),
+        "weighting_note": "Per-episode medians are episode-weighted; pooled distributions are row/interval-level.",
+    }
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -592,6 +1041,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recursive", action="store_true", help="recursively discover HDF5 files")
     parser.add_argument("--max-files", type=int, help="analyze at most M discovered files")
     parser.add_argument("--output-dir", type=Path, help="directory for CSV and JSON reports")
+    parser.add_argument(
+        "--analysis-source", choices=("episode", "sidecar", "auto"), default="episode",
+        help="episode policy-grid analysis (default), native sidecar rows, or automatic sidecar fallback",
+    )
+    parser.add_argument("--sidecar", type=Path, help="tracker-output sidecar HDF5 path")
+    parser.add_argument("--phase-gap-ms", type=float, default=250.0,
+                        help="gap larger than this starts a new sidecar phase (default: 250)")
+    parser.add_argument("--min-phase-detections", type=int, default=3,
+                        help="minimum detections marking a phase dense (default: 3)")
+    parser.add_argument("--rate-window-ms", type=float, default=250.0,
+                        help="dense-phase rate window width (default: 250)")
     parser.add_argument(
         "--plot", action="store_true",
         help="create dependency-free SVG timelines and summary charts under OUTPUT_DIR/plots",
@@ -615,9 +1075,548 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--max-age-ms must be finite and nonnegative")
     if args.timestamp_epsilon < 0 or not math.isfinite(args.timestamp_epsilon):
         parser.error("--timestamp-epsilon must be finite and nonnegative")
+    if args.phase_gap_ms < 0 or not math.isfinite(args.phase_gap_ms):
+        parser.error("--phase-gap-ms must be finite and nonnegative")
+    if args.min_phase_detections <= 0:
+        parser.error("--min-phase-detections must be positive")
+    if args.rate_window_ms <= 0 or not math.isfinite(args.rate_window_ms):
+        parser.error("--rate-window-ms must be finite and positive")
     if args.recursive and args.top_dir is None:
         parser.error("--recursive requires --top-dir")
     return args
+
+
+def _episode_attributes(path: Path) -> dict[str, Any]:
+    with h5py.File(path, "r") as h5:
+        return {str(key): _json_value(value) for key, value in h5.attrs.items()}
+
+
+def _resolve_sidecar_path(episode_path: Path, attrs: Mapping[str, Any], explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        return explicit.expanduser().resolve()
+    value = attrs.get("sparse_tracking_sidecar_h5")
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    candidate = Path(str(value)).expanduser()
+    if not candidate.is_absolute():
+        candidate = episode_path.parent / candidate
+    return candidate.resolve()
+
+
+def _sidecar_group_metadata(path: Path) -> list[tuple[str, dict[str, Any]]]:
+    groups = []
+    with h5py.File(path, "r") as h5:
+        for name in sidecar_group_names(path):
+            attrs = {str(key): _json_value(value) for key, value in h5[name].attrs.items()}
+            groups.append((name, attrs))
+    return groups
+
+
+def _write_rows_even_if_empty(path: Path, rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        fieldnames = list(rows[0].keys()) if rows else list(fields)
+        fieldnames = [name for name in fieldnames if not name.startswith("_")]
+        writer = csv.DictWriter(stream, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: _json_value(row.get(name)) for name in fieldnames})
+
+
+def _parse_tracker_config(attrs: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = attrs.get("sparse_tracking_tracker_config_json")
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        config = json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"parse_error": "invalid sparse_tracking_tracker_config_json"}
+
+    def selected(mapping: Mapping[str, Any]) -> dict[str, Any]:
+        result = {}
+        for key, value in mapping.items():
+            lower = str(key).lower()
+            if key in ("bin_ms", "accumulation_window_ms") or any(
+                token in lower for token in ("morph", "spatial", "velocity", "history", "threshold")
+            ):
+                result[str(key)] = value
+            if isinstance(value, Mapping):
+                nested = selected(value)
+                if nested:
+                    result.setdefault(str(key), {}).update(nested)
+        return result
+    return selected(config) if isinstance(config, Mapping) else {"value": config}
+
+
+def _sidecar_rejection_rows(arrays: Mapping[str, np.ndarray], episode_id: str) -> list[dict[str, Any]]:
+    if "rejection_reason" not in arrays:
+        return []
+    values = np.asarray(arrays["rejection_reason"]).reshape(-1)
+    decoded = [value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+               for value in values]
+    unique, counts = np.unique(decoded, return_counts=True)
+    return [{"episode_id": episode_id, "rejection_reason": reason, "count": int(count),
+             "fraction_of_sidecar_rows": float(count / len(decoded)) if decoded else None}
+            for reason, count in zip(unique, counts)]
+
+
+def _simple_sidecar_svg(path: Path, title: str, subtitle: str, values: Sequence[float] = ()) -> None:
+    width, height = 1000, 260
+    vals = np.asarray(values, dtype=np.float64)
+    bars = []
+    if vals.size:
+        counts, _ = np.histogram(vals, bins=min(30, max(1, int(np.sqrt(vals.size)))))
+        maximum = max(int(np.max(counts)), 1)
+        for index, count in enumerate(counts):
+            x = 70 + 880 * index / len(counts)
+            w = max(1, 880 / len(counts) - 2)
+            h = 140 * count / maximum
+            bars.append(f'<rect x="{x:.2f}" y="{220-h:.2f}" width="{w:.2f}" height="{h:.2f}" fill="#1565c0"/>')
+    content = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+               '<rect width="100%" height="100%" fill="white"/>',
+               f'<text x="40" y="35" font-family="Arial" font-size="20" font-weight="bold">{escape(title)}</text>',
+               f'<text x="40" y="60" font-family="Arial" font-size="12">{escape(subtitle)}</text>',
+               *bars, '</svg>']
+    path.write_text("\n".join(content) + "\n", encoding="utf-8")
+
+
+def _sidecar_row_svg(
+    path: Path, title: str, subtitle: str, arrays: Mapping[str, np.ndarray],
+    episode_phases: Sequence[Mapping[str, Any]], row_order_axis: bool = False,
+) -> None:
+    """Draw actual valid/invalid sidecar markers and active/phase boundaries."""
+    times = np.asarray(arrays["available_ros_t_ns"], dtype=np.float64) * 1e-9
+    valid = np.asarray(arrays["valid"]).reshape(-1) != 0
+    if row_order_axis:
+        xvalues = np.arange(times.size, dtype=float)
+        axis_note = "row index (duplicate rows preserved)"
+    else:
+        xvalues = times
+        axis_note = "available ROS time"
+    lo, hi = (float(xvalues[0]), float(xvalues[-1])) if xvalues.size else (0.0, 1.0)
+    scale = max(hi - lo, 1.0)
+    elements = [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="280">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="45" y="30" font-family="Arial" font-size="20" font-weight="bold">{escape(title)}</text>',
+        f'<text x="45" y="53" font-family="Arial" font-size="12">{escape(subtitle)}; x={axis_note}</text>',
+        '<line x1="65" y1="215" x2="1040" y2="215" stroke="#555"/>',
+    ]
+    for index, (xvalue, is_valid) in enumerate(zip(xvalues, valid)):
+        x = 65 + 975 * (float(xvalue) - lo) / scale
+        y = 105 if is_valid else 185
+        color = "#2e7d32" if is_valid else "#d32f2f"
+        tooltip = escape(f"row={index}, t={times[index]:.9f}, state={'present' if is_valid else 'absent'}")
+        elements.append(f'<circle cx="{x:.2f}" cy="{y}" r="4" fill="{color}"><title>{tooltip}</title></circle>')
+    active = extract_active_interval(arrays)
+    if active is not None:
+        for index in active:
+            x = 65 + 975 * (float(xvalues[index]) - lo) / scale
+            elements.append(f'<line x1="{x:.2f}" y1="75" x2="{x:.2f}" y2="220" stroke="#6a1b9a" stroke-dasharray="5 4"/>')
+    if not row_order_axis:
+        for phase in episode_phases:
+            if phase["is_dense"]:
+                x = 65 + 975 * (float(phase["first_detection_time"]) - lo) / scale
+                elements.append(f'<line x1="{x:.2f}" y1="75" x2="{x:.2f}" y2="220" stroke="#ef6c00"/>')
+    elements.extend([
+        '<text x="15" y="110" font-family="Arial" font-size="12">valid</text>',
+        '<text x="15" y="190" font-family="Arial" font-size="12">invalid</text>',
+        '<text x="65" y="250" font-family="Arial" font-size="11">Markers are recorded rows, not continuous 1 ms bins.</text>',
+        '</svg>',
+    ])
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _sidecar_sensor_window_svg(
+    path: Path, episode_id: str, arrays: Mapping[str, np.ndarray],
+) -> None:
+    """Plot equal-height row bars whose widths encode observed sensor-window spans."""
+    starts = np.asarray(arrays["sensor_window_start_us"], dtype=np.float64)
+    ends = np.asarray(arrays["sensor_window_end_us"], dtype=np.float64)
+    durations_ms = (ends - starts) / 1000.0
+    valid = np.asarray(arrays["valid"]).reshape(-1) != 0
+    finite = durations_ms[np.isfinite(durations_ms)]
+    maximum = float(np.max(finite)) if finite.size and np.max(finite) > 0 else 1.0
+    count = durations_ms.size
+    slot = 990.0 / max(count, 1)
+    elements = [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="280">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<text x="45" y="30" font-family="Arial" font-size="20" font-weight="bold">Observed sensor-window duration</text>',
+        f'<text x="45" y="53" font-family="Arial" font-size="12">{escape(episode_id)}; equal-height bars in sidecar-row order, width encodes observed duration</text>',
+        '<line x1="65" y1="205" x2="1055" y2="205" stroke="#555"/>',
+    ]
+    for index, (duration, is_valid) in enumerate(zip(durations_ms, valid)):
+        normalized = max(float(duration), 0.0) / maximum if np.isfinite(duration) else 0.0
+        bar_width = max(1.0, normalized * max(slot * 0.9, 1.0))
+        center = 65 + (index + 0.5) * slot
+        x = center - bar_width / 2.0
+        color = "#2e7d32" if is_valid else "#d32f2f"
+        tooltip = escape(
+            f"row={index}, observed sensor-window duration={duration:.3f} ms, "
+            f"state={'valid' if is_valid else 'invalid'}"
+        )
+        elements.append(
+            f'<rect x="{x:.2f}" y="105" width="{bar_width:.2f}" height="100" '
+            f'fill="{color}"><title>{tooltip}</title></rect>'
+        )
+    elements.extend([
+        '<rect x="65" y="105" width="990" height="100" fill="none" stroke="#333"/>',
+        '<rect x="65" y="230" width="14" height="14" fill="#2e7d32"/><text x="85" y="242" font-family="Arial" font-size="11">valid row</text>',
+        '<rect x="165" y="230" width="14" height="14" fill="#d32f2f"/><text x="185" y="242" font-family="Arial" font-size="11">invalid row</text>',
+        f'<text x="310" y="242" font-family="Arial" font-size="11">maximum observed duration={maximum:.3f} ms; bar widths scaled within this episode</text>',
+        '</svg>',
+    ])
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _write_sidecar_aggregate_dashboard(
+    path: Path, metrics: Sequence[Mapping[str, Any]],
+    intervals: Sequence[Mapping[str, Any]],
+) -> None:
+    """Write an aggregate row-sequence dashboard for native sidecar output."""
+    width, height = 1200, 760
+    active_valid = sum(int(metric.get("active_interval_valid_row_count") or 0)
+                       for metric in metrics)
+    active_invalid = sum(int(metric.get("active_interval_invalid_row_count") or 0)
+                         for metric in metrics)
+    active_rows = active_valid + active_invalid
+    valid_fraction = active_valid / active_rows if active_rows else 0.0
+    gap_ms = np.asarray(
+        [float(row["inter_detection_interval_ms"]) for row in intervals],
+        dtype=np.float64,
+    )
+    counts = np.array([
+        np.count_nonzero(gap_ms <= 33.0),
+        np.count_nonzero((gap_ms > 33.0) & (gap_ms <= 50.0)),
+        np.count_nonzero((gap_ms > 50.0) & (gap_ms <= 100.0)),
+        np.count_nonzero((gap_ms > 100.0) & (gap_ms <= 200.0)),
+        np.count_nonzero((gap_ms > 200.0) & (gap_ms <= 500.0)),
+        np.count_nonzero(gap_ms > 500.0),
+    ], dtype=int)
+    labels = ("≤33", "33–50", "50–100", "100–200", "200–500", ">500")
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<style>text{font-family:Arial,sans-serif;fill:#202124}.small{font-size:12px}.label{font-size:14px}.title{font-size:20px;font-weight:bold}.section{font-size:16px;font-weight:bold}.caveat{font-size:12px;fill:#7f1d1d}</style>',
+        '<text x="50" y="34" class="title">Native sidecar tracker-output aggregate analysis</text>',
+        f'<text x="50" y="58" class="label">episodes={len(metrics)} · active-interval rows={active_rows} · recorded unique-output gaps={gap_ms.size}</text>',
+        '<text x="50" y="98" class="section">Pooled active-interval sidecar-row fraction</text>',
+    ]
+    bar_x, bar_y, bar_w, bar_h = 50, 120, 500, 65
+    valid_w = bar_w * valid_fraction
+    elements.extend([
+        f'<rect x="{bar_x}" y="{bar_y}" width="{valid_w:.3f}" height="{bar_h}" fill="#2e7d32"/>',
+        f'<rect x="{bar_x + valid_w:.3f}" y="{bar_y}" width="{bar_w - valid_w:.3f}" height="{bar_h}" fill="#d32f2f"/>',
+        f'<rect x="{bar_x}" y="{bar_y}" width="{bar_w}" height="{bar_h}" fill="none" stroke="#333"/>',
+        f'<text x="{bar_x + 8}" y="{bar_y + 40}" style="fill:white;font-weight:bold">valid {valid_fraction * 100:.2f}% ({active_valid})</text>',
+        f'<text x="{bar_x + bar_w - 8}" y="{bar_y + 40}" text-anchor="end" style="fill:white;font-weight:bold">invalid {(1-valid_fraction) * 100:.2f}% ({active_invalid})</text>',
+        '<text x="650" y="98" class="section">Recorded valid-output gap distribution (ms)</text>',
+    ])
+    hist_x, hist_y, hist_w, hist_h = 650, 120, 490, 170
+    max_count = max(int(np.max(counts)), 1)
+    each_w = hist_w / len(counts)
+    for index, (label, count) in enumerate(zip(labels, counts)):
+        h = hist_h * int(count) / max_count
+        x = hist_x + index * each_w + 8
+        y = hist_y + hist_h - h
+        elements.extend([
+            f'<rect x="{x:.2f}" y="{y:.2f}" width="{each_w - 16:.2f}" height="{h:.2f}" fill="#ef6c00"><title>{escape(label)} ms: {int(count)} gaps</title></rect>',
+            f'<text x="{x + (each_w - 16) / 2:.2f}" y="{hist_y + hist_h + 18}" text-anchor="middle" class="small">{escape(label)}</text>',
+            f'<text x="{x + (each_w - 16) / 2:.2f}" y="{max(y - 5, hist_y + 12):.2f}" text-anchor="middle" class="small">{int(count)}</text>',
+        ])
+    elements.extend([
+        f'<line x1="{hist_x}" y1="{hist_y + hist_h}" x2="{hist_x + hist_w}" y2="{hist_y + hist_h}" stroke="#333"/>',
+        '<text x="50" y="290" class="section">Per-episode active-interval valid-row fractions</text>',
+    ])
+    chart_x, chart_y, chart_w, chart_h = 50, 315, 1090, 370
+    values = [metric.get("active_interval_valid_row_fraction") for metric in metrics]
+    slot = chart_w / max(len(values), 1)
+    for index, (metric, value) in enumerate(zip(metrics, values)):
+        if value is None:
+            continue
+        fraction = float(value)
+        height_px = chart_h * fraction
+        x = chart_x + index * slot + min(5.0, slot * 0.1)
+        rect_w = max(1.0, slot - min(10.0, slot * 0.2))
+        tooltip = escape(f"{metric['episode_id']}: {fraction * 100:.2f}% active valid rows")
+        elements.append(
+            f'<rect x="{x:.2f}" y="{chart_y + chart_h - height_px:.2f}" width="{rect_w:.2f}" '
+            f'height="{height_px:.2f}" fill="#1565c0"><title>{tooltip}</title></rect>'
+        )
+        if len(values) <= 30:
+            elements.append(f'<text x="{x + rect_w / 2:.2f}" y="{chart_y + chart_h + 17}" text-anchor="middle" class="small">{index + 1}</text>')
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        y = chart_y + chart_h * (1.0 - fraction)
+        elements.extend([
+            f'<line x1="{chart_x}" y1="{y:.2f}" x2="{chart_x + chart_w}" y2="{y:.2f}" stroke="#bbb" stroke-dasharray="3 4"/>',
+            f'<text x="{chart_x - 8}" y="{y + 4:.2f}" text-anchor="end" class="small">{fraction * 100:.0f}%</text>',
+        ])
+    finite_values = [float(value) for value in values if value is not None]
+    if finite_values:
+        average = float(np.mean(finite_values))
+        average_y = chart_y + chart_h * (1.0 - average)
+        elements.extend([
+            f'<line x1="{chart_x}" y1="{average_y:.2f}" x2="{chart_x + chart_w}" y2="{average_y:.2f}" stroke="#b71c1c" stroke-width="5"/>',
+            f'<text x="{chart_x + chart_w - 4}" y="{average_y - 8:.2f}" text-anchor="end" font-family="Arial" font-size="12" font-weight="bold" fill="#b71c1c" style="fill:#b71c1c">episode mean {average * 100:.2f}%</text>',
+        ])
+    elements.extend([
+        '</svg>',
+    ])
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _write_longest_valid_run_range_plot(
+    path: Path, metrics: Sequence[Mapping[str, Any]],
+) -> None:
+    """Plot episode longest-valid-run timestamp spans in milliseconds."""
+    values = np.asarray([
+        float(metric["longest_present_run_ms"])
+        for metric in metrics if metric.get("longest_present_run_ms") is not None
+    ], dtype=np.float64)
+    width, height = 1000, 280
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<style>text{font-family:Arial,sans-serif;fill:#202124}.small{font-size:12px}.title{font-size:20px;font-weight:bold}</style>',
+        '<text x="45" y="34" class="title">Longest valid-row-sequence duration per episode</text>',
+        '<text x="45" y="58" class="small">Range-and-mean summary; duration is last-row timestamp minus first-row timestamp within each valid run</text>',
+    ]
+    axis_x, axis_y, axis_w = 80.0, 160.0, 850.0
+    if values.size:
+        minimum, mean, maximum = float(np.min(values)), float(np.mean(values)), float(np.max(values))
+        scale_max = max(maximum, 1.0)
+
+        def x_position(value: float) -> float:
+            return axis_x + axis_w * value / scale_max
+
+        min_x, mean_x, max_x = (x_position(value) for value in (minimum, mean, maximum))
+        elements.extend([
+            f'<line x1="{axis_x}" y1="{axis_y}" x2="{axis_x + axis_w}" y2="{axis_y}" stroke="#555"/>',
+            f'<line x1="{min_x:.2f}" y1="{axis_y}" x2="{max_x:.2f}" y2="{axis_y}" stroke="#1565c0" stroke-width="8"/>',
+        ])
+        for index, value in enumerate(values):
+            x = x_position(float(value))
+            jitter = ((index % 7) - 3) * 3.0
+            elements.append(
+                f'<circle cx="{x:.2f}" cy="{axis_y + jitter:.2f}" r="4" fill="#78909c" fill-opacity="0.45"><title>episode longest valid-run span={value:.3f} ms</title></circle>'
+            )
+        elements.extend([
+            f'<line x1="{min_x:.2f}" y1="125" x2="{min_x:.2f}" y2="195" stroke="#0d47a1" stroke-width="3"/>',
+            f'<line x1="{max_x:.2f}" y1="125" x2="{max_x:.2f}" y2="195" stroke="#0d47a1" stroke-width="3"/>',
+            f'<circle cx="{mean_x:.2f}" cy="{axis_y}" r="11" fill="#b71c1c" stroke="white" stroke-width="2"/>',
+            f'<text x="{min_x:.2f}" y="218" text-anchor="middle" class="small">min {minimum:.2f} ms</text>',
+            f'<text x="{mean_x:.2f}" y="105" text-anchor="middle" class="small" style="fill:#b71c1c;font-weight:bold">mean {mean:.2f} ms</text>',
+            f'<text x="{max_x:.2f}" y="218" text-anchor="middle" class="small">max {maximum:.2f} ms</text>',
+            f'<text x="{axis_x + axis_w / 2}" y="255" text-anchor="middle" class="small">Longest valid-row-sequence timestamp span (ms); episodes={values.size}</text>',
+        ])
+    else:
+        elements.append('<text x="500" y="150" text-anchor="middle" class="small">No episode has a valid active interval.</text>')
+    elements.append('</svg>')
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _write_sidecar_plots(
+    plot_dir: Path, episodes: Sequence[tuple[str, Mapping[str, np.ndarray], Sequence[Mapping[str, Any]]]],
+    metrics: Sequence[Mapping[str, Any]],
+    intervals: Sequence[Mapping[str, Any]], phases: Sequence[Mapping[str, Any]],
+    windows: Sequence[Mapping[str, Any]], statistics: Sequence[Mapping[str, Any]],
+    rejections: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Write dependency-free SVG diagnostics, explicitly identified as row based."""
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for index, (episode_id, arrays, episode_phases) in enumerate(episodes):
+        stem = _safe_plot_name(episode_id, index).removesuffix(".svg")
+        specs = (
+            ("full_timeline", "Native tracker-output timing", "All valid/invalid sidecar rows; vertical extent is marker state."),
+            ("active_zoom", "Valid detection gaps", "First-to-last recorded valid output with dense-phase boundaries."),
+            ("binary_row_signal", "Sidecar row-sequence binary signal", "Present/absent rows in row order; not a continuous 1 ms timeline."),
+            ("window_diagnostics", "Observed sensor-window duration", "Observed window span and event diagnostics; not CPU latency."),
+        )
+        for suffix, title, subtitle in specs:
+            path = plot_dir / f"{stem}_{suffix}.svg"
+            if suffix == "window_diagnostics":
+                _sidecar_sensor_window_svg(path, episode_id, arrays)
+            else:
+                _sidecar_row_svg(path, title, f"{episode_id}: {subtitle}", arrays,
+                                 episode_phases, row_order_axis=suffix == "binary_row_signal")
+            paths.append(str(path))
+    dashboard_path = plot_dir / "sidecar_aggregate_summary.svg"
+    _write_sidecar_aggregate_dashboard(dashboard_path, metrics, intervals)
+    paths.append(str(dashboard_path))
+    longest_run_path = plot_dir / "longest_valid_row_sequence_duration_range_mean.svg"
+    _write_longest_valid_run_range_plot(longest_run_path, metrics)
+    paths.append(str(longest_run_path))
+    update_intervals = [float(value) * 1e-6 for _, arrays, _ in episodes
+                        for value in np.diff(np.asarray(arrays["available_ros_t_ns"], dtype=np.float64))]
+    sensor_durations = [value for row in statistics if row["field"] == "sensor_window_duration_ms"
+                        for value in row.get("_finite_values", [])]
+    window_events = [value for row in statistics if row["field"] == "window_event_count"
+                     for value in row.get("_finite_values", [])]
+    aggregate_specs = (
+        ("valid_detection_gap_distribution.svg", "Valid detection gaps", [r["inter_detection_interval_ms"] for r in intervals]),
+        ("native_update_interval_distribution.svg", "Native tracker-output timing", update_intervals),
+        ("dense_phase_rate_distribution.svg", "Dense-phase interval rate", [p["interval_rate_hz"] for p in phases if p.get("interval_rate_hz") is not None]),
+        ("phase_window_rate_distribution.svg", "Phase-window detection rate", [w["detection_rate_hz"] for w in windows]),
+        ("sensor_window_duration_distribution.svg", "Observed sensor-window duration", sensor_durations),
+        ("window_event_count_distribution.svg", "Window event count", window_events),
+        ("rejection_reason_counts.svg", "Rejection-reason counts", [r["count"] for r in rejections]),
+    )
+    for filename, title, values in aggregate_specs:
+        path = plot_dir / filename
+        _simple_sidecar_svg(path, title, "Sidecar-derived offline analysis; missing rows are not confirmed absence.", values)
+        paths.append(str(path))
+    return paths
+
+
+def run_sidecar_analysis(args: argparse.Namespace, files: Sequence[Path], base_dir: Path) -> int:
+    """Analyze tracker-output sidecars matched to episode files."""
+    output_dir = (args.output_dir or (base_dir / "event_detection_analysis")).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics: list[dict[str, Any]] = []
+    intervals: list[dict[str, Any]] = []
+    runs: list[dict[str, Any]] = []
+    phases: list[dict[str, Any]] = []
+    windows: list[dict[str, Any]] = []
+    statistics: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    plot_episodes = []
+    sidecar_paths = []
+    configs = []
+    for episode_path in files:
+        try:
+            attrs = _episode_attributes(episode_path)
+            sidecar_path = _resolve_sidecar_path(episode_path, attrs, args.sidecar)
+            if sidecar_path is None or not sidecar_path.is_file():
+                reason = "no matching sidecar path exists"
+                if args.analysis_source == "auto":
+                    print(f"warning: {episode_path}: {reason}; falling back to episode mode", file=sys.stderr)
+                    return -1
+                raise ValueError(reason)
+            group_meta = _sidecar_group_metadata(sidecar_path)
+            group_name = match_episode_to_sidecar_group(episode_path, attrs, group_meta)
+            if group_name is None and len(group_meta) == 1:
+                group_name = group_meta[0][0]
+            if group_name is None:
+                raise ValueError("episode could not be matched to a sidecar group")
+            arrays, side_attrs, reordered = load_sidecar_group(sidecar_path, group_name)
+            missing_optional = [name for name in SIDECAR_OPTIONAL_DATASETS if name not in arrays]
+            if missing_optional:
+                print(f"warning: {sidecar_path}::{group_name}: optional diagnostics unavailable: "
+                      + ", ".join(missing_optional), file=sys.stderr)
+            if reordered:
+                print(f"warning: {sidecar_path}::{group_name}: non-monotonic timestamps; rows stable-sorted by timestamp, packet, original index", file=sys.stderr)
+            episode_id = str(episode_path)
+            metric, episode_intervals, episode_runs = summarize_sidecar_episode(
+                arrays, episode_id, sidecar_path, group_name)
+            raw_times = np.asarray(arrays["available_ros_t_ns"], dtype=np.float64) * 1e-9
+            metric["_all_update_intervals_ms"] = (np.diff(raw_times) * 1000.0).tolist()
+            episode_phases, _ = segment_dense_phases(
+                arrays, episode_id, args.phase_gap_ms, args.min_phase_detections)
+            episode_windows = calculate_phase_window_rates(episode_phases, arrays, args.rate_window_ms)
+            for phase in episode_phases:
+                phase_windows = [w for w in episode_windows if w["phase_id"] == phase["phase_id"]]
+                rates = [float(w["detection_rate_hz"]) for w in phase_windows]
+                phase.update({
+                    "minimum_window_rate_hz": min(rates) if rates else None,
+                    "median_window_rate_hz": _percentile(rates, 50), "p90_window_rate_hz": _percentile(rates, 90),
+                    "maximum_window_rate_hz": max(rates) if rates else None,
+                    "maximum_window_detection_count": max((w["valid_detection_count"] for w in phase_windows), default=None),
+                })
+            episode_stats = detection_window_statistics(arrays, episode_id)
+            for stat in episode_stats:
+                field = stat["field"]
+                if field == "sensor_window_duration_ms":
+                    values = (np.asarray(arrays["sensor_window_end_us"], dtype=float) - np.asarray(arrays["sensor_window_start_us"], dtype=float)) / 1000.0
+                else:
+                    values = np.asarray(arrays.get(field, []))
+                try:
+                    stat["_finite_values"] = np.asarray(values, dtype=float)[np.isfinite(np.asarray(values, dtype=float))].tolist()
+                except (TypeError, ValueError):
+                    stat["_finite_values"] = []
+            metrics.append(metric)
+            intervals.extend(episode_intervals)
+            runs.extend(episode_runs)
+            phases.extend(episode_phases)
+            windows.extend(episode_windows)
+            statistics.extend(episode_stats)
+            rejections.extend(_sidecar_rejection_rows(arrays, episode_id))
+            plot_episodes.append((episode_id, arrays, episode_phases))
+            sidecar_paths.append(str(sidecar_path))
+            config = _parse_tracker_config({**attrs, **side_attrs})
+            if config is not None:
+                configs.append({"episode_id": episode_id, "configuration": config})
+            print(f"{episode_id}: native sidecar tracker-output/update cadence, rows={metric['total_sidecar_rows']}, unique valid outputs={metric['valid_detection_count']}")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            skipped.append({"file": str(episode_path), "episode": "", "reason": str(exc)})
+            print(f"warning: unmatched/skipped episode {episode_path}: {exc}", file=sys.stderr)
+    aggregate = summarize_sidecar_aggregate(metrics, intervals, phases, windows, statistics,
+                                            sidecar_paths, len(files), len(skipped))
+    aggregate_statistics = []
+    for field in SIDECAR_NUMERIC_FIELDS:
+        pooled = [value for row in statistics if row["field"] == field
+                  for value in row.get("_finite_values", [])]
+        if pooled:
+            aggregate_statistics.append({"episode_id": "__aggregate_pooled_rows__", "field": field,
+                                         **_numeric_stats(pooled)})
+    statistics.extend(aggregate_statistics)
+    if rejections:
+        pooled_rejections: dict[str, int] = {}
+        for row in rejections:
+            pooled_rejections[str(row["rejection_reason"])] = (
+                pooled_rejections.get(str(row["rejection_reason"]), 0) + int(row["count"])
+            )
+        total_rejections = sum(pooled_rejections.values())
+        rejections.extend({"episode_id": "__aggregate_pooled_rows__", "rejection_reason": reason,
+                           "count": count, "fraction_of_sidecar_rows": count / total_rejections}
+                          for reason, count in sorted(pooled_rejections.items()))
+    outputs = (
+        ("sidecar_episode_metrics.csv", metrics, ("episode_id",)),
+        ("sidecar_detection_intervals.csv", intervals, ("episode_id", "detection_index")),
+        ("sidecar_rle_runs.csv", runs, ("episode_id", "signal_source", "run_index")),
+        ("sidecar_phases.csv", phases, ("episode_id", "phase_id", "is_dense")),
+        ("sidecar_phase_rate_windows.csv", windows, ("episode_id", "phase_id", "window_index")),
+        ("sidecar_window_statistics.csv", statistics, ("episode_id", "field", "count")),
+        ("sidecar_rejection_statistics.csv", rejections, ("episode_id", "rejection_reason", "count")),
+    )
+    for filename, rows_out, fields in outputs:
+        _write_rows_even_if_empty(output_dir / filename, rows_out, fields)
+    plot_paths = _write_sidecar_plots(
+        output_dir / "plots", plot_episodes, metrics, intervals, phases, windows, statistics,
+        rejections,
+    ) if args.plot else []
+    report = {
+        **aggregate,
+        "analysis_configuration": {
+            "phase_gap_ms": args.phase_gap_ms,
+            "min_phase_detections": args.min_phase_detections,
+            "rate_window_ms": args.rate_window_ms,
+            "cadence_label": "native sidecar tracker-output/update cadence",
+            "rle_note": "row-sequence RLE, not a continuous millisecond signal",
+        },
+        "tracker_configurations": configs, "skipped_episodes": skipped, "plot_files": plot_paths,
+        "measurement_scope": {
+            "measured": ["tracker-output timing", "observed sensor-window spans", "recorded valid tracker-output gaps"],
+            "not_available": [
+                "every processed 1 ms bin", "reliable empty 1 ms-bin counts",
+                "map-building latency", "morphology latency", "blob-extraction latency",
+                "velocity-fit latency", "total CPU latency", "true sensor-event-to-detection latency",
+            ],
+            "absence_caveat": "Missing sidecar rows and gaps between recorded valid outputs are not confirmed detector absence.",
+            "latency_note": "True sensor-event-to-detection latency requires additional runtime timestamps.",
+        },
+    }
+    (output_dir / "sidecar_aggregate_summary.json").write_text(json.dumps(_json_value(report), indent=2) + "\n", encoding="utf-8")
+    if not metrics:
+        print("error: no sidecar episode could be analyzed", file=sys.stderr)
+        return 1
+    print(f"Reports written to {output_dir}")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -636,6 +1635,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             files = files[: args.max_files]
         base_dir = top_dir
     discovered_count = len(files)
+    if args.analysis_source == "sidecar":
+        return run_sidecar_analysis(args, files, base_dir)
+    if args.analysis_source == "auto":
+        sidecar_files = []
+        episode_fallback_files = []
+        for path in files:
+            try:
+                attrs = _episode_attributes(path)
+                candidate = _resolve_sidecar_path(path, attrs, args.sidecar)
+                groups = _sidecar_group_metadata(candidate) if candidate and candidate.is_file() else []
+                matched = match_episode_to_sidecar_group(path, attrs, groups)
+                if matched is not None or len(groups) == 1:
+                    sidecar_files.append(path)
+                else:
+                    episode_fallback_files.append(path)
+                    print(f"warning: {path}: no matching sidecar; falling back to episode mode",
+                          file=sys.stderr)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                episode_fallback_files.append(path)
+                print(f"warning: {path}: sidecar lookup failed ({exc}); falling back to episode mode",
+                      file=sys.stderr)
+        if sidecar_files:
+            sidecar_result = run_sidecar_analysis(args, sidecar_files, base_dir)
+            if sidecar_result != 0 and not episode_fallback_files:
+                return sidecar_result
+        if not episode_fallback_files:
+            return 0
+        files = episode_fallback_files
     output_dir = (args.output_dir or (base_dir / "event_detection_analysis")).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     # Avoid consuming outputs if the output directory happens to sit below top-dir.
