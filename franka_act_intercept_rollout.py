@@ -34,7 +34,7 @@ from intercept_rollout_contract import (
     validate_intercept_stats_and_config,
 )
 from policy import ACTPolicy
-from rollout_latency_trace import RolloutLatencyTracer
+from rollout_latency_trace import RolloutLatencyTracer, resolve_latency_trace_cuda_sync
 from sparse_ball import (
     SparsePoint, construct_causal_sparse_history,
     SPARSE_HISTORY_OFFSETS_SEC, default_sparse_topic,
@@ -847,7 +847,20 @@ def main():
     parser.add_argument("--diag_log_period_sec", type=float, default=1.0)
     parser.add_argument("--reject_log_period_sec", type=float, default=1.0)
     parser.add_argument("--enable_latency_trace", action="store_true", default=False)
-    parser.add_argument("--latency_trace_cuda_sync", action="store_true", default=False)
+    latency_cuda_sync_group = parser.add_mutually_exclusive_group()
+    latency_cuda_sync_group.add_argument(
+        "--latency_trace_cuda_sync",
+        dest="latency_trace_cuda_sync",
+        action="store_true",
+        help="Synchronize CUDA around traced model inference (default when latency tracing is enabled).",
+    )
+    latency_cuda_sync_group.add_argument(
+        "--no_latency_trace_cuda_sync",
+        dest="latency_trace_cuda_sync",
+        action="store_false",
+        help="Disable CUDA synchronization while latency tracing is enabled.",
+    )
+    parser.set_defaults(latency_trace_cuda_sync=None)
     parser.add_argument("--latency_trace_topic", type=str, default="/intercept_trace/act_rollout")
     parser.add_argument("--latency_run_id", type=str, default="")
 
@@ -917,6 +930,10 @@ def main():
     parser.set_defaults(use_bce_last_action_dim=False)
 
     args = parser.parse_args()
+    args.latency_trace_cuda_sync = resolve_latency_trace_cuda_sync(
+        args.enable_latency_trace,
+        args.latency_trace_cuda_sync,
+    )
     args.policy_rate_hz = validate_policy_rate(args.policy_rate_hz)
     if args.fps is None:
         args.fps = float(args.policy_rate_hz)

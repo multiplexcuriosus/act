@@ -171,6 +171,14 @@ class RolloutLatencyTraceTests(unittest.TestCase):
                 synchronize()
         synchronize.assert_not_called()
 
+    def test_cuda_sync_defaults_to_latency_trace_setting(self):
+        from rollout_latency_trace import resolve_latency_trace_cuda_sync
+
+        self.assertTrue(resolve_latency_trace_cuda_sync(True, None))
+        self.assertFalse(resolve_latency_trace_cuda_sync(False, None))
+        self.assertFalse(resolve_latency_trace_cuda_sync(True, False))
+        self.assertTrue(resolve_latency_trace_cuda_sync(False, True))
+
 
 if __name__ == "__main__":
     unittest.main()

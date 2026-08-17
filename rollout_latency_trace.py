@@ -8,6 +8,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 
+def resolve_latency_trace_cuda_sync(
+    enable_latency_trace: bool,
+    latency_trace_cuda_sync: Optional[bool],
+) -> bool:
+    """Default CUDA synchronization to the latency tracing enablement state."""
+    if latency_trace_cuda_sync is None:
+        return bool(enable_latency_trace)
+    return bool(latency_trace_cuda_sync)
+
+
 @dataclass
 class TickTrace:
     sequence: int
