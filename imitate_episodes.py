@@ -799,6 +799,9 @@ def main(args):
         stats['sparse_history_offsets_frames'] = list(
             sparse_history_offsets_frames(policy_rate_hz)
         )
+        stats['sparse_source'] = sparse_source
+        stats['sparse_feature_dim'] = sparse_feature_dim
+        stats['sparse_history_length'] = sparse_history_length
     stats['input_modality'] = input_modality
     stats['visual_history_frames'] = visual_history_frames
     stats['visual_history_offsets'] = list(visual_history_offsets)

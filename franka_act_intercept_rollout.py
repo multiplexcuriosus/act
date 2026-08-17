@@ -37,7 +37,7 @@ from policy import ACTPolicy
 from sparse_ball import (
     SparsePoint, construct_causal_sparse_history,
     SPARSE_HISTORY_OFFSETS_SEC, default_sparse_topic,
-    sparse_history_offsets_frames, validate_policy_rate,
+    resolve_sparse_checkpoint_contract, sparse_history_offsets_frames, validate_policy_rate,
     validate_sparse_checkpoint_contract,
 )
 
@@ -183,23 +183,18 @@ class FrankaActRolloutNode(Node):
                 stats, self.sparse_source, self.sparse_image_width,
                 self.sparse_image_height, self.max_observation_age_sec,
             )
-            sparse_runtime_contract = {
-                "policy_rate_hz": self.policy_rate_hz,
-                "qpos_history_offsets": list(self.qpos_history_offsets),
-                "chunk_size": self.chunk_size,
-                "sparse_source": self.sparse_source,
-                "sparse_feature_dim": 4,
-                "sparse_history_length": 3,
-            }
-            for key, expected in sparse_runtime_contract.items():
-                if key not in stats:
-                    raise ValueError(f"Sparse checkpoint is missing {key}")
-                saved = stats[key].tolist() if isinstance(stats[key], np.ndarray) else stats[key]
-                if saved != expected:
-                    raise ValueError(
-                        f"Sparse checkpoint/rollout mismatch for {key}: "
-                        f"rollout={expected!r}, saved={saved!r}"
-                    )
+            sparse_runtime_contract = resolve_sparse_checkpoint_contract(
+                stats, self.policy_rate_hz, self.chunk_size, self.sparse_source,
+            )
+            self.qpos_history_offsets = tuple(
+                sparse_runtime_contract["qpos_history_offsets"]
+            )
+            inferred = sparse_runtime_contract["inferred_legacy_fields"]
+            if inferred:
+                self.get_logger().warn(
+                    "Legacy 30 Hz sparse checkpoint metadata inferred: "
+                    f"{inferred}"
+                )
             stats_arrays = {key: np.asarray(stats[key]) for key in (
                 "qpos_mean", "qpos_std", "action_mean", "action_std")}
             policy_config["sparse_mean"] = stats["sparse_mean"]

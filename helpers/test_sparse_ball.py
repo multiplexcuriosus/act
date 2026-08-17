@@ -1,5 +1,8 @@
 """Focused tests for the canonical four-feature sparse-ball contract."""
 
+import pathlib
+import pickle
+
 import numpy as np
 import pytest
 
@@ -7,7 +10,8 @@ from sparse_ball import (
     SPARSE_FEATURE_NAMES, policy_period_ns, policy_period_sec,
     SparsePoint, construct_causal_sparse_history, construct_sparse_features,
     default_sparse_topic, sparse_dataset_paths, sparse_history_offsets_frames,
-    validate_policy_rate, validate_sparse_checkpoint_contract,
+    resolve_sparse_checkpoint_contract, validate_policy_rate,
+    validate_sparse_checkpoint_contract,
 )
 
 
@@ -89,3 +93,96 @@ def test_explicit_30_60_hz_contract(rate, period_ns, offsets):
 def test_unsupported_policy_rates_are_rejected(rate):
     with pytest.raises(ValueError, match="policy rate"):
         validate_policy_rate(rate)
+
+
+def _checkpoint_contract(rate=30):
+    offsets = [-6, -3, 0] if rate == 30 else [-12, -6, 0]
+    return {
+        "policy_rate_hz": np.int64(rate),
+        "chunk_size": np.asarray(rate),
+        "qpos_history_offsets": tuple(offsets),
+        "sparse_history_offsets_frames": np.asarray(offsets),
+        "sparse_source": "rgb",
+        "sparse_feature_dim": np.int64(4),
+        "sparse_history_length": np.asarray(3),
+    }
+
+
+@pytest.mark.parametrize("rate", [30, 60])
+def test_modern_sparse_checkpoint_contract_succeeds(rate):
+    stats = _checkpoint_contract(rate)
+    resolved = resolve_sparse_checkpoint_contract(stats, rate, rate, "rgb")
+    assert resolved["policy_rate_hz"] == rate
+    assert resolved["chunk_size"] == rate
+    assert resolved["qpos_history_offsets"] == (
+        [-6, -3, 0] if rate == 30 else [-12, -6, 0]
+    )
+    assert resolved["inferred_legacy_fields"] == []
+    assert isinstance(stats["sparse_history_offsets_frames"], np.ndarray)
+
+
+def test_legacy_30hz_contract_infers_missing_and_none_fields_once():
+    stats = _checkpoint_contract()
+    missing = ["policy_rate_hz", "chunk_size", "qpos_history_offsets",
+               "sparse_history_offsets_frames"]
+    for key in missing:
+        if key == "chunk_size":
+            stats[key] = None
+        else:
+            stats.pop(key)
+    with pytest.warns(RuntimeWarning, match="Legacy 30 Hz.*metadata missing") as caught:
+        resolved = resolve_sparse_checkpoint_contract(stats, 30, 30, "rgb")
+    assert len(caught) == 1
+    assert resolved["policy_rate_hz"] == resolved["chunk_size"] == 30
+    assert resolved["qpos_history_offsets"] == [-6, -3, 0]
+    assert resolved["sparse_history_offsets_frames"] == [-6, -3, 0]
+    assert resolved["inferred_legacy_fields"] == missing
+    assert stats["chunk_size"] is None
+
+
+def test_legacy_contract_is_not_inferred_at_60hz():
+    stats = _checkpoint_contract(60)
+    for key in ("policy_rate_hz", "chunk_size", "qpos_history_offsets",
+                "sparse_history_offsets_frames"):
+        stats.pop(key)
+    with pytest.raises(ValueError, match="lacks explicit 60 Hz sparse contract metadata"):
+        resolve_sparse_checkpoint_contract(stats, 60, 60, "rgb")
+
+
+@pytest.mark.parametrize(
+    "rate,key,bad",
+    [
+        (30, "policy_rate_hz", 60), (60, "policy_rate_hz", 30),
+        (30, "chunk_size", 60), (60, "chunk_size", 30),
+        (30, "qpos_history_offsets", [-12, -6, 0]),
+        (60, "qpos_history_offsets", [-6, -3, 0]),
+        (30, "sparse_history_offsets_frames", [-12, -6, 0]),
+        (60, "sparse_history_offsets_frames", [-6, -3, 0]),
+        (30, "sparse_source", "event"),
+        (30, "sparse_feature_dim", 6),
+        (30, "sparse_history_length", 2),
+    ],
+)
+def test_sparse_checkpoint_contract_rejects_mismatches(rate, key, bad):
+    stats = _checkpoint_contract(rate)
+    stats[key] = bad
+    with pytest.raises(ValueError, match=key):
+        resolve_sparse_checkpoint_contract(stats, rate, rate, "rgb")
+
+
+def test_supplied_legacy_checkpoint_contract_smoke():
+    path = pathlib.Path(
+        "/home/jau/dyros/data/ckpts/intercept_sparse_grid_20260814_174207/"
+        "rgb/sparse_rgb_uvnorm_valid_age_hist3_30hz_lr1e-5_bs8_kl1/"
+        "dataset_stats.pkl"
+    )
+    with path.open("rb") as stream:
+        stats = pickle.load(stream)
+    with pytest.warns(RuntimeWarning, match="chunk_size"):
+        resolved = resolve_sparse_checkpoint_contract(stats, 30, 30, "rgb")
+    assert resolved["policy_rate_hz"] == 30
+    assert resolved["chunk_size"] == 30
+    assert resolved["qpos_history_offsets"] == [-6, -3, 0]
+    assert resolved["sparse_history_offsets_frames"] == [-6, -3, 0]
+    assert resolved["sparse_source"] == "rgb"
+    assert resolved["inferred_legacy_fields"] == ["chunk_size"]

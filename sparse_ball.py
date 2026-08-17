@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, Sequence
+import warnings
 
 import numpy as np
 
@@ -45,6 +46,97 @@ def sparse_history_offsets_frames(rate_hz):
     """Return the fixed-time sparse history offsets at the selected rate."""
     rate = validate_policy_rate(rate_hz)
     return tuple(int(round(offset * rate)) for offset in SPARSE_HISTORY_OFFSETS_SEC)
+
+
+def _normalize_contract_value(value):
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    elif isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (tuple, list)):
+        return [_normalize_contract_value(item) for item in value]
+    return value
+
+
+def resolve_sparse_checkpoint_contract(
+    stats, requested_policy_rate_hz, requested_chunk_size,
+    requested_sparse_source,
+):
+    """Resolve the rate-specific sparse contract without mutating checkpoint stats."""
+    rate = validate_policy_rate(requested_policy_rate_hz)
+    chunk_size = int(_normalize_contract_value(requested_chunk_size))
+    expected_offsets = list(sparse_history_offsets_frames(rate))
+    if chunk_size != rate:
+        raise ValueError(
+            "Requested sparse chunk_size does not match policy_rate_hz: "
+            f"expected={rate}, requested={chunk_size}"
+        )
+
+    rate_values = {
+        "policy_rate_hz": rate,
+        "chunk_size": chunk_size,
+        "qpos_history_offsets": expected_offsets,
+        "sparse_history_offsets_frames": expected_offsets,
+    }
+    missing = [key for key in rate_values if stats.get(key) is None]
+    if rate == 60 and missing:
+        raise ValueError(
+            "This checkpoint lacks explicit 60 Hz sparse contract metadata. "
+            "Retrain it or use a checkpoint containing policy_rate_hz, "
+            "chunk_size, and rate-specific history offsets. "
+            f"Missing fields: {missing}"
+        )
+
+    resolved = {}
+    inferred = []
+    for key, expected in rate_values.items():
+        if stats.get(key) is None:
+            resolved[key] = expected
+            inferred.append(key)
+            continue
+        saved = _normalize_contract_value(stats[key])
+        if key in ("policy_rate_hz", "chunk_size"):
+            try:
+                saved = int(saved)
+            except (TypeError, ValueError):
+                pass
+        if saved != expected:
+            raise ValueError(
+                f"Sparse checkpoint contract mismatch for {key}: "
+                f"requested={expected!r}, saved={saved!r}"
+            )
+        resolved[key] = saved
+
+    strict_values = {
+        "sparse_source": str(requested_sparse_source),
+        "sparse_feature_dim": SPARSE_FEATURE_DIM,
+        "sparse_history_length": SPARSE_HISTORY_LENGTH,
+    }
+    for key, expected in strict_values.items():
+        if stats.get(key) is None:
+            raise ValueError(f"Sparse checkpoint is missing {key}")
+        saved = _normalize_contract_value(stats[key])
+        if key != "sparse_source":
+            try:
+                saved = int(saved)
+            except (TypeError, ValueError):
+                pass
+        if saved != expected:
+            raise ValueError(
+                f"Sparse checkpoint contract mismatch for {key}: "
+                f"requested={expected!r}, saved={saved!r}"
+            )
+        resolved[key] = saved
+
+    resolved["inferred_legacy_fields"] = inferred
+    if inferred:
+        warnings.warn(
+            "[WARN] Legacy 30 Hz sparse checkpoint metadata missing "
+            f"{inferred}; inferred the legacy 30 Hz contract.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return resolved
 
 
 def default_sparse_topic(source: str) -> str:
