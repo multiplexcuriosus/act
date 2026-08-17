@@ -8,9 +8,10 @@ cd "$SCRIPT_DIR"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 DATASET_DIRS=(
-  "/home/dyros/Data/jg_data/hdf5/position_only/recording_20260728_225008_hdf5_position_only"
-  "/home/dyros/Data/jg_data/hdf5/position_only/recording_20260727_215525_hdf5_position_only"
+  "/home/dyros/Data/jg_data/hdf5/position_only_fast_event/recording_20260814_145026_position_only_fast_event_hdf5/"
+  "/home/dyros/Data/jg_data/hdf5/position_only_fast_event/recording_20260814_165217_position_only_fast_event_hdf5/"
 )
+
 
 for DATASET_DIR in "${DATASET_DIRS[@]}"; do
   if [[ ! -d "$DATASET_DIR" ]]; then
@@ -25,7 +26,7 @@ mkdir -p "$RUN_ROOT"
 cp -- "$SCRIPT_PATH" "$RUN_ROOT/grid_train_sparse_ball_intercept.sh"
 
 for POLICY_RATE_HZ in 30 60; do
-for SPARSE_SOURCE in event; do
+for SPARSE_SOURCE in rgb event; do
   for LR in 1e-5; do
     for BS in 8; do
       for KL in 1; do
