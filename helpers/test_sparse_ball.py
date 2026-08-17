@@ -7,7 +7,7 @@ from sparse_ball import (
     SPARSE_FEATURE_NAMES, policy_period_ns, policy_period_sec,
     SparsePoint, construct_causal_sparse_history, construct_sparse_features,
     default_sparse_topic, sparse_dataset_paths, sparse_history_offsets_frames,
-    validate_sparse_checkpoint_contract,
+    validate_policy_rate, validate_sparse_checkpoint_contract,
 )
 
 
@@ -83,3 +83,9 @@ def test_explicit_30_60_hz_contract(rate, period_ns, offsets):
     assert SPARSE_FEATURE_NAMES == (
         "u_norm", "v_norm", "valid", "observation_age_sec"
     )
+
+
+@pytest.mark.parametrize("rate", [0, 29, 31, 120, 30.5])
+def test_unsupported_policy_rates_are_rejected(rate):
+    with pytest.raises(ValueError, match="policy rate"):
+        validate_policy_rate(rate)

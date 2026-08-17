@@ -40,7 +40,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from sparse_ball import (
-    construct_sparse_features, policy_period_ns,
+    SPARSE_HISTORY_OFFSETS_SEC, construct_sparse_features, policy_period_ns,
+    sparse_history_offsets_frames, validate_policy_rate,
 )
 
 
@@ -1217,6 +1218,29 @@ def dataset_kwargs(compression: str) -> Dict[str, Any]:
     return {"compression": "lzf"}
 
 
+def validate_policy_grid_metadata(h5, requested_fps: float, path: str = "output") -> float:
+    """Validate that converter metadata and timestamps describe the requested grid."""
+    requested_rate = int(requested_fps)
+    if float(requested_fps) != requested_rate or requested_rate <= 0:
+        raise RuntimeError(f"{path}: requested FPS must be a positive integer")
+    metadata_rate = int(h5.attrs.get("policy_rate_hz", requested_rate))
+    timestamps = np.asarray(h5["/observations/timestamps"][()], dtype=np.float64)
+    if timestamps.size < 2:
+        raise RuntimeError(f"{path}: need at least two policy timestamps to validate cadence")
+    median_period = float(np.median(np.diff(timestamps)))
+    expected_period = 1.0 / requested_rate
+    metadata_period = float(h5.attrs.get("policy_period_ns", 0)) * 1e-9
+    if metadata_rate != requested_rate or not np.isclose(
+        metadata_period, expected_period, rtol=0.0, atol=1e-9
+    ) or not np.isclose(median_period, expected_period, rtol=0.02, atol=1e-6):
+        raise RuntimeError(
+            f"{path}: output policy-grid mismatch: requested={requested_rate} Hz "
+            f"({expected_period:.9f}s), metadata={metadata_rate} Hz/"
+            f"{metadata_period:.9f}s, timestamp median={median_period:.9f}s"
+        )
+    return median_period
+
+
 def write_episode(
     output_path: str,
     arrays: Dict[str, np.ndarray],
@@ -1262,6 +1286,17 @@ def write_episode(
                 if int(fps) in (30, 60)
                 else int(round(1_000_000_000 / float(fps)))
             )
+            if sparse_source is not None:
+                sparse_offsets = sparse_history_offsets_frames(fps)
+                h5.attrs["chunk_size"] = int(fps)
+                h5.attrs["qpos_history_frames"] = len(sparse_offsets)
+                h5.attrs["qpos_history_offsets"] = np.asarray(
+                    sparse_offsets, dtype=np.int32
+                )
+                h5.attrs["sparse_history_offsets_sec"] = np.asarray(
+                    SPARSE_HISTORY_OFFSETS_SEC, dtype=np.float64
+                )
+                h5.attrs["sparse_history_length"] = len(sparse_offsets)
             h5.attrs["episode_index"] = int(episode.output_idx)
             h5.attrs["source_episode_index"] = int(episode.source_idx)
             h5.attrs["episode_start"] = float(episode.start)
@@ -1518,13 +1553,18 @@ def write_episode(
                 "points", data=arrays["target_base_points"], dtype=np.float32
             )
 
+            median_period = validate_policy_grid_metadata(h5, fps, temporary_path)
+
         os.replace(temporary_path, output_path)
     except Exception:
         if os.path.exists(temporary_path):
             os.unlink(temporary_path)
         raise
 
-    log(f"[INFO] wrote {output_path}")
+    log(
+        f"[INFO] wrote {output_path}: policy_rate_hz={int(fps)}, "
+        f"median_policy_period_sec={median_period:.9f}"
+    )
 
 
 def resolve_input_paths(
@@ -1739,6 +1779,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     conversion_start_wall = time.perf_counter()
     args = parse_args()
+    selected_rate = validate_policy_rate(args.fps)
+    log(
+        f"[INFO] selected policy grid: fps={selected_rate}, "
+        f"policy_period_sec={1.0 / selected_rate:.9f}, "
+        f"policy_period_ns={policy_period_ns(selected_rate)}"
+    )
     # Preserve compatibility with programmatic callers/tests that provide a
     # pre-XYT argparse namespace.
     for name, default in (

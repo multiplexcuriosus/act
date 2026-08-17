@@ -25,7 +25,8 @@ from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from utils import INTERCEPT_HISTORY_OFFSETS_DEFAULT
 from policy import ACTPolicy, ACTTaskPolicy, CNNMLPPolicy
 from sparse_ball import (
-    policy_period_ns, policy_period_sec, sparse_history_offsets_frames,
+    SPARSE_HISTORY_OFFSETS_SEC, policy_period_ns, policy_period_sec,
+    sparse_history_offsets_frames,
     validate_policy_rate, validate_sparse_checkpoint_contract,
 )
 from visualize_episodes import save_videos
@@ -428,6 +429,16 @@ def main(args):
     sparse_history_length = int(args.get('sparse_history_length', 3))
     max_observation_age_sec = float(args.get('max_observation_age_sec', 0.10))
     policy_rate_hz = validate_policy_rate(args.get('policy_rate_hz', 30))
+    qpos_history_offsets = (
+        sparse_history_offsets_frames(policy_rate_hz)
+        if input_modality == 'sparse_ball'
+        else INTERCEPT_HISTORY_OFFSETS_DEFAULT
+    )
+    if data_mode == 'intercept' and int(args['chunk_size']) != policy_rate_hz:
+        raise ValueError(
+            f"Interception uses a one-second action horizon: policy_rate_hz="
+            f"{policy_rate_hz} requires chunk_size={policy_rate_hz}, got {args['chunk_size']}"
+        )
     if input_modality == 'sparse_ball':
         if sparse_source not in ('rgb', 'event'):
             raise ValueError('--sparse_source rgb|event is required for sparse_ball')
@@ -581,6 +592,7 @@ def main(args):
                          'max_observation_age_sec': max_observation_age_sec,
                          'policy_rate_hz': policy_rate_hz,
                          'policy_period_sec': policy_period_sec(policy_rate_hz),
+                         'qpos_history_offsets': list(qpos_history_offsets),
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -729,11 +741,8 @@ def main(args):
             image_size=image_size,
             rgb_history_frames=rgb_history_frames,
             visual_history_frames=visual_history_frames,
-            history_offsets=(
-                sparse_history_offsets_frames(policy_rate_hz)
-                if input_modality == 'sparse_ball'
-                else INTERCEPT_HISTORY_OFFSETS_DEFAULT
-            ),
+            history_offsets=qpos_history_offsets,
+            policy_rate_hz=policy_rate_hz,
             input_modality=input_modality,
             sparse_source=sparse_source,
             sparse_feature_dim=sparse_feature_dim,
@@ -783,6 +792,9 @@ def main(args):
     stats['policy_rate_hz'] = policy_rate_hz
     stats['policy_period_ns'] = policy_period_ns(policy_rate_hz)
     stats['policy_period_sec'] = policy_period_sec(policy_rate_hz)
+    stats['chunk_size'] = int(args['chunk_size'])
+    stats['sparse_history_offsets_sec'] = list(SPARSE_HISTORY_OFFSETS_SEC)
+    stats['sparse_history_length'] = sparse_history_length
     if input_modality == 'sparse_ball':
         stats['sparse_history_offsets_frames'] = list(
             sparse_history_offsets_frames(policy_rate_hz)
@@ -803,8 +815,8 @@ def main(args):
         stats['raw_qpos_dim'] = 7
         stats['state_dim'] = 21
         stats['action_dim'] = 1
-        stats['qpos_history_frames'] = 3
-        stats['qpos_history_offsets'] = list(INTERCEPT_HISTORY_OFFSETS_DEFAULT)
+        stats['qpos_history_frames'] = len(qpos_history_offsets)
+        stats['qpos_history_offsets'] = list(qpos_history_offsets)
         stats['qpos_flatten_order'] = 'oldest_to_newest'
         stats['action_type'] = 'measured_tcp_s_delta'
         stats['action_representation'] = 'future_delta_relative_to_anchor'

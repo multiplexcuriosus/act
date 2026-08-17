@@ -129,6 +129,22 @@ class InterceptRolloutContractTests(unittest.TestCase):
         self.assertAlmostEqual(sync.anchor_tcp_s, 0.25)
         self.assertAlmostEqual(sync.anchor_tcp_s_timestamp, 1.59)
 
+    def test_sparse_qpos_history_indices_follow_policy_rate(self):
+        for rate, offsets, expected in (
+            (30, (-6, -3, 0), (14, 17, 20)),
+            (60, (-12, -6, 0), (8, 14, 20)),
+        ):
+            timestamps = [index / rate for index in range(21)]
+            qpos = [np.full(7, index, dtype=np.float32) for index in range(21)]
+            sync = select_sync_observation(
+                timestamps, timestamps, qpos, timestamps, timestamps,
+                history_offsets=offsets,
+            )
+            self.assertEqual(sync.history_indices, expected)
+            np.testing.assert_array_equal(
+                sync.qpos_history.reshape(3, 7)[:, 0], expected
+            )
+
     def test_chunk_denormalization(self):
         norm = np.asarray([0.0, 1.0, -1.0], dtype=np.float32)
         out = denormalize_delta_chunk(

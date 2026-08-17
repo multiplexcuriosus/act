@@ -36,7 +36,9 @@ from intercept_rollout_contract import (
 from policy import ACTPolicy
 from sparse_ball import (
     SparsePoint, construct_causal_sparse_history,
-    default_sparse_topic, validate_sparse_checkpoint_contract,
+    SPARSE_HISTORY_OFFSETS_SEC, default_sparse_topic,
+    sparse_history_offsets_frames, validate_policy_rate,
+    validate_sparse_checkpoint_contract,
 )
 
 
@@ -69,7 +71,8 @@ class FrankaActRolloutNode(Node):
         self.temporal_agg_reset_service = args.temporal_agg_reset_service
         self.publish_current_scalar = bool(args.publish_current_scalar)
 
-        self.fps = args.fps
+        self.policy_rate_hz = validate_policy_rate(args.policy_rate_hz)
+        self.fps = float(args.fps)
         if self.fps <= 0.0:
             raise ValueError(f"fps must be > 0, got {self.fps}")
         self.temporal_agg_mode = str(args.temporal_agg_mode)
@@ -82,6 +85,10 @@ class FrankaActRolloutNode(Node):
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
         self.input_modality = str(args.input_modality)
+        self.qpos_history_offsets = (
+            sparse_history_offsets_frames(self.policy_rate_hz)
+            if self.input_modality == "sparse_ball" else (-6, -3, 0)
+        )
         self.sparse_source = args.sparse_source
         self.sparse_topic = args.sparse_topic or default_sparse_topic(self.sparse_source)
         self.event_spatial_preprocessing = args.event_spatial_preprocessing
@@ -142,7 +149,11 @@ class FrankaActRolloutNode(Node):
             "use_bce_last_action_dim": args.use_bce_last_action_dim,
             "rgb_history_frames": args.rgb_history_frames,
             "visual_history_frames": args.rgb_history_frames,
-            "visual_history_offsets": [-6, -3, 0],
+            "visual_history_offsets": list(
+                self.qpos_history_offsets
+                if self.input_modality == "sparse_ball" else (-6, -3, 0)
+            ),
+            "qpos_history_offsets": list(self.qpos_history_offsets),
             "channels_per_visual_frame": 0 if self.input_modality == "sparse_ball" else 3,
             "visual_frame_order": "oldest_to_newest",
             "image_normalization": (
@@ -156,6 +167,7 @@ class FrankaActRolloutNode(Node):
             "sparse_feature_dim": 4,
             "sparse_history_length": 3,
             "max_observation_age_sec": self.max_observation_age_sec,
+            "policy_rate_hz": self.policy_rate_hz,
         }
 
         ckpt_path = os.path.join(args.ckpt_dir, args.ckpt_name)
@@ -171,6 +183,23 @@ class FrankaActRolloutNode(Node):
                 stats, self.sparse_source, self.sparse_image_width,
                 self.sparse_image_height, self.max_observation_age_sec,
             )
+            sparse_runtime_contract = {
+                "policy_rate_hz": self.policy_rate_hz,
+                "qpos_history_offsets": list(self.qpos_history_offsets),
+                "chunk_size": self.chunk_size,
+                "sparse_source": self.sparse_source,
+                "sparse_feature_dim": 4,
+                "sparse_history_length": 3,
+            }
+            for key, expected in sparse_runtime_contract.items():
+                if key not in stats:
+                    raise ValueError(f"Sparse checkpoint is missing {key}")
+                saved = stats[key].tolist() if isinstance(stats[key], np.ndarray) else stats[key]
+                if saved != expected:
+                    raise ValueError(
+                        f"Sparse checkpoint/rollout mismatch for {key}: "
+                        f"rollout={expected!r}, saved={saved!r}"
+                    )
             stats_arrays = {key: np.asarray(stats[key]) for key in (
                 "qpos_mean", "qpos_std", "action_mean", "action_std")}
             policy_config["sparse_mean"] = stats["sparse_mean"]
@@ -445,6 +474,7 @@ class FrankaActRolloutNode(Node):
             joint_qpos_samples=joint_qpos,
             tcp_timestamps=tcp_timestamps,
             tcp_values=tcp_values,
+            history_offsets=self.qpos_history_offsets,
         )
 
         selected_visual_msgs = [visual_messages[index] for index in sync.history_indices]
@@ -454,7 +484,7 @@ class FrankaActRolloutNode(Node):
                 for msg in visual_messages
             ]
             image_np = construct_causal_sparse_history(
-                sparse_points, sync.visual_timestamps[-1], (-0.2, -0.1, 0.0),
+                sparse_points, sync.visual_timestamps[-1], SPARSE_HISTORY_OFFSETS_SEC,
                 self.sparse_image_width, self.sparse_image_height,
                 self.max_observation_age_sec,
             )[None, ...]
@@ -729,7 +759,8 @@ def main():
     parser.add_argument("--no_publish_current_scalar", action="store_false", dest="publish_current_scalar")
     parser.set_defaults(publish_current_scalar=True)
 
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--policy_rate_hz", type=int, choices=[30, 60], default=30)
+    parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--max_source_buffer", type=int, default=256)
     parser.add_argument("--max_observation_age_sec", type=float, default=None)
     parser.add_argument("--max_anchor_age_sec", type=float, default=0.10)
@@ -738,7 +769,7 @@ def main():
 
     parser.add_argument("--state_dim", type=int, default=21)
     parser.add_argument("--action_dim", type=int, default=1)
-    parser.add_argument("--chunk_size", type=int, default=30)
+    parser.add_argument("--chunk_size", type=int, default=None)
     parser.add_argument("--rgb_history_frames", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=320)
     parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb", "event"])
@@ -802,6 +833,16 @@ def main():
     parser.set_defaults(use_bce_last_action_dim=False)
 
     args = parser.parse_args()
+    args.policy_rate_hz = validate_policy_rate(args.policy_rate_hz)
+    if args.fps is None:
+        args.fps = float(args.policy_rate_hz)
+    if not np.isclose(float(args.fps), float(args.policy_rate_hz), atol=1e-9):
+        parser.error(
+            f"--fps {args.fps} disagrees with --policy_rate_hz {args.policy_rate_hz}; "
+            "only matched 30 Hz and 60 Hz configurations are supported"
+        )
+    if args.chunk_size is None:
+        args.chunk_size = args.policy_rate_hz
     if args.input_modality is None:
         args.input_modality = args.camera_name
     if args.max_observation_age_sec is None:
@@ -834,8 +875,11 @@ def main():
         raise ValueError(f"Interception rollout requires --state_dim 21, got {args.state_dim}")
     if int(args.action_dim) != 1:
         raise ValueError(f"Interception rollout requires --action_dim 1, got {args.action_dim}")
-    if int(args.chunk_size) != 30:
-        raise ValueError(f"Interception rollout requires --chunk_size 30, got {args.chunk_size}")
+    if int(args.chunk_size) != int(args.policy_rate_hz):
+        raise ValueError(
+            f"Interception rollout at {args.policy_rate_hz} Hz requires "
+            f"--chunk_size {args.policy_rate_hz}, got {args.chunk_size}"
+        )
     if int(args.rgb_history_frames) != 3:
         raise ValueError(
             f"Interception rollout requires --rgb_history_frames 3, got {args.rgb_history_frames}"

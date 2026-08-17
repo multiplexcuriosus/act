@@ -12,6 +12,7 @@ from sparse_ball import (
     SPARSE_FEATURE_DIM, SPARSE_FEATURE_NAMES, SPARSE_HISTORY_LENGTH,
     SPARSE_HISTORY_OFFSETS, SPARSE_HISTORY_OFFSETS_SEC, SPARSE_SOURCE_TIMESTAMP_POLICY,
     construct_sparse_features, sparse_dataset_paths,
+    sparse_history_offsets_frames, validate_policy_rate,
 )
 
 import IPython
@@ -1718,6 +1719,7 @@ def load_intercept_data(
     sparse_feature_dim=SPARSE_FEATURE_DIM,
     sparse_history_length=SPARSE_HISTORY_LENGTH,
     max_observation_age_sec=0.10,
+    policy_rate_hz=30,
 ):
     del split_num_trials  # currently unused in interception loader
 
@@ -1746,10 +1748,18 @@ def load_intercept_data(
     if int(action_dim) != 1:
         raise ValueError(f"Interception action_dim must be 1, got {action_dim}")
 
+    policy_rate_hz = validate_policy_rate(policy_rate_hz)
     history_offsets = tuple(int(offset) for offset in history_offsets)
-    if history_offsets != INTERCEPT_HISTORY_OFFSETS_DEFAULT:
+    expected_history_offsets = (
+        sparse_history_offsets_frames(policy_rate_hz)
+        if input_modality == 'sparse_ball'
+        else INTERCEPT_HISTORY_OFFSETS_DEFAULT
+    )
+    if history_offsets != expected_history_offsets:
         raise ValueError(
-            f"Interception history_offsets must be {INTERCEPT_HISTORY_OFFSETS_DEFAULT}, got {history_offsets}"
+            "Interception history offset mismatch: "
+            f"modality={input_modality}, policy_rate_hz={policy_rate_hz}, "
+            f"expected={expected_history_offsets}, received={history_offsets}"
         )
 
     episode_paths = collect_episode_paths(dataset_dirs)
@@ -1775,12 +1785,33 @@ def load_intercept_data(
     expected_event_metadata = None
     for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
+            if 'policy_rate_hz' in root.attrs:
+                stored_rate = validate_policy_rate(root.attrs['policy_rate_hz'])
+                if stored_rate != policy_rate_hz:
+                    raise ValueError(
+                        f"Policy-rate mismatch in {dataset_path}: requested {policy_rate_hz} Hz "
+                        f"but HDF5 metadata declares {stored_rate} Hz. Regenerate the dataset "
+                        "with helpers/bag_to_il_intercept.py."
+                    )
             _, _, event_metadata = _validate_intercept_episode_structure(
                 root,
                 dataset_path,
                 modality=input_modality,
                 expected_event_metadata=expected_event_metadata,
             )
+            timestamps = np.asarray(root['/observations/timestamps'][()], dtype=np.float64)
+            median_period = float(np.median(np.diff(timestamps)))
+            expected_period = 1.0 / policy_rate_hz
+            if not np.isfinite(median_period) or not np.isclose(
+                median_period, expected_period, rtol=0.08, atol=5e-4
+            ):
+                inferred_rate = 1.0 / median_period if median_period > 0 else float('nan')
+                raise ValueError(
+                    f"Policy-rate mismatch in {dataset_path}: requested {policy_rate_hz} Hz "
+                    f"(period {expected_period:.9f}s), but the HDF5 timestamp grid has median "
+                    f"period {median_period:.9f}s (~{inferred_rate:.3f} Hz). Regenerate the "
+                    "dataset with helpers/bag_to_il_intercept.py."
+                )
             if input_modality == 'event' and expected_event_metadata is None:
                 expected_event_metadata = event_metadata
             if input_modality == 'sparse_ball':
