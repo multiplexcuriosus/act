@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from sparse_ball import (SPARSE_FEATURE_NAMES, rate_contract,
+from sparse_ball import (SPARSE_FEATURE_NAMES, SPARSE_FEATURE_NAME_ALIASES, rate_contract,
                          validate_policy_rate,
                          validate_sparse_checkpoint_contract)
 
@@ -353,6 +353,14 @@ def validate_intercept_stats_and_config(
         expected_metadata["rgb_history_offsets"] = list(runtime_offsets)
         expected_metadata["qpos_history_offsets"] = list(runtime_offsets)
     if modality == "sparse_ball":
+        # Older checkpoints used shorter labels for the same four values.
+        # Canonicalize labels only; feature count and ordering remain strict.
+        if "sparse_feature_names" in stats:
+            stats = dict(stats)
+            stats["sparse_feature_names"] = [
+                SPARSE_FEATURE_NAME_ALIASES.get(name, name)
+                for name in stats["sparse_feature_names"]
+            ]
         expected_metadata.pop("rgb_history_frames")
         expected_metadata.pop("rgb_history_offsets")
         expected_metadata.pop("rgb_frame_order")

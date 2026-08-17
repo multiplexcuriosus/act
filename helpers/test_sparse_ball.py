@@ -126,6 +126,19 @@ def test_four_feature_checkpoint_loads_and_six_feature_or_source_mismatch_reject
         validate_intercept_stats_and_config(_sparse_stats("event"), config, 30, runtime)
 
 
+def test_compact_sparse_feature_name_aliases_load_but_wrong_order_is_rejected():
+    config = _model_config()
+    runtime = {"sparse_source": "rgb", "max_observation_age_sec": .1,
+               "image_width": 1280, "image_height": 720}
+    stats = _sparse_stats()
+    stats["sparse_feature_names"] = ["u_norm", "v_norm", "valid", "observation_age_sec"]
+    validate_intercept_stats_and_config(stats, config, 30, runtime)
+
+    stats["sparse_feature_names"] = ["v_norm", "u_norm", "valid", "observation_age_sec"]
+    with pytest.raises(ValueError, match="sparse_feature_names"):
+        validate_intercept_stats_and_config(stats, config, 30, runtime)
+
+
 @pytest.mark.parametrize(
     "rate,offsets,chunk,period",
     [(30, (-6, -3, 0), 30, 1 / 30), (60, (-12, -6, 0), 60, 1 / 60)],

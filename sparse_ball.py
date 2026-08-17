@@ -16,6 +16,11 @@ SPARSE_HISTORY_LENGTH = 3
 SPARSE_FEATURE_NAMES = (
     "u_normalized", "v_normalized", "valid", "observation_age_seconds"
 )
+SPARSE_FEATURE_NAME_ALIASES = {
+    "u_norm": "u_normalized",
+    "v_norm": "v_normalized",
+    "observation_age_sec": "observation_age_seconds",
+}
 # Compatibility names used by the current dataset loader; values remain the
 # exact db535494 four-feature contract.
 SPARSE_BALL_FEATURE_DIM = SPARSE_FEATURE_DIM
@@ -216,11 +221,15 @@ def validate_sparse_checkpoint_contract(
             "Sparse checkpoint contract mismatch for max observation age: "
             f"configured={max_observation_age_sec}, saved={saved_age}"
         )
-    if list(stats.get("sparse_feature_names", ())) != list(SPARSE_FEATURE_NAMES):
+    saved_feature_names = list(stats.get("sparse_feature_names", ()))
+    canonical_saved_feature_names = [
+        SPARSE_FEATURE_NAME_ALIASES.get(name, name) for name in saved_feature_names
+    ]
+    if canonical_saved_feature_names != list(SPARSE_FEATURE_NAMES):
         raise ValueError(
             "Sparse checkpoint contract mismatch for sparse_feature_names: "
             f"expected={list(SPARSE_FEATURE_NAMES)!r}, "
-            f"saved={stats.get('sparse_feature_names')!r}"
+            f"saved={saved_feature_names!r}"
         )
     if policy_rate_hz is not None:
         rate = validate_policy_rate(policy_rate_hz)
