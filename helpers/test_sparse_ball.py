@@ -51,6 +51,20 @@ def test_causal_history_never_selects_future_point():
     assert np.all(history[:, 2] == 1)
 
 
+def test_repeated_policy_ticks_reuse_source_and_increase_age():
+    points = [SparsePoint(0.95, 30, 40)]
+    first = construct_causal_sparse_history(
+        points, 1.00, (0.0,), 320, 320, 0.20,
+    )
+    second = construct_causal_sparse_history(
+        points, 1.05, (0.0,), 320, 320, 0.20,
+    )
+    assert first[0, 2] == second[0, 2] == 1
+    assert first[0, 3] == pytest.approx(0.05)
+    assert second[0, 3] == pytest.approx(0.10)
+    np.testing.assert_allclose(first[0, :2], second[0, :2])
+
+
 def test_source_paths_and_checkpoint_contract_are_source_specific():
     assert default_sparse_topic("rgb") == "/ball_tracker2/ball_2d_px"
     assert default_sparse_topic("event") == "/openmv_cam/event_tracker/ball_2d_px"
@@ -77,16 +91,18 @@ def test_source_paths_and_checkpoint_contract_are_source_specific():
 
 
 @pytest.mark.parametrize(
-    "rate,period_ns,offsets", [(30, 33333333, (-6, -3, 0)),
-                               (60, 16666667, (-12, -6, 0))],
+    "rate,period_ns,offsets,chunk_size",
+    [(30, 33333333, (-6, -3, 0), 30),
+     (60, 16666667, (-12, -6, 0), 60)],
 )
-def test_explicit_30_60_hz_contract(rate, period_ns, offsets):
+def test_explicit_30_60_hz_contract(rate, period_ns, offsets, chunk_size):
     assert policy_period_ns(rate) == period_ns
     assert policy_period_sec(rate) == pytest.approx(1.0 / rate)
     assert sparse_history_offsets_frames(rate) == offsets
     assert SPARSE_FEATURE_NAMES == (
         "u_norm", "v_norm", "valid", "observation_age_sec"
     )
+    assert chunk_size == rate  # one policy-second action chunk
 
 
 @pytest.mark.parametrize("rate", [0, 29, 31, 120, 30.5])

@@ -29,6 +29,8 @@ from intercept_rollout_contract import (  # noqa: E402
     resolve_event_spatial_preprocessing,
     resolve_temporal_agg_mode,
     select_sync_observation,
+    select_qpos_history_at_targets,
+    skip_duplicate_source_frame,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
 )
@@ -144,6 +146,21 @@ class InterceptRolloutContractTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 sync.qpos_history.reshape(3, 7)[:, 0], expected
             )
+
+    def test_sparse_policy_targets_select_only_causal_qpos(self):
+        timestamps = [0.79, 0.81, 0.89, 0.91, 0.99, 1.01]
+        samples = [np.full(7, index, dtype=np.float32)
+                   for index in range(len(timestamps))]
+        history, selected = select_qpos_history_at_targets(
+            timestamps, samples, (0.8, 0.9, 1.0),
+        )
+        self.assertEqual(selected, (0.79, 0.89, 0.99))
+        np.testing.assert_array_equal(history.reshape(3, 7)[:, 0], [0, 2, 4])
+
+    def test_duplicate_source_policy_is_modality_specific(self):
+        self.assertFalse(skip_duplicate_source_frame("sparse_ball"))
+        self.assertTrue(skip_duplicate_source_frame("rgb"))
+        self.assertTrue(skip_duplicate_source_frame("event"))
 
     def test_chunk_denormalization(self):
         norm = np.asarray([0.0, 1.0, -1.0], dtype=np.float32)
