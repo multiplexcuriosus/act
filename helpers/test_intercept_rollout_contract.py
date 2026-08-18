@@ -33,6 +33,7 @@ from intercept_rollout_contract import (  # noqa: E402
     skip_duplicate_source_frame,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
+    validate_normalization_stats,
 )
 from image_preprocessing import (  # noqa: E402
     mask_and_center_crop_square_rotated_event_image,
@@ -182,6 +183,19 @@ class InterceptRolloutContractTests(unittest.TestCase):
         config["use_bce_last_action_dim"] = True
         with self.assertRaises(ValueError):
             validate_intercept_stats_and_config(stats, config, expected_chunk_size=30)
+
+    def test_common_normalization_validation_is_shared_and_strict(self):
+        stats = self.make_stats("rgb")
+        arrays = validate_normalization_stats(stats)
+        self.assertEqual(arrays["qpos_mean"].shape, (21,))
+        self.assertEqual(arrays["action_std"].shape, (1,))
+
+        for key in ("qpos_mean", "qpos_std", "action_mean", "action_std"):
+            with self.subTest(missing=key):
+                invalid = dict(stats)
+                invalid.pop(key)
+                with self.assertRaisesRegex(ValueError, key):
+                    validate_normalization_stats(invalid)
 
     def test_stale_anchor_rejected(self):
         with self.assertRaises(ValueError):

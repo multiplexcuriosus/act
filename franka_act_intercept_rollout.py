@@ -35,12 +35,13 @@ from intercept_rollout_contract import (
     skip_duplicate_source_frame,
     validate_anchor_freshness,
     validate_intercept_stats_and_config,
+    validate_normalization_stats,
 )
 from policy import ACTPolicy
 from rollout_latency_trace import RolloutLatencyTracer, resolve_latency_trace_cuda_sync
 from sparse_ball import (
     SparsePoint, construct_causal_sparse_history,
-    SPARSE_HISTORY_OFFSETS_SEC, default_sparse_topic,
+    SPARSE_HISTORY_OFFSETS_SEC, resolve_sparse_topic,
     resolve_sparse_checkpoint_contract, sparse_history_offsets_frames, validate_policy_rate,
     validate_sparse_checkpoint_contract,
 )
@@ -95,7 +96,7 @@ class FrankaActRolloutNode(Node):
             if self.input_modality == "sparse_ball" else (-6, -3, 0)
         )
         self.sparse_source = args.sparse_source
-        self.sparse_topic = args.sparse_topic or default_sparse_topic(self.sparse_source)
+        self.sparse_topic = resolve_sparse_topic(self.sparse_source, args.sparse_topic)
         self.event_spatial_preprocessing = args.event_spatial_preprocessing
         self._event_spatial_shape_trace_logged = False
         self.image_channels = 0 if self.input_modality == "sparse_ball" else 9
@@ -203,10 +204,9 @@ class FrankaActRolloutNode(Node):
                     "Legacy 30 Hz sparse checkpoint metadata inferred: "
                     f"{inferred}"
                 )
-            stats_arrays = {key: np.asarray(stats[key]) for key in (
-                "qpos_mean", "qpos_std", "action_mean", "action_std")}
-            policy_config["sparse_mean"] = stats["sparse_mean"]
-            policy_config["sparse_std"] = stats["sparse_std"]
+            stats_arrays = validate_normalization_stats(stats, include_sparse=True)
+            policy_config["sparse_mean"] = stats_arrays["sparse_mean"]
+            policy_config["sparse_std"] = stats_arrays["sparse_std"]
         else:
             stats_arrays = validate_intercept_stats_and_config(
                 stats=stats, policy_config=policy_config,

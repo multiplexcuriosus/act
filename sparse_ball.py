@@ -148,6 +148,23 @@ def default_sparse_topic(source: str) -> str:
     raise ValueError(f"sparse_source must be 'rgb' or 'event', got {source!r}")
 
 
+def resolve_sparse_topic(source: str, requested_topic=None) -> str:
+    """Resolve defaults while rejecting the opposite source's canonical topic."""
+    default_topic = default_sparse_topic(source)
+    if requested_topic is None or str(requested_topic) == "":
+        return default_topic
+    topic = str(requested_topic)
+    conflicting_topic = (
+        DEFAULT_EVENT_SPARSE_TOPIC if source == "rgb" else DEFAULT_RGB_SPARSE_TOPIC
+    )
+    if topic == conflicting_topic:
+        raise ValueError(
+            "Sparse source/topic mismatch: "
+            f"selected source={source!r} conflicts with topic={topic!r}"
+        )
+    return topic
+
+
 def sparse_dataset_paths(source: str):
     """Return canonical raw HDF5 paths for a sparse source."""
     if source not in ("rgb", "event"):

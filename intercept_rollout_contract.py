@@ -574,6 +574,42 @@ def _stats_modality(stats: Dict[str, object]) -> Optional[str]:
     return None
 
 
+def validate_normalization_stats(
+    stats: Dict[str, object],
+    *,
+    include_sparse: bool = False,
+) -> Dict[str, np.ndarray]:
+    """Validate normalization arrays shared by dense and sparse rollouts."""
+    expected = [
+        ("qpos_mean", (21,), False),
+        ("qpos_std", (21,), True),
+        ("action_mean", (1,), False),
+        ("action_std", (1,), True),
+    ]
+    if include_sparse:
+        expected.extend((
+            ("sparse_mean", (4,), False),
+            ("sparse_std", (4,), True),
+        ))
+
+    arrays: Dict[str, np.ndarray] = {}
+    for stat_key, expected_shape, strictly_positive in expected:
+        if stat_key not in stats:
+            raise ValueError(f"Missing required stats key: {stat_key}")
+        arr = np.asarray(stats[stat_key], dtype=np.float32)
+        if arr.shape != expected_shape:
+            raise ValueError(
+                f"Stats shape mismatch for {stat_key}: "
+                f"expected {expected_shape}, got {arr.shape}"
+            )
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"Stats {stat_key} contains non-finite values")
+        if strictly_positive and np.any(arr <= 0.0):
+            raise ValueError(f"{stat_key} must be strictly positive")
+        arrays[stat_key] = arr
+    return arrays
+
+
 def validate_intercept_stats_and_config(
     stats: Dict[str, object],
     policy_config: Dict[str, object],
@@ -661,30 +697,7 @@ def validate_intercept_stats_and_config(
             f"expected {expected_offsets}, found {policy_config.get('visual_history_offsets')}"
         )
 
-    arrays: Dict[str, np.ndarray] = {}
-    for stat_key, expected_shape in (
-        ("qpos_mean", (21,)),
-        ("qpos_std", (21,)),
-        ("action_mean", (1,)),
-        ("action_std", (1,)),
-    ):
-        if stat_key not in stats:
-            raise ValueError(f"Missing required stats key: {stat_key}")
-        arr = np.asarray(stats[stat_key], dtype=np.float32).reshape(-1)
-        if arr.shape != expected_shape:
-            raise ValueError(
-                f"Stats shape mismatch for {stat_key}: expected {expected_shape}, got {arr.shape}"
-            )
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f"Stats {stat_key} contains non-finite values")
-        arrays[stat_key] = arr
-
-    if np.any(arrays["qpos_std"] <= 0.0):
-        raise ValueError("qpos_std must be strictly positive")
-    if np.any(arrays["action_std"] <= 0.0):
-        raise ValueError("action_std must be strictly positive")
-
-    return arrays
+    return validate_normalization_stats(stats)
 
 
 def denormalize_delta_chunk(

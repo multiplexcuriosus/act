@@ -10,9 +10,10 @@ from sparse_ball import (
     SPARSE_FEATURE_NAMES, policy_period_ns, policy_period_sec,
     SparsePoint, construct_causal_sparse_history, construct_sparse_features,
     default_sparse_topic, sparse_dataset_paths, sparse_history_offsets_frames,
-    resolve_sparse_checkpoint_contract, validate_policy_rate,
+    resolve_sparse_checkpoint_contract, resolve_sparse_topic, validate_policy_rate,
     validate_sparse_checkpoint_contract,
 )
+from intercept_rollout_contract import validate_normalization_stats
 
 
 @pytest.mark.parametrize("width,height", [(1280, 720), (320, 320)])
@@ -88,6 +89,83 @@ def test_source_paths_and_checkpoint_contract_are_source_specific():
         validate_sparse_checkpoint_contract(
             {**stats, "sparse_feature_dim": 6}, "rgb", 1280, 720, 0.10
         )
+
+
+def test_sparse_topic_defaults_mismatches_and_custom_override():
+    assert resolve_sparse_topic("rgb", None) == "/ball_tracker2/ball_2d_px"
+    assert resolve_sparse_topic("event", None) == "/openmv_cam/event_tracker/ball_2d_px"
+    with pytest.raises(ValueError, match=r"source='rgb'.*event_tracker"):
+        resolve_sparse_topic("rgb", "/openmv_cam/event_tracker/ball_2d_px")
+    with pytest.raises(ValueError, match=r"source='event'.*ball_tracker2"):
+        resolve_sparse_topic("event", "/ball_tracker2/ball_2d_px")
+    assert resolve_sparse_topic("rgb", "/custom/sparse_point") == "/custom/sparse_point"
+
+
+def _valid_normalization_stats():
+    return {
+        "qpos_mean": np.zeros(21, dtype=np.float32),
+        "qpos_std": np.ones(21, dtype=np.float32),
+        "action_mean": np.zeros(1, dtype=np.float32),
+        "action_std": np.ones(1, dtype=np.float32),
+        "sparse_mean": np.zeros(4, dtype=np.float32),
+        "sparse_std": np.ones(4, dtype=np.float32),
+    }
+
+
+def test_valid_sparse_normalization_statistics():
+    arrays = validate_normalization_stats(
+        _valid_normalization_stats(), include_sparse=True,
+    )
+    assert arrays["qpos_mean"].shape == (21,)
+    assert arrays["action_std"].shape == (1,)
+    assert arrays["sparse_mean"].shape == arrays["sparse_std"].shape == (4,)
+
+
+@pytest.mark.parametrize(
+    "key", ["qpos_mean", "qpos_std", "action_mean", "action_std",
+            "sparse_mean", "sparse_std"],
+)
+def test_sparse_normalization_statistics_require_every_array(key):
+    stats = _valid_normalization_stats()
+    stats.pop(key)
+    with pytest.raises(ValueError, match=key):
+        validate_normalization_stats(stats, include_sparse=True)
+
+
+@pytest.mark.parametrize(
+    "key,bad_shape",
+    [("qpos_mean", (20,)), ("qpos_std", (1, 21)),
+     ("action_mean", (2,)), ("action_std", (1, 1)),
+     ("sparse_mean", (3,)), ("sparse_std", (1, 4))],
+)
+def test_sparse_normalization_statistics_reject_wrong_shapes(key, bad_shape):
+    stats = _valid_normalization_stats()
+    stats[key] = np.ones(bad_shape, dtype=np.float32)
+    with pytest.raises(ValueError, match=key):
+        validate_normalization_stats(stats, include_sparse=True)
+
+
+@pytest.mark.parametrize(
+    "key", ["qpos_mean", "qpos_std", "action_mean", "action_std",
+            "sparse_mean", "sparse_std"],
+)
+def test_sparse_normalization_statistics_reject_nonfinite_values(key):
+    stats = _valid_normalization_stats()
+    stats[key] = stats[key].copy()
+    stats[key].flat[0] = np.nan
+    with pytest.raises(ValueError, match=key):
+        validate_normalization_stats(stats, include_sparse=True)
+
+
+@pytest.mark.parametrize("key,bad", [("qpos_std", 0.0), ("qpos_std", -1.0),
+                                      ("action_std", 0.0), ("action_std", -1.0),
+                                      ("sparse_std", 0.0), ("sparse_std", -1.0)])
+def test_sparse_normalization_statistics_require_positive_std(key, bad):
+    stats = _valid_normalization_stats()
+    stats[key] = stats[key].copy()
+    stats[key].flat[0] = bad
+    with pytest.raises(ValueError, match=key):
+        validate_normalization_stats(stats, include_sparse=True)
 
 
 @pytest.mark.parametrize(
