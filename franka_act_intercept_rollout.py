@@ -482,6 +482,9 @@ class FrankaActRolloutNode(Node):
             discarded_entries = self._reset_temporal_aggregation("service_reset")
             self.rollout_epoch += 1
             self.reset_anchor_floor_ns = floor_anchor_ns
+            self._last_sparse_message_tick_ns = None
+            self._last_sparse_diagnostics.clear()
+            self._last_policy_output_timestamp = None
             if floor_anchor_ns is not None:
                 self._last_attempted_anchor_ns = floor_anchor_ns
 
