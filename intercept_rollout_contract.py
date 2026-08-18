@@ -411,6 +411,30 @@ def select_latest_index_at_or_before(
     return idx
 
 
+def select_qpos_history_at_targets(
+    timestamps: Sequence[float],
+    qpos_samples: Sequence[np.ndarray],
+    target_timestamps: Sequence[float],
+) -> Tuple[np.ndarray, Tuple[float, ...]]:
+    """Select the latest causal qpos sample for every policy-history target."""
+    if len(timestamps) != len(qpos_samples):
+        raise ValueError("qpos timestamps and samples must have matching lengths")
+    selected = []
+    selected_timestamps = []
+    for target in target_timestamps:
+        index = select_latest_index_at_or_before(timestamps, target)
+        if index is None:
+            raise ValueError(f"No causal qpos sample at history target {target:.9f}")
+        selected.append(qpos_samples[index])
+        selected_timestamps.append(float(timestamps[index]))
+    return build_qpos_history(selected), tuple(selected_timestamps)
+
+
+def skip_duplicate_source_frame(input_modality: str) -> bool:
+    """Dense visual policies are frame-driven; sparse policies are clock-driven."""
+    return str(input_modality) != "sparse_ball"
+
+
 def extract_arm_qpos(joint_names: Sequence[str], joint_positions: Sequence[float]) -> np.ndarray:
     name_to_idx = {name: index for index, name in enumerate(joint_names)}
     missing = [name for name in ARM_JOINT_NAMES if name not in name_to_idx]
