@@ -60,34 +60,31 @@ def _dryrun_parser(rollout):
     return parser
 
 
-@pytest.mark.parametrize("source", ("rgb", "event"))
-def test_dryrun_argument_parses_both_sources(rollout, source):
-    assert _dryrun_parser(rollout).parse_args(["--dryrun", source]).dryrun == source
+def test_dryrun_argument_is_boolean(rollout):
+    parser = _dryrun_parser(rollout)
+    assert parser.parse_args([]).dryrun is False
+    assert parser.parse_args(["--dryrun"]).dryrun is True
 
 
-@pytest.mark.parametrize("argv", (["--dryrun"], ["--dryrun", "depth"]))
-def test_dryrun_argument_rejects_missing_and_invalid_values(rollout, argv):
+def test_dryrun_argument_rejects_a_value(rollout):
     with pytest.raises(SystemExit):
-        _dryrun_parser(rollout).parse_args(argv)
+        _dryrun_parser(rollout).parse_args(["--dryrun", "rgb"])
 
 
 @pytest.mark.parametrize(
-    "enabled,dryrun,topic",
+    "source,topic",
     (
-        ("rgb", "event", "/openmv_cam/event_tracker/ball_2d_px"),
-        ("event", "rgb", "/ball_tracker2/ball_2d_px"),
+        ("rgb", "/ball_tracker2/ball_2d_px"),
+        ("event", "/openmv_cam/event_tracker/ball_2d_px"),
     ),
 )
-def test_opposite_sources_are_accepted_and_effective_for_sparse_input(
-    rollout, enabled, dryrun, topic
-):
-    runtime = rollout.resolve_rollout_runtime(enabled, dryrun)
-    assert runtime["enabled_source"] == enabled
-    assert runtime["effective_source"] == dryrun
-    assert resolve_sparse_topic(runtime["effective_source"], None) == topic
+def test_dryrun_keeps_selected_source_for_input_and_checkpoint(rollout, source, topic):
+    runtime = rollout.resolve_rollout_runtime(source, True)
+    assert runtime["sparse_source"] == source
+    assert resolve_sparse_topic(runtime["sparse_source"], None) == topic
     checkpoint_contract = resolve_sparse_checkpoint_contract(
         {
-            "sparse_source": dryrun,
+            "sparse_source": source,
             "sparse_feature_dim": 4,
             "sparse_history_length": 3,
             "policy_rate_hz": 30,
@@ -97,19 +94,14 @@ def test_opposite_sources_are_accepted_and_effective_for_sparse_input(
         },
         requested_policy_rate_hz=30,
         requested_chunk_size=30,
-        requested_sparse_source=runtime["effective_source"],
+        requested_sparse_source=runtime["sparse_source"],
     )
-    assert checkpoint_contract["sparse_source"] == dryrun
+    assert checkpoint_contract["sparse_source"] == source
 
 
 @pytest.mark.parametrize("source", ("rgb", "event"))
-def test_same_source_is_rejected(rollout, source):
-    with pytest.raises(ValueError, match="opposite"):
-        rollout.resolve_rollout_runtime(source, source)
-
-
-def test_active_endpoints_are_unchanged(rollout):
-    runtime = rollout.resolve_rollout_runtime("rgb", None)
+def test_active_endpoints_are_unchanged(rollout, source):
+    runtime = rollout.resolve_rollout_runtime(source, False)
     assert runtime["node_fqn"] == "/franka_act_rollout_intercept"
     assert runtime["prediction_topic"] == "/act/intercept_prediction_chunk_abs_s"
     assert runtime["prediction_current_topic"] == "/act/intercept_prediction_current_abs_s"
@@ -118,14 +110,34 @@ def test_active_endpoints_are_unchanged(rollout):
 
 @pytest.mark.parametrize("source", ("rgb", "event"))
 def test_dryrun_endpoints_are_namespaced_and_never_production(rollout, source):
-    enabled = "event" if source == "rgb" else "rgb"
-    runtime = rollout.resolve_rollout_runtime(enabled, source)
+    runtime = rollout.resolve_rollout_runtime(source, True)
     prefix = f"/act_dryrun/{source}"
     assert runtime["namespace"] == prefix
     assert runtime["node_fqn"] == f"{prefix}/franka_act_rollout_intercept"
     assert runtime["prediction_topic"] == f"{prefix}/intercept_prediction_chunk_abs_s"
     assert runtime["prediction_current_topic"] == f"{prefix}/intercept_prediction_current_abs_s"
     assert runtime["reset_service"] == f"{prefix}/reset_temporal_aggregation"
-    assert runtime["latency_trace_topic"] == f"{prefix}/latency_trace"
+    assert runtime["latency_trace_topic"] == f"{prefix}/intercept_trace/act_rollout"
     assert runtime["prediction_topic"] != rollout.PRODUCTION_PREDICTION_TOPIC
     assert runtime["prediction_current_topic"] != rollout.PRODUCTION_CURRENT_PREDICTION_TOPIC
+
+
+def test_active_explicit_topics_are_preserved(rollout):
+    runtime = rollout.resolve_rollout_runtime(
+        "rgb",
+        False,
+        prediction_topic="/custom/chunk",
+        prediction_current_topic="/custom/current",
+        reset_service="/custom/reset",
+        latency_trace_topic="/custom/trace",
+    )
+    assert runtime["prediction_topic"] == "/custom/chunk"
+    assert runtime["prediction_current_topic"] == "/custom/current"
+    assert runtime["reset_service"] == "/custom/reset"
+    assert runtime["latency_trace_topic"] == "/custom/trace"
+
+
+@pytest.mark.parametrize("source", ("rgb", "event"))
+def test_no_opposite_source_validation_exists(rollout, source):
+    runtime = rollout.resolve_rollout_runtime(source, True)
+    assert runtime["sparse_source"] == source
