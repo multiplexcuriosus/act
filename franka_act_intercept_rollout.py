@@ -47,6 +47,50 @@ from sparse_ball import (
 )
 
 
+PRODUCTION_NODE_NAME = "franka_act_rollout_intercept"
+PRODUCTION_PREDICTION_TOPIC = "/act/intercept_prediction_chunk_abs_s"
+PRODUCTION_CURRENT_PREDICTION_TOPIC = "/act/intercept_prediction_current_abs_s"
+PRODUCTION_RESET_SERVICE = "/act/reset_temporal_aggregation"
+
+
+def resolve_rollout_runtime(sparse_source: Optional[str], dryrun: Optional[str]) -> Dict[str, Any]:
+    """Resolve source identity and ROS endpoints for active and comparison rollouts."""
+    if sparse_source not in ("rgb", "event"):
+        raise ValueError("--sparse_source rgb|event is required")
+    if dryrun is not None and dryrun not in ("rgb", "event"):
+        raise ValueError("--dryrun must be one of: rgb, event")
+    if dryrun == sparse_source:
+        raise ValueError("--dryrun must identify the source opposite --sparse_source")
+
+    effective_source = dryrun if dryrun is not None else sparse_source
+    namespace = f"/act_dryrun/{effective_source}" if dryrun is not None else ""
+    resolved = {
+        "enabled_source": sparse_source,
+        "effective_source": effective_source,
+        "dryrun": dryrun is not None,
+        "namespace": namespace,
+        "node_name": PRODUCTION_NODE_NAME,
+        "node_fqn": f"{namespace}/{PRODUCTION_NODE_NAME}" if namespace else f"/{PRODUCTION_NODE_NAME}",
+        "prediction_topic": f"{namespace}/intercept_prediction_chunk_abs_s" if namespace else PRODUCTION_PREDICTION_TOPIC,
+        "prediction_current_topic": f"{namespace}/intercept_prediction_current_abs_s" if namespace else PRODUCTION_CURRENT_PREDICTION_TOPIC,
+        "reset_service": f"{namespace}/reset_temporal_aggregation" if namespace else PRODUCTION_RESET_SERVICE,
+        "latency_trace_topic": f"{namespace}/latency_trace" if namespace else "/intercept_trace/act_rollout",
+    }
+    if resolved["dryrun"]:
+        assert resolved["prediction_topic"] != PRODUCTION_PREDICTION_TOPIC
+        assert resolved["prediction_current_topic"] != PRODUCTION_CURRENT_PREDICTION_TOPIC
+    return resolved
+
+
+def add_dryrun_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dryrun",
+        choices=("rgb", "event"),
+        metavar="MOD",
+        help="Run the opposite sparse modality as a namespaced comparison rollout.",
+    )
+
+
 def stamp_to_sec(stamp) -> float:
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
@@ -62,7 +106,10 @@ def _first_last(values: np.ndarray, n: int = 3) -> str:
 
 class FrankaActRolloutNode(Node):
     def __init__(self, args):
-        super().__init__("franka_act_rollout_intercept")
+        if args.node_namespace:
+            super().__init__(PRODUCTION_NODE_NAME, namespace=args.node_namespace)
+        else:
+            super().__init__(PRODUCTION_NODE_NAME)
 
         self.bridge = CvBridge()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,7 +142,8 @@ class FrankaActRolloutNode(Node):
             sparse_history_offsets_frames(self.policy_rate_hz)
             if self.input_modality == "sparse_ball" else (-6, -3, 0)
         )
-        self.sparse_source = args.sparse_source
+        self.enabled_sparse_source = args.sparse_source
+        self.sparse_source = args.effective_sparse_source
         self.sparse_topic = resolve_sparse_topic(self.sparse_source, args.sparse_topic)
         self.event_spatial_preprocessing = args.event_spatial_preprocessing
         self._event_spatial_shape_trace_logged = False
@@ -310,6 +358,12 @@ class FrankaActRolloutNode(Node):
         self.get_logger().info(f"prediction_chunk_topic={self.prediction_topic}")
         self.get_logger().info("prediction_chunk_msg_type=std_msgs/msg/Float64MultiArray")
         self.get_logger().info(f"prediction_current_topic={self.prediction_current_topic}")
+        self.get_logger().info(f"enabled_live_source={self.enabled_sparse_source}")
+        self.get_logger().info(f"effective_runtime_source={self.sparse_source}")
+        self.get_logger().info(f"dryrun={bool(args.dryrun)}")
+        self.get_logger().info(f"node_fully_qualified_name={self.get_fully_qualified_name()}")
+        if args.enable_latency_trace:
+            self.get_logger().info(f"latency_trace_topic={args.latency_trace_topic}")
         self.get_logger().info("prediction_current_msg_type=std_msgs/msg/Float64")
         self.get_logger().info(f"publish_current_scalar={self.publish_current_scalar}")
         self.get_logger().info(
@@ -970,6 +1024,7 @@ def main():
     parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb", "event"])
     parser.add_argument("--input_modality", choices=["rgb", "event", "sparse_ball"])
     parser.add_argument("--sparse_source", choices=["rgb", "event"])
+    add_dryrun_argument(parser)
     parser.add_argument("--sparse_topic", type=str)
     add_event_spatial_preprocessing_arguments(parser)
 
@@ -1043,13 +1098,36 @@ def main():
     if args.chunk_size is None:
         args.chunk_size = args.policy_rate_hz
     if args.input_modality is None:
-        args.input_modality = args.camera_name
+        args.input_modality = "sparse_ball" if args.dryrun is not None else args.camera_name
     if args.max_observation_age_sec is None:
         args.max_observation_age_sec = (
             0.10 if args.input_modality == "sparse_ball" else 0.20
         )
     if args.input_modality == "sparse_ball" and args.sparse_source is None:
         parser.error("--sparse_source rgb|event is required with sparse_ball")
+    if args.dryrun is not None and args.input_modality != "sparse_ball":
+        parser.error("--dryrun requires --input_modality sparse_ball")
+    args.effective_sparse_source = args.sparse_source
+    args.node_namespace = None
+    if args.input_modality == "sparse_ball":
+        try:
+            runtime = resolve_rollout_runtime(args.sparse_source, args.dryrun)
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.effective_sparse_source = runtime["effective_source"]
+        args.node_namespace = runtime["namespace"]
+    if args.dryrun is not None:
+        # A comparison rollout always consumes its effective modality's canonical
+        # shared input; an override could silently point it at the live source.
+        args.sparse_topic = None
+        args.prediction_topic = runtime["prediction_topic"]
+        args.prediction_current_topic = runtime["prediction_current_topic"]
+        args.temporal_agg_reset_service = runtime["reset_service"]
+        args.latency_trace_topic = runtime["latency_trace_topic"]
+        dryrun_run_id = f"act-dryrun-{args.effective_sparse_source}"
+        args.latency_run_id = (
+            f"{dryrun_run_id}-{args.latency_run_id}" if args.latency_run_id else dryrun_run_id
+        )
     if args.input_modality in ("rgb", "event") and args.input_modality != args.camera_name:
         parser.error("Dense --input_modality must match --camera_name")
     try:
