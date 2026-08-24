@@ -53,6 +53,8 @@ class DETRVAE(nn.Module):
         self.encoder = encoder
         hidden_dim = transformer.d_model
         self.input_modality = input_modality
+        self.sparse_feature_dim = int(sparse_feature_dim)
+        self.sparse_history_length = int(sparse_history_length)
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
@@ -127,8 +129,12 @@ class DETRVAE(nn.Module):
             latent_input = self.latent_out_proj(latent_sample)
 
         if self.input_modality == 'sparse_ball':
-            if image.ndim != 3 or image.shape[1:] != (3, 4):
-                raise ValueError(f"Sparse ACT input must have shape [B,3,4], got {image.shape}")
+            expected = (self.sparse_history_length, self.sparse_feature_dim)
+            if image.ndim != 3 or tuple(image.shape[1:]) != expected:
+                raise ValueError(
+                    f"Sparse ACT input must have shape [B,{expected[0]},{expected[1]}], "
+                    f"got {tuple(image.shape)}"
+                )
             sparse = self.sparse_feature_proj(image).transpose(1, 2).unsqueeze(2)
             sparse_pos = self.sparse_pos_embed.weight.transpose(0, 1).unsqueeze(0).unsqueeze(2)
             proprio_input = self.input_proj_robot_state(qpos)
