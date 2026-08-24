@@ -14,6 +14,10 @@ SUPPORTED_POLICY_RATES_HZ = (30, 60)
 SPARSE_HISTORY_OFFSETS_SEC = (-0.2, -0.1, 0.0)
 SPARSE_HISTORY_OFFSETS = (-6, -3, 0)
 SPARSE_HISTORY_LENGTH = 3
+SPARSE_HISTORY_MODE_LEGACY = "legacy"
+SPARSE_HISTORY_MODE_M_WINDOW = "m_window"
+DEFAULT_HISTORY_MS = 200.0
+DEFAULT_SPARSE_HISTORY_CAPACITY = 32
 SPARSE_FEATURE_NAMES = ("u_norm", "v_norm", "valid", "observation_age_sec")
 SPARSE_SOURCE_TIMESTAMP_POLICY = "point_stamped_header_latest_at_or_before_policy_time"
 DEFAULT_MAX_OBSERVATION_AGE_SEC = 0.10
@@ -48,6 +52,47 @@ def sparse_history_offsets_frames(rate_hz):
     return tuple(int(round(offset * rate)) for offset in SPARSE_HISTORY_OFFSETS_SEC)
 
 
+def qpos_history_offsets_for_window(rate_hz, history_ms=DEFAULT_HISTORY_MS):
+    """Return every policy-grid offset in an inclusive causal time window."""
+    rate = validate_policy_rate(rate_hz)
+    history_ms = float(history_ms)
+    if not np.isfinite(history_ms) or history_ms < 0:
+        raise ValueError("history_ms must be finite and non-negative")
+    frames = int(round(history_ms * rate / 1000.0))
+    return tuple(range(-frames, 1))
+
+
+def resolve_history_config(mode=SPARSE_HISTORY_MODE_LEGACY, policy_rate_hz=30,
+                           history_ms=DEFAULT_HISTORY_MS,
+                           sparse_history_capacity=DEFAULT_SPARSE_HISTORY_CAPACITY):
+    """Resolve tensor dimensions while retaining the historical default."""
+    mode = str(mode)
+    if mode not in (SPARSE_HISTORY_MODE_LEGACY, SPARSE_HISTORY_MODE_M_WINDOW):
+        raise ValueError("sparse_history_mode must be 'legacy' or 'm_window'")
+    if mode == SPARSE_HISTORY_MODE_LEGACY:
+        offsets = sparse_history_offsets_frames(policy_rate_hz)
+        capacity = SPARSE_HISTORY_LENGTH
+        horizon_ms = 200.0
+    else:
+        offsets = qpos_history_offsets_for_window(policy_rate_hz, history_ms)
+        capacity = int(sparse_history_capacity)
+        horizon_ms = float(history_ms)
+        if capacity <= 0:
+            raise ValueError("sparse_history_capacity must be positive")
+    return {
+        "history_mode": mode,
+        "history_horizon_ms": horizon_ms,
+        "history_horizon_sec": horizon_ms / 1000.0,
+        "sparse_history_capacity": capacity,
+        "sparse_feature_dim": SPARSE_FEATURE_DIM,
+        "qpos_history_offsets": offsets,
+        "qpos_history_length": len(offsets),
+        "state_dim": 7 * len(offsets),
+        "qpos_flatten_order": "oldest_to_newest",
+        "causal_sampling_policy": "source_timestamp_at_or_before_policy_anchor_within_horizon",
+    }
+
+
 def default_sparse_topic(source: str) -> str:
     """Return the repository default PointStamped topic for a sparse source."""
     if source == "rgb":
@@ -63,6 +108,16 @@ def sparse_dataset_paths(source: str):
         raise ValueError(f"sparse_source must be 'rgb' or 'event', got {source!r}")
     prefix = f"/observations/sparse_tracking/{source}"
     return f"{prefix}_2d_px", f"{prefix}_valid", f"{prefix}_source_timestamps"
+
+
+def raw_sparse_dataset_paths(source: str):
+    """Return canonical literal (not policy-grid aligned) sparse stream paths."""
+    if source not in ("rgb", "event"):
+        raise ValueError(f"sparse_source must be 'rgb' or 'event', got {source!r}")
+    prefix = "/observations/sparse_tracking"
+    return (f"{prefix}/raw_{source}_timestamps",
+            f"{prefix}/raw_{source}_2d_px",
+            f"{prefix}/raw_{source}_valid")
 
 
 def construct_sparse_features(
@@ -121,6 +176,50 @@ class SparsePoint:
     u: float
     v: float
     valid: int = 1
+
+
+def construct_causal_sparse_window(
+    points: Iterable[SparsePoint], policy_timestamp: float, history_ms: float,
+    capacity: int, image_width: int, image_height: int, *, return_info=False,
+):
+    """Build a front-padded, oldest-to-newest literal sparse observation window."""
+    anchor = float(policy_timestamp)
+    horizon = float(history_ms) / 1000.0
+    capacity = int(capacity)
+    if not np.isfinite(anchor) or not np.isfinite(horizon) or horizon < 0:
+        raise ValueError("policy_timestamp and history_ms must be finite; history_ms >= 0")
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+    if image_width <= 1 or image_height <= 1:
+        raise ValueError("sparse image dimensions must both exceed one pixel")
+    ordered = sorted(points, key=lambda item: item.source_timestamp)
+    stamps = np.asarray([p.source_timestamp for p in ordered], dtype=np.float64)
+    if stamps.size and (not np.isfinite(stamps).all() or np.any(np.diff(stamps) < 0)):
+        raise ValueError("sparse source timestamps must be finite and monotonic")
+    selected = [p for p in ordered if anchor - horizon <= p.source_timestamp <= anchor]
+    overflow_count = max(0, len(selected) - capacity)
+    if overflow_count:
+        selected = selected[-capacity:]
+    result = np.zeros((capacity, SPARSE_FEATURE_DIM), dtype=np.float32)
+    start = capacity - len(selected)
+    for row, point in enumerate(selected, start=start):
+        age = anchor - float(point.source_timestamp)
+        in_bounds = (np.isfinite(point.u) and np.isfinite(point.v)
+                     and 0 <= point.u < image_width and 0 <= point.v < image_height)
+        result[row, 3] = age
+        if point.valid and in_bounds:
+            result[row, 0] = 2.0 * float(point.u) / (image_width - 1) - 1.0
+            result[row, 1] = 2.0 * float(point.v) / (image_height - 1) - 1.0
+            result[row, 2] = 1.0
+    info = {
+        "overflow": bool(overflow_count),
+        "overflow_count": overflow_count,
+        "selected_count": len(selected),
+        "selected_timestamps": np.asarray(
+            [p.source_timestamp for p in selected], dtype=np.float64
+        ),
+    }
+    return (result, info) if return_info else result
 
 
 def construct_causal_sparse_history(
