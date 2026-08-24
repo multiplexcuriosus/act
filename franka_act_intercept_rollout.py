@@ -989,14 +989,20 @@ def main():
     parser.add_argument("--no_publish_current_scalar", action="store_false", dest="publish_current_scalar")
     parser.set_defaults(publish_current_scalar=True)
 
-    parser.add_argument("--policy_rate_hz", type=int, choices=[30, 60], default=30)
-    parser.add_argument("--fps", type=float, default=None)
+    parser.add_argument(
+        "--policy_rate_hz",
+        type=int,
+        choices=[30, 60],
+        default=None,
+        help="Deprecated compatibility option; the effective policy rate is always set from --fps.",
+    )
+    parser.add_argument("--fps", type=float, choices=[30.0, 60.0], default=30.0)
     parser.add_argument("--max_source_buffer", type=int, default=256)
     parser.add_argument("--max_observation_age_sec", type=float, default=None)
     parser.add_argument("--max_anchor_age_sec", type=float, default=0.10)
     parser.add_argument("--diag_log_period_sec", type=float, default=1.0)
     parser.add_argument("--reject_log_period_sec", type=float, default=1.0)
-    parser.add_argument("--enable_latency_trace", action="store_true", default=False)
+    parser.add_argument("--enable_latency_trace", action="store_true", default=True)
     latency_cuda_sync_group = parser.add_mutually_exclusive_group()
     latency_cuda_sync_group.add_argument(
         "--latency_trace_cuda_sync",
@@ -1020,20 +1026,24 @@ def main():
     parser.add_argument("--rgb_history_frames", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=320)
     parser.add_argument("--camera_name", type=str, default="rgb", choices=["rgb", "event"])
-    parser.add_argument("--input_modality", choices=["rgb", "event", "sparse_ball"])
+    parser.add_argument(
+        "--input_modality",
+        choices=["rgb", "event", "sparse_ball"],
+        default="sparse_ball",
+    )
     parser.add_argument("--sparse_source", choices=["rgb", "event"])
     add_dryrun_argument(parser)
     parser.add_argument("--sparse_topic", type=str)
     add_event_spatial_preprocessing_arguments(parser)
 
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--kl_weight", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--kl_weight", type=int, default=1)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--dim_feedforward", type=int, default=3200)
     parser.add_argument(
         "--temporal-agg-mode",
         choices=["full", "latest", "recent"],
-        default=None,
+        default="latest",
     )
     parser.add_argument(
         "--recent-agg-window",
@@ -1049,7 +1059,7 @@ def main():
     parser.add_argument(
         "--action-lookahead-steps",
         type=int,
-        default=0,
+        default=11,
     )
     legacy_temporal_agg_group = parser.add_mutually_exclusive_group()
     legacy_temporal_agg_group.add_argument(
@@ -1085,14 +1095,9 @@ def main():
         args.enable_latency_trace,
         args.latency_trace_cuda_sync,
     )
-    args.policy_rate_hz = validate_policy_rate(args.policy_rate_hz)
-    if args.fps is None:
-        args.fps = float(args.policy_rate_hz)
-    if not np.isclose(float(args.fps), float(args.policy_rate_hz), atol=1e-9):
-        parser.error(
-            f"--fps {args.fps} disagrees with --policy_rate_hz {args.policy_rate_hz}; "
-            "only matched 30 Hz and 60 Hz configurations are supported"
-        )
+    args.policy_rate_hz = validate_policy_rate(args.fps)
+    if not args.latency_run_id:
+        args.latency_run_id = time.strftime("rgb_%Y%m%d_%H%M%S")
     if args.chunk_size is None:
         args.chunk_size = args.policy_rate_hz
     if args.input_modality is None:
