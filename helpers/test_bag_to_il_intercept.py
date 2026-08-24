@@ -1336,6 +1336,52 @@ class BagToIlInterceptTests(unittest.TestCase):
                     sparse["event_2d_px"][:][sparse["event_valid"][:] == 0], 0
                 )
 
+    def test_common_sparse_metadata_without_sparse_source_at_30_and_60_hz(self):
+        for rate, expected_offsets in (
+            (30, [-6, -3, 0]), (60, [-12, -6, 0])
+        ):
+            data = self.make_sampling_data(
+                [0.0, 0.1, 0.2], [0.0, 0.1, 0.2]
+            )
+            data["rgb_2d_t"] = [0.0, 0.1, 0.2]
+            data["rgb_2d_source_t"] = [0.0, 0.1, 0.2]
+            data["rgb_2d_px"] = [[10.0, 20.0]] * 3
+            episode = self.make_episode(end=0.2)
+            arrays = self.mod.sample_episode(
+                data, episode, fps=float(rate),
+                max_current_tcp_s_age_sec=1.0,
+                rgb_2d_enabled=True, sparse_source=None,
+            )
+            self.assertNotIn("sparse_ball", arrays)
+            self.assertIn("sparse_tracking/rgb_2d_px", arrays)
+            with tempfile.TemporaryDirectory() as directory:
+                output = os.path.join(directory, f"episode_{rate}.hdf5")
+                self.mod.write_episode(
+                    output, arrays, episode, self.make_topics(), float(rate),
+                    "none", False, sparse_source=None,
+                )
+                with h5py.File(output, "r") as target:
+                    self.assertEqual(target.attrs["policy_rate_hz"], rate)
+                    self.assertEqual(target.attrs["fps"], float(rate))
+                    self.assertEqual(target.attrs["chunk_size"], rate)
+                    self.assertEqual(target.attrs["qpos_history_frames"], 3)
+                    self.assertEqual(target.attrs["sparse_history_length"], 3)
+                    np.testing.assert_array_equal(
+                        target.attrs["qpos_history_offsets"], expected_offsets
+                    )
+                    np.testing.assert_array_equal(
+                        target.attrs["sparse_history_offsets_frames"],
+                        expected_offsets,
+                    )
+                    np.testing.assert_allclose(
+                        target.attrs["sparse_history_offsets_sec"],
+                        [-0.2, -0.1, 0.0],
+                    )
+                    self.assertEqual(
+                        target.attrs["policy_period_ns"],
+                        self.mod.policy_period_ns(rate),
+                    )
+
     def test_failed_write_removes_temporary_file(self):
         arrays = {
             "timestamps": np.asarray([0.0]),

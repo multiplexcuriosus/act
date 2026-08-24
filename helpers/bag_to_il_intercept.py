@@ -1275,6 +1275,9 @@ def write_episode(
         )
 
     compression_kwargs = dataset_kwargs(compression)
+    has_sparse_tracking = any(
+        key.startswith("sparse_tracking/") for key in arrays
+    )
     try:
         with h5py.File(temporary_path, "w") as h5:
             h5.attrs["sim"] = False
@@ -1286,7 +1289,7 @@ def write_episode(
                 if int(fps) in (30, 60)
                 else int(round(1_000_000_000 / float(fps)))
             )
-            if sparse_source is not None:
+            if has_sparse_tracking and int(fps) in (30, 60):
                 sparse_offsets = sparse_history_offsets_frames(fps)
                 h5.attrs["chunk_size"] = int(fps)
                 h5.attrs["qpos_history_frames"] = len(sparse_offsets)
@@ -1297,6 +1300,9 @@ def write_episode(
                     SPARSE_HISTORY_OFFSETS_SEC, dtype=np.float64
                 )
                 h5.attrs["sparse_history_length"] = len(sparse_offsets)
+                h5.attrs["sparse_history_offsets_frames"] = np.asarray(
+                    sparse_offsets, dtype=np.int32
+                )
             h5.attrs["episode_index"] = int(episode.output_idx)
             h5.attrs["source_episode_index"] = int(episode.source_idx)
             h5.attrs["episode_start"] = float(episode.start)

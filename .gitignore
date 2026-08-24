@@ -145,3 +145,4 @@ first_imgs/*
 *.mp4
 *.png
 trajectory-analysis
+COLCON_IGNORE

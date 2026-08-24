@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, Sequence
+import warnings
 
 import numpy as np
 
@@ -181,3 +182,73 @@ def validate_sparse_checkpoint_contract(
             "Sparse checkpoint contract mismatch for max observation age: "
             f"configured={max_observation_age_sec}, saved={saved_age}"
         )
+
+
+def resolve_sparse_checkpoint_contract(
+    stats, requested_policy_rate_hz, requested_chunk_size,
+    requested_sparse_source, warning_callback=None,
+):
+    """Resolve strict modern metadata or the legacy 30 Hz sparse contract."""
+    rate = validate_policy_rate(requested_policy_rate_hz)
+    chunk_size = int(requested_chunk_size)
+    expected_offsets = sparse_history_offsets_frames(rate)
+    if chunk_size != rate:
+        raise ValueError(
+            f"Sparse rollout at {rate} Hz requires chunk_size={rate}, got {chunk_size}"
+        )
+
+    expected = {
+        "policy_rate_hz": rate,
+        "qpos_history_offsets": list(expected_offsets),
+        "chunk_size": chunk_size,
+        "sparse_history_offsets_frames": list(expected_offsets),
+        "sparse_source": requested_sparse_source,
+        "sparse_feature_dim": SPARSE_FEATURE_DIM,
+        "sparse_history_length": SPARSE_HISTORY_LENGTH,
+    }
+    legacy_fields = (
+        "policy_rate_hz", "qpos_history_offsets", "chunk_size",
+        "sparse_history_offsets_frames",
+    )
+    missing_legacy = [key for key in legacy_fields if key not in stats]
+    if missing_legacy and rate != 30:
+        raise ValueError(
+            "Sparse checkpoint requested at 60 Hz is missing rate/history metadata "
+            f"{missing_legacy}. Legacy metadata is inferred only at 30 Hz; retrain the "
+            "checkpoint or regenerate its metadata for 60 Hz."
+        )
+
+    resolved = {}
+    for key, expected_value in expected.items():
+        if key not in stats:
+            if key in legacy_fields and rate == 30:
+                resolved[key] = expected_value
+                continue
+            raise ValueError(f"Sparse checkpoint is missing {key}")
+        saved = stats[key]
+        if isinstance(saved, np.ndarray):
+            saved = saved.tolist()
+        if key in ("qpos_history_offsets", "sparse_history_offsets_frames"):
+            saved = list(saved)
+        elif key in ("policy_rate_hz", "chunk_size", "sparse_feature_dim",
+                     "sparse_history_length"):
+            saved = int(saved)
+        if saved != expected_value:
+            raise ValueError(
+                f"Sparse checkpoint/rollout mismatch for {key}: "
+                f"rollout={expected_value!r}, saved={saved!r}"
+            )
+        resolved[key] = saved
+
+    resolved["legacy_inferred_fields"] = missing_legacy
+    resolved["legacy_inferred"] = bool(missing_legacy)
+    if missing_legacy:
+        message = (
+            f"[WARN] Legacy sparse checkpoint metadata missing {missing_legacy}; "
+            "assuming the legacy 30 Hz sparse contract."
+        )
+        if warning_callback is None:
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+        else:
+            warning_callback(message)
+    return resolved

@@ -7,7 +7,8 @@ from sparse_ball import (
     SPARSE_FEATURE_NAMES, policy_period_ns, policy_period_sec,
     SparsePoint, construct_causal_sparse_history, construct_sparse_features,
     default_sparse_topic, sparse_dataset_paths, sparse_history_offsets_frames,
-    validate_policy_rate, validate_sparse_checkpoint_contract,
+    resolve_sparse_checkpoint_contract, validate_policy_rate,
+    validate_sparse_checkpoint_contract,
 )
 
 
@@ -89,3 +90,73 @@ def test_explicit_30_60_hz_contract(rate, period_ns, offsets):
 def test_unsupported_policy_rates_are_rejected(rate):
     with pytest.raises(ValueError, match="policy rate"):
         validate_policy_rate(rate)
+
+
+def _checkpoint_rate_contract(rate):
+    offsets = list(sparse_history_offsets_frames(rate))
+    return {
+        "policy_rate_hz": rate,
+        "qpos_history_offsets": offsets,
+        "chunk_size": rate,
+        "sparse_history_offsets_frames": offsets,
+        "sparse_source": "rgb",
+        "sparse_feature_dim": 4,
+        "sparse_history_length": 3,
+    }
+
+
+@pytest.mark.parametrize("rate", [30, 60])
+def test_modern_sparse_checkpoint_rate_contract(rate):
+    resolved = resolve_sparse_checkpoint_contract(
+        _checkpoint_rate_contract(rate), rate, rate, "rgb"
+    )
+    assert resolved["legacy_inferred"] is False
+    assert resolved["qpos_history_offsets"] == list(
+        sparse_history_offsets_frames(rate)
+    )
+
+
+def test_legacy_30_hz_checkpoint_contract_is_inferred():
+    stats = _checkpoint_rate_contract(30)
+    missing = [
+        "policy_rate_hz", "qpos_history_offsets", "chunk_size",
+        "sparse_history_offsets_frames",
+    ]
+    for key in missing:
+        stats.pop(key)
+    with pytest.warns(RuntimeWarning, match="legacy 30 Hz sparse contract"):
+        resolved = resolve_sparse_checkpoint_contract(stats, 30, 30, "rgb")
+    assert resolved["legacy_inferred"] is True
+    assert resolved["legacy_inferred_fields"] == missing
+    assert resolved["qpos_history_offsets"] == [-6, -3, 0]
+    assert resolved["chunk_size"] == 30
+
+
+def test_legacy_checkpoint_metadata_is_never_inferred_at_60_hz():
+    stats = _checkpoint_rate_contract(30)
+    stats.pop("policy_rate_hz")
+    stats.pop("qpos_history_offsets")
+    with pytest.raises(ValueError, match="inferred only at 30 Hz.*retrain"):
+        resolve_sparse_checkpoint_contract(stats, 60, 60, "rgb")
+
+
+@pytest.mark.parametrize(
+    "requested_rate,saved_rate", [(30, 60), (60, 30)]
+)
+def test_sparse_checkpoint_rate_mismatch_is_rejected(requested_rate, saved_rate):
+    with pytest.raises(ValueError, match="mismatch for policy_rate_hz"):
+        resolve_sparse_checkpoint_contract(
+            _checkpoint_rate_contract(saved_rate), requested_rate,
+            requested_rate, "rgb",
+        )
+
+
+def test_sparse_checkpoint_history_and_chunk_mismatches_are_rejected():
+    stats = _checkpoint_rate_contract(60)
+    stats["qpos_history_offsets"] = [-6, -3, 0]
+    with pytest.raises(ValueError, match="mismatch for qpos_history_offsets"):
+        resolve_sparse_checkpoint_contract(stats, 60, 60, "rgb")
+    stats = _checkpoint_rate_contract(60)
+    stats["chunk_size"] = 30
+    with pytest.raises(ValueError, match="mismatch for chunk_size"):
+        resolve_sparse_checkpoint_contract(stats, 60, 60, "rgb")
