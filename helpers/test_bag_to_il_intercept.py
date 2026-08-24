@@ -1327,8 +1327,15 @@ class BagToIlInterceptTests(unittest.TestCase):
             with h5py.File(output, "r") as target:
                 sparse = target["observations/sparse_tracking"]
                 for name in ("rgb_2d_px", "rgb_valid", "event_2d_px",
-                             "event_valid", "event_latest_rejection_reason"):
+                             "event_valid", "event_latest_rejection_reason",
+                             "raw_rgb_timestamps", "raw_rgb_2d_px",
+                             "raw_rgb_valid", "raw_event_timestamps",
+                             "raw_event_2d_px", "raw_event_valid"):
                     self.assertIn(name, sparse)
+                np.testing.assert_allclose(sparse["raw_rgb_timestamps"][:], [0.0])
+                np.testing.assert_allclose(sparse["raw_event_timestamps"][:], [0.0])
+                np.testing.assert_array_equal(sparse["raw_rgb_valid"][:], [1])
+                np.testing.assert_array_equal(sparse["raw_event_valid"][:], [1])
                 self.assertIn("images/rgb", target["observations"])
                 self.assertIn("processing/event_tracker", target)
                 self.assertEqual(len(sparse["rgb_valid"]), len(sparse["event_valid"]))

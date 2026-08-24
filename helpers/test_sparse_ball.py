@@ -5,7 +5,8 @@ import pytest
 
 from sparse_ball import (
     SPARSE_FEATURE_NAMES, policy_period_ns, policy_period_sec,
-    SparsePoint, construct_causal_sparse_history, construct_sparse_features,
+    SparsePoint, construct_causal_sparse_history, construct_causal_sparse_window,
+    construct_sparse_features, qpos_history_offsets_for_window,
     default_sparse_topic, sparse_dataset_paths, sparse_history_offsets_frames,
     resolve_sparse_checkpoint_contract, validate_policy_rate,
     validate_sparse_checkpoint_contract,
@@ -46,6 +47,35 @@ def test_causal_history_never_selects_future_point():
     expected_u = 2 * np.asarray([10, 10, 30]) / 319 - 1
     np.testing.assert_allclose(history[:, 0], expected_u)
     assert np.all(history[:, 2] == 1)
+
+
+def test_m_window_is_causal_front_padded_and_uses_anchor_age():
+    rows, info = construct_causal_sparse_window(
+        [SparsePoint(.79, 1, 2), SparsePoint(.81, 10, 20),
+         SparsePoint(.95, 30, 40, 0), SparsePoint(1.01, 50, 60)],
+        1.0, 200, 4, 320, 320, return_info=True,
+    )
+    np.testing.assert_array_equal(rows[:2], np.zeros((2, 4), dtype=np.float32))
+    assert rows[2, 2] == 1 and rows[2, 3] == pytest.approx(.19)
+    assert rows[3, 2] == 0 and rows[3, 3] == pytest.approx(.05)
+    np.testing.assert_allclose(info['selected_timestamps'], [.81, .95])
+    assert not info['overflow']
+
+
+def test_m_window_overflow_retains_newest_deterministically():
+    points = [SparsePoint(.8 + i * .01, i, i) for i in range(21)]
+    _, info = construct_causal_sparse_window(
+        points, 1.0, 200, 3, 320, 320, return_info=True,
+    )
+    assert info['overflow'] and info['overflow_count'] == 18
+    np.testing.assert_allclose(info['selected_timestamps'], [.98, .99, 1.0])
+
+
+@pytest.mark.parametrize('rate,length,state_dim', [(30, 7, 49), (60, 13, 91)])
+def test_m_window_qpos_offsets(rate, length, state_dim):
+    offsets = qpos_history_offsets_for_window(rate, 200)
+    assert offsets == tuple(range(-(length - 1), 1))
+    assert 7 * len(offsets) == state_dim
 
 
 def test_source_paths_and_checkpoint_contract_are_source_specific():
