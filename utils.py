@@ -11,7 +11,8 @@ import torchvision.transforms.v2 as transforms
 from sparse_ball import (
     SPARSE_FEATURE_DIM, SPARSE_FEATURE_NAMES, SPARSE_HISTORY_LENGTH,
     SPARSE_HISTORY_OFFSETS, SPARSE_HISTORY_OFFSETS_SEC, SPARSE_SOURCE_TIMESTAMP_POLICY,
-    construct_sparse_features, sparse_dataset_paths,
+    SparsePoint, construct_causal_sparse_window, construct_sparse_features,
+    raw_sparse_dataset_paths, sparse_dataset_paths,
     sparse_history_offsets_frames, validate_policy_rate,
 )
 
@@ -535,6 +536,25 @@ def _read_sparse_episode(root, dataset_path, source, max_observation_age_sec):
         max_observation_age_sec,
     )
     return features, width, height
+
+
+def _read_raw_sparse_episode(root, dataset_path, source):
+    timestamp_key, points_key, valid_key = raw_sparse_dataset_paths(source)
+    for key in (timestamp_key, points_key, valid_key):
+        if key not in root:
+            raise ValueError(
+                f"M-window mode requires raw sparse dataset {key} in {dataset_path}; "
+                "legacy grid-aligned data is not silently converted"
+            )
+    timestamps = np.asarray(root[timestamp_key][()], dtype=np.float64)
+    points = np.asarray(root[points_key][()], dtype=np.float64)
+    valid = np.asarray(root[valid_key][()]).reshape(-1)
+    if timestamps.ndim != 1 or points.shape != (len(timestamps), 2) or valid.shape != timestamps.shape:
+        raise ValueError(f"Malformed raw {source} sparse stream in {dataset_path}")
+    if len(timestamps) and (not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) < 0)):
+        raise ValueError(f"Raw {source} sparse timestamps must be finite and monotonic")
+    return [SparsePoint(t, p[0], p[1], int(v))
+            for t, p, v in zip(timestamps, points, valid)]
 
 def rotate_n_crop_transform(img, size=(360, 480), angle=None, top=None):
     if angle is None:
@@ -1208,6 +1228,9 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         expected_event_metadata=None,
         sparse_source=None,
         max_observation_age_sec=0.10,
+        sparse_history_mode='legacy',
+        history_ms=200.0,
+        sparse_history_capacity=32,
     ):
         super(EpisodicInterceptDataset).__init__()
         self.episode_paths = list(episode_paths)
@@ -1227,6 +1250,9 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         self.expected_event_metadata = expected_event_metadata
         self.sparse_source = sparse_source
         self.max_observation_age_sec = float(max_observation_age_sec)
+        self.sparse_history_mode = str(sparse_history_mode)
+        self.history_ms = float(history_ms)
+        self.sparse_history_capacity = int(sparse_history_capacity)
         self.is_sim = None
         self._printed_image_debug = False
         self._printed_intercept_debug = False
@@ -1243,9 +1269,9 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"Interception dataset requires camera_names={expected_camera_names} for modality {self.input_modality!r}, got {self.camera_names}"
             )
-        if len(self.qpos_history_offsets) != 3:
+        if not self.qpos_history_offsets or self.qpos_history_offsets[-1] != 0:
             raise ValueError(
-                f"Interception requires exactly 3 qpos history offsets, got {self.qpos_history_offsets}"
+                f"Interception qpos history must be nonempty and end at 0, got {self.qpos_history_offsets}"
             )
         if len(self.visual_history_offsets) <= 0:
             raise ValueError("Interception requires at least one visual history offset")
@@ -1253,12 +1279,14 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         if self.input_modality == 'sparse_ball':
             if self.sparse_source not in ('rgb', 'event'):
                 raise ValueError("sparse_source must be 'rgb' or 'event'")
-            if (len(self.visual_history_offsets) != SPARSE_HISTORY_LENGTH
+            if self.sparse_history_mode == 'legacy' and (len(self.visual_history_offsets) != SPARSE_HISTORY_LENGTH
                     or self.visual_history_offsets[-1] != 0
                     or tuple(sorted(self.visual_history_offsets)) != self.visual_history_offsets):
                 raise ValueError(
                     "Sparse history offsets must be three ascending frame offsets ending at 0"
                 )
+            if self.sparse_history_mode not in ('legacy', 'm_window'):
+                raise ValueError("sparse_history_mode must be legacy or m_window")
 
         if self.input_modality != 'sparse_ball':
             _print_image_pipeline_info(self.camera_names, target_size=self.image_size)
@@ -1292,11 +1320,20 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
             qpos = qpos_history.reshape(-1).astype(np.float32)
 
             if self.input_modality == 'sparse_ball':
-                sparse_full, _, _ = _read_sparse_episode(
-                    root, dataset_path, self.sparse_source,
-                    self.max_observation_age_sec,
-                )
-                model_input = sparse_full[visual_history_indices].astype(np.float32)
+                if self.sparse_history_mode == 'm_window':
+                    raw_points = _read_raw_sparse_episode(root, dataset_path, self.sparse_source)
+                    width, height = _sparse_image_dimensions(root, dataset_path, self.sparse_source)
+                    anchor_timestamp = float(root['/observations/timestamps'][anchor_t])
+                    model_input = construct_causal_sparse_window(
+                        raw_points, anchor_timestamp, self.history_ms,
+                        self.sparse_history_capacity, width, height,
+                    )
+                else:
+                    sparse_full, _, _ = _read_sparse_episode(
+                        root, dataset_path, self.sparse_source,
+                        self.max_observation_age_sec,
+                    )
+                    model_input = sparse_full[visual_history_indices].astype(np.float32)
             else:
                 visual_key = '/observations/images/rgb' if self.input_modality == 'rgb' else '/observations/images/event'
                 visual_frames = [root[visual_key][ts] for ts in visual_history_indices]
@@ -1327,13 +1364,16 @@ class EpisodicInterceptDataset(torch.utils.data.Dataset):
         is_pad = torch.from_numpy(is_pad).bool()
 
         if self.input_modality == 'sparse_ball':
-            assert image_data.shape == (SPARSE_HISTORY_LENGTH, SPARSE_FEATURE_DIM), image_data.shape
+            expected_sparse_length = (self.sparse_history_capacity
+                                      if self.sparse_history_mode == 'm_window'
+                                      else SPARSE_HISTORY_LENGTH)
+            assert image_data.shape == (expected_sparse_length, SPARSE_FEATURE_DIM), image_data.shape
         else:
             expected_image_channels = int(
                 self.norm_stats.get('image_channels', image_rgb.shape[-1])
             )
             assert image_data.shape == (1, expected_image_channels, self.image_size[0], self.image_size[1]), image_data.shape
-        assert qpos_data.shape == (21,), qpos_data.shape
+        assert qpos_data.shape == (7 * len(self.qpos_history_offsets),), qpos_data.shape
         assert action_data.shape == (self.chunk_size, 1), action_data.shape
         assert is_pad.shape == (self.chunk_size,), is_pad.shape
 
@@ -1412,6 +1452,8 @@ def get_intercept_norm_stats(
     visual_history_offsets=None,
     sparse_source=None,
     max_observation_age_sec=0.10,
+    sparse_history_mode='legacy', history_ms=200.0,
+    sparse_history_capacity=32, policy_rate_hz=30,
 ):
     qpos_histories = []
     delta_tokens = []
@@ -1427,10 +1469,15 @@ def get_intercept_norm_stats(
                 expected_event_metadata=event_metadata,
             )
             if input_modality == 'sparse_ball':
-                sparse_full, sparse_width, sparse_height = _read_sparse_episode(
-                    root, dataset_path, sparse_source, max_observation_age_sec
-                )
-                sparse_rows.append(sparse_full)
+                if sparse_history_mode == 'm_window':
+                    raw_sparse = _read_raw_sparse_episode(root, dataset_path, sparse_source)
+                    sparse_width, sparse_height = _sparse_image_dimensions(root, dataset_path, sparse_source)
+                    anchor_timestamps = np.asarray(root['/observations/timestamps'][()], dtype=np.float64)
+                else:
+                    sparse_full, sparse_width, sparse_height = _read_sparse_episode(
+                        root, dataset_path, sparse_source, max_observation_age_sec
+                    )
+                    sparse_rows.append(sparse_full)
                 dimensions = (sparse_width, sparse_height)
                 if sparse_dimensions is None:
                     sparse_dimensions = dimensions
@@ -1444,6 +1491,11 @@ def get_intercept_norm_stats(
         for anchor_t in range(T - 1):
             history_indices = compute_history_indices(anchor_t, history_offsets)
             qpos_histories.append(qpos_full[history_indices].reshape(-1))
+            if input_modality == 'sparse_ball' and sparse_history_mode == 'm_window':
+                sparse_rows.append(construct_causal_sparse_window(
+                    raw_sparse, float(anchor_timestamps[anchor_t]), history_ms,
+                    sparse_history_capacity, sparse_width, sparse_height,
+                ))
 
             future_end = min(T, anchor_t + 1 + chunk_size)
             future_abs = action_full[anchor_t + 1:future_end, 0]
@@ -1481,7 +1533,7 @@ def get_intercept_norm_stats(
         'example_qpos': qpos_histories[0],
         'data_mode': 'intercept',
         'raw_qpos_dim': 7,
-        'state_dim': 21,
+        'state_dim': 7 * len(history_offsets),
         'action_dim': 1,
         'input_modality': str(input_modality),
         'visual_history_frames': len(visual_history_offsets),
@@ -1513,7 +1565,20 @@ def get_intercept_norm_stats(
             'sparse_feature_dim': SPARSE_FEATURE_DIM,
             'sparse_feature_names': list(SPARSE_FEATURE_NAMES),
             'sparse_history_offsets_sec': list(SPARSE_HISTORY_OFFSETS_SEC),
-            'sparse_history_length': SPARSE_HISTORY_LENGTH,
+            'sparse_history_length': (int(sparse_history_capacity)
+                                      if sparse_history_mode == 'm_window'
+                                      else SPARSE_HISTORY_LENGTH),
+            'sparse_history_mode': sparse_history_mode,
+            'history_mode': sparse_history_mode,
+            'history_horizon_ms': float(history_ms),
+            'history_horizon_sec': float(history_ms) / 1000.0,
+            'sparse_history_capacity': (int(sparse_history_capacity)
+                                        if sparse_history_mode == 'm_window'
+                                        else SPARSE_HISTORY_LENGTH),
+            'qpos_history_length': len(history_offsets),
+            'causal_sampling_policy': 'source_timestamp_at_or_before_policy_anchor_within_horizon',
+            'policy_rate_hz': int(policy_rate_hz),
+            'action_chunk_size': int(chunk_size),
             'sparse_source': sparse_source,
             'sparse_image_width': sparse_width,
             'sparse_image_height': sparse_height,
@@ -1720,6 +1785,9 @@ def load_intercept_data(
     sparse_history_length=SPARSE_HISTORY_LENGTH,
     max_observation_age_sec=0.10,
     policy_rate_hz=30,
+    sparse_history_mode='legacy',
+    history_ms=200.0,
+    sparse_history_capacity=32,
 ):
     del split_num_trials  # currently unused in interception loader
 
@@ -1739,19 +1807,24 @@ def load_intercept_data(
             raise ValueError("sparse_source must be 'rgb' or 'event'")
         if int(sparse_feature_dim) != SPARSE_FEATURE_DIM:
             raise ValueError("sparse_feature_dim must be 4")
-        if int(sparse_history_length) != SPARSE_HISTORY_LENGTH:
-            raise ValueError("sparse_history_length must be 3")
+        expected_sparse_length = (int(sparse_history_capacity)
+                                  if sparse_history_mode == 'm_window'
+                                  else SPARSE_HISTORY_LENGTH)
+        if int(sparse_history_length) != expected_sparse_length:
+            raise ValueError(f"sparse_history_length must be {expected_sparse_length}")
     if int(raw_qpos_dim) != 7:
         raise ValueError(f"Interception raw_qpos_dim must be 7, got {raw_qpos_dim}")
-    if int(state_dim) != 21:
-        raise ValueError(f"Interception state_dim must be 21, got {state_dim}")
+    expected_state_dim = 7 * len(tuple(history_offsets))
+    if int(state_dim) != expected_state_dim:
+        raise ValueError(f"Interception state_dim must be {expected_state_dim}, got {state_dim}")
     if int(action_dim) != 1:
         raise ValueError(f"Interception action_dim must be 1, got {action_dim}")
 
     policy_rate_hz = validate_policy_rate(policy_rate_hz)
     history_offsets = tuple(int(offset) for offset in history_offsets)
     expected_history_offsets = (
-        sparse_history_offsets_frames(policy_rate_hz)
+        (tuple(range(-int(round(float(history_ms) * policy_rate_hz / 1000.0)), 1))
+         if sparse_history_mode == 'm_window' else sparse_history_offsets_frames(policy_rate_hz))
         if input_modality == 'sparse_ball'
         else INTERCEPT_HISTORY_OFFSETS_DEFAULT
     )
@@ -1815,11 +1888,13 @@ def load_intercept_data(
             if input_modality == 'event' and expected_event_metadata is None:
                 expected_event_metadata = event_metadata
             if input_modality == 'sparse_ball':
-                _read_sparse_episode(
-                    root, dataset_path, sparse_source, max_observation_age_sec
-                )
+                (_read_raw_sparse_episode(root, dataset_path, sparse_source)
+                 if sparse_history_mode == 'm_window' else
+                 _read_sparse_episode(root, dataset_path, sparse_source, max_observation_age_sec))
 
-    if input_modality == 'event' and expected_event_metadata.get(
+    if input_modality == 'sparse_ball' and sparse_history_mode == 'm_window':
+        visual_history_offsets = (0,)
+    elif input_modality == 'event' and expected_event_metadata.get(
         'event_representation'
     ) == 'xyt_signed_voxel_v1':
         visual_history_offsets = INTERCEPT_XYT_VISUAL_OFFSETS
@@ -1840,7 +1915,8 @@ def load_intercept_data(
             f"Interception visual-history conflict: rgb_history_frames={rgb_history_frames} "
             f"but visual_history_frames={visual_history_frames}"
         )
-    if requested_visual_frames is not None and int(requested_visual_frames) != resolved_visual_history_frames:
+    if (input_modality != 'sparse_ball' and requested_visual_frames is not None
+            and int(requested_visual_frames) != resolved_visual_history_frames):
         raise ValueError(
             "Interception visual history does not match dataset metadata: "
             f"requested={requested_visual_frames}, expected={resolved_visual_history_frames}"
@@ -1876,6 +1952,8 @@ def load_intercept_data(
         visual_history_offsets=visual_history_offsets,
         sparse_source=sparse_source,
         max_observation_age_sec=max_observation_age_sec,
+        sparse_history_mode=sparse_history_mode, history_ms=history_ms,
+        sparse_history_capacity=sparse_history_capacity, policy_rate_hz=policy_rate_hz,
     )
 
     train_dataset = EpisodicInterceptDataset(
@@ -1892,6 +1970,8 @@ def load_intercept_data(
         expected_event_metadata=expected_event_metadata,
         sparse_source=sparse_source,
         max_observation_age_sec=max_observation_age_sec,
+        sparse_history_mode=sparse_history_mode, history_ms=history_ms,
+        sparse_history_capacity=sparse_history_capacity,
     )
     val_dataset = EpisodicInterceptDataset(
         val_episode_paths,
@@ -1907,6 +1987,8 @@ def load_intercept_data(
         expected_event_metadata=expected_event_metadata,
         sparse_source=sparse_source,
         max_observation_age_sec=max_observation_age_sec,
+        sparse_history_mode=sparse_history_mode, history_ms=history_ms,
+        sparse_history_capacity=sparse_history_capacity,
     )
 
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
