@@ -1165,6 +1165,18 @@ def sample_episode(
         arrays["sparse_tracking/rgb_valid"] = rgb_valid
         arrays["sparse_tracking/rgb_source_timestamps"] = rgb_source_timestamps
         arrays["sparse_tracking/rgb_source_age_sec"] = rgb_source_age_sec
+        raw_rgb_timestamps = np.asarray(data.get("rgb_2d_source_t", []), dtype=np.float64)
+        raw_rgb_points = np.asarray(data.get("rgb_2d_px", []), dtype=np.float32).reshape(-1, 2)
+        if raw_rgb_timestamps.shape != (len(raw_rgb_points),):
+            raise RuntimeError("raw RGB sparse timestamp/coordinate count mismatch")
+        if raw_rgb_timestamps.size:
+            _validate_monotonic_non_decreasing("raw RGB sparse", raw_rgb_timestamps)
+        raw_rgb_valid = (np.isfinite(raw_rgb_points).all(axis=1)
+                         & (raw_rgb_points[:, 0] >= 0) & (raw_rgb_points[:, 0] < rgb.shape[2])
+                         & (raw_rgb_points[:, 1] >= 0) & (raw_rgb_points[:, 1] < rgb.shape[1]))
+        arrays["sparse_tracking/raw_rgb_timestamps"] = raw_rgb_timestamps
+        arrays["sparse_tracking/raw_rgb_2d_px"] = raw_rgb_points
+        arrays["sparse_tracking/raw_rgb_valid"] = raw_rgb_valid.astype(np.uint8)
 
     if event is not None:
         arrays["event"] = event
@@ -1189,6 +1201,20 @@ def sample_episode(
         arrays.update({f"sparse_tracking/{key}": value
                        for key, value in event_tracking.items()})
         arrays["event_tracker_updates"] = list(event_tracker_updates)
+        raw_event_timestamps = np.asarray(
+            [update.available_ros_t_ns for update in event_tracker_updates],
+            dtype=np.float64,
+        ) * 1e-9
+        if raw_event_timestamps.size:
+            _validate_monotonic_non_decreasing("raw event sparse", raw_event_timestamps)
+        arrays["sparse_tracking/raw_event_timestamps"] = raw_event_timestamps
+        arrays["sparse_tracking/raw_event_2d_px"] = np.asarray(
+            [[update.x_px, update.y_px] for update in event_tracker_updates],
+            dtype=np.float32,
+        ).reshape(-1, 2)
+        arrays["sparse_tracking/raw_event_valid"] = np.asarray(
+            [update.valid for update in event_tracker_updates], dtype=np.uint8
+        )
 
     if sparse_source is not None:
         prefix = f"sparse_tracking/{sparse_source}"
@@ -1431,6 +1457,9 @@ def write_episode(
                     ["u_px", "v_px"], dtype=h5py.string_dtype("utf-8")
                 )
                 sparse.attrs["raw_coordinate_units"] = "pixels"
+                sparse.attrs["raw_rgb_timestamp_domain"] = "PointStamped ROS header timestamp"
+                sparse.attrs["raw_event_timestamp_domain"] = "tracker packet availability ROS timestamp"
+                sparse.attrs["raw_stream_order"] = "monotonic_oldest_to_newest"
                 sparse.attrs["rgb_width_px"] = int(arrays["rgb"].shape[2])
                 sparse.attrs["rgb_height_px"] = int(arrays["rgb"].shape[1])
                 if event_tracker_metadata:
