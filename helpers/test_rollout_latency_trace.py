@@ -144,6 +144,7 @@ class RolloutLatencyTraceTests(unittest.TestCase):
     def test_event_provenance_detail_json_serialization(self):
         node, tracer = self.make_tracer("sparse_ball")
         tick = tracer.begin(4_000)
+        tracer.mark(tick, "event_tracker_update_available")
         tracer.mark(tick, "event_observation_selected")
         tracer.mark(tick, "sparse_input_built")
         tracer.add_detail(
@@ -167,7 +168,8 @@ class RolloutLatencyTraceTests(unittest.TestCase):
         stages = detail["stages"]
         ordered = [
             stages[name]["steady_ns"] for name in
-            ("timer_tick_begin", "event_observation_selected", "sparse_input_built",
+            ("timer_tick_begin", "event_tracker_update_available",
+             "event_observation_selected", "sparse_input_built",
              "model_forward_pass", "prediction_publication")
         ]
         self.assertEqual(ordered, sorted(ordered))

@@ -173,6 +173,7 @@ def _sparse_builder_node(module, points, max_age=0.2):
     node.device = torch.device("cpu")
     node._last_sparse_message_tick_ns = None
     node._last_sparse_diagnostics = {}
+    node.event_update_buffer = deque()
     node._trace_stages = []
     node._trace_mark = lambda stage, **detail: node._trace_stages.append((stage, detail))
     return node
@@ -181,6 +182,27 @@ def _sparse_builder_node(module, points, max_age=0.2):
 def _point(stamp, u=30.0, v=40.0):
     msg = types.SimpleNamespace(point=types.SimpleNamespace(x=u, y=v))
     return stamp, msg
+
+
+def _typed(module, update_id, stamp, *, valid=True, u=30.0, v=40.0,
+           receipt=None, packet_id=100, reason=""):
+    return module.BufferedEventObservation(
+        tracker_update_id=update_id, tracker_update_id_valid=True,
+        source_packet_id=packet_id,
+        source_packet_id_valid=True, source_timestamp_ns=int(stamp * 1e9),
+        receipt_timestamp_ns=int((stamp if receipt is None else receipt) * 1e9),
+        sensor_window_start_us=1, sensor_window_end_us=2, x_px=u, y_px=v,
+        vx_px_s=3.0, vy_px_s=4.0, valid=valid, rejection_reason=reason,
+        candidate_count=2, window_event_count=50, confidence=0.9,
+        velocity_valid=True,
+    )
+
+
+def _set_typed_updates(node, updates):
+    node.event_update_buffer = deque(updates)
+    node.visual_buffer = deque(
+        (update.source_timestamp, update) for update in updates if update.valid
+    )
 
 
 def test_event_provenance_sequence_unchanged_then_changed_timestamp(monkeypatch):
@@ -221,6 +243,93 @@ def test_event_selection_precedes_sparse_build_and_model_forward(monkeypatch):
     names = [stage for stage, _detail in node._trace_stages]
     assert names.index("event_observation_selected") < names.index("sparse_input_built")
     assert names.index("sparse_input_built") < names.index("model_forward_pass")
+
+
+def test_typed_valid_update_and_complete_history_provenance(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    node = _sparse_builder_node(module, [])
+    updates = [_typed(module, i, stamp) for i, stamp in enumerate((0.79, 0.89, 0.99), 7)]
+    _set_typed_updates(node, updates)
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.0)
+    p = node._last_sparse_diagnostics["event_provenance"]
+    assert p["tracker_latest_update_id"] == 9
+    assert p["policy_selected_update_id"] == 9
+    assert p["policy_selected_valid"]
+    assert p["selected_event_update_ids"] == [7, 8, 9]
+    assert p["selected_event_packet_ids"] == [100, 100, 100]
+    assert p["selected_event_valid_flags"] == [True, True, True]
+
+
+def test_invalid_latest_holds_prior_valid_and_records_receipt_delay(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    node = _sparse_builder_node(module, [])
+    valid = _typed(module, 10, 0.95, receipt=0.97)
+    invalid = _typed(module, 11, 0.99, valid=False, receipt=1.00,
+                     reason="no_candidate", u=float("nan"), v=float("nan"))
+    _set_typed_updates(node, [valid, invalid])
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.0)
+    p = node._last_sparse_diagnostics["event_provenance"]
+    assert p["tracker_latest_update_id"] == 11
+    assert not p["tracker_latest_valid"]
+    assert p["tracker_latest_rejection_reason"] == "no_candidate"
+    assert p["policy_selected_update_id"] == 10
+    assert p["policy_selected_valid"] and p["policy_selected_is_held"]
+    assert p["policy_selected_receipt_timestamp_ns"] == 970_000_000
+
+
+def test_repeated_and_changed_update_ids_with_unchanged_coordinates(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    node = _sparse_builder_node(module, [])
+    first = _typed(module, 12, 0.95)
+    _set_typed_updates(node, [first])
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.0)
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.01)
+    assert not node._last_sparse_diagnostics["event_provenance"]["event_policy_observation_changed"]
+    changed_id = _typed(module, 13, 1.005, u=30.0, v=40.0)
+    _set_typed_updates(node, [first, changed_id])
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.01)
+    p = node._last_sparse_diagnostics["event_provenance"]
+    assert p["event_policy_observation_changed"]
+    assert p["policy_selected_u"] == 30.0
+
+
+def test_out_of_order_and_future_updates_do_not_break_causal_selection(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    node = _sparse_builder_node(module, [])
+    causal = _typed(module, 20, 0.95)
+    future = _typed(module, 22, 1.05)
+    out_of_order_latest_received = _typed(module, 21, 0.90)
+    _set_typed_updates(node, [causal, future, out_of_order_latest_received])
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.0)
+    p = node._last_sparse_diagnostics["event_provenance"]
+    assert p["tracker_latest_update_id"] == 21
+    assert p["policy_selected_update_id"] == 20
+
+
+def test_typed_callback_retains_invalid_and_legacy_fallback(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    node = _sparse_builder_node(module, [])
+    node._clock = _Clock([1.02, 1.03])
+    msg = types.SimpleNamespace(
+        header=types.SimpleNamespace(stamp=types.SimpleNamespace(sec=1, nanosec=0)),
+        availability_timestamp_ns=1_000_000_000,
+        tracker_update_id=5, tracker_update_id_valid=True,
+        source_packet_id=8, source_packet_id_valid=True,
+        sensor_window_start_us=10, sensor_window_end_us=20,
+        x_px=0.0, y_px=0.0, vx_px_s=0.0, vy_px_s=0.0,
+        valid=False, rejection_reason="empty", candidate_count=0,
+        window_event_count=0, confidence=0.0, velocity_valid=False,
+    )
+    module.FrankaActRolloutNode.event_tracker_update_cb(node, msg)
+    assert len(node.event_update_buffer) == 1
+    assert not node.visual_buffer
+    legacy = types.SimpleNamespace(
+        header=types.SimpleNamespace(stamp=types.SimpleNamespace(sec=1, nanosec=10)),
+        point=types.SimpleNamespace(x=4.0, y=5.0),
+    )
+    module.FrankaActRolloutNode.sparse_cb(node, legacy)
+    assert node.event_update_buffer[-1].legacy_pointstamped
+    assert node.event_update_buffer[-1].tracker_update_id is None
 
 
 def test_sparse_qpos_selection_is_policy_time_causal():

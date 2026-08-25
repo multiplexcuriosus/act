@@ -2,24 +2,51 @@
 
 ## Live rollout provenance
 
-When latency tracing is enabled, the sparse rollout writes the exact causal
-event observation selected at each policy tick into `LatencyTrace.detail_json`.
-`event_source_timestamp_ns` comes from the subscribed `PointStamped.header.stamp`,
-and `event_age_sec` is policy-tick ROS time minus that source time.  The local
-`event_observation_sequence` advances when the selected source timestamp changes;
-it is **not** an OpenMV hardware packet ID.
+Event sparse rollout defaults to `/openmv_cam/event_tracker/update`, whose exact
+type is `openmv_cam/msg/EventTrackerUpdate` (Python import
+`from openmv_cam.msg import EventTrackerUpdate`). Every callback, including an
+invalid result, is retained in the tracker-update provenance buffer. The latest
+tracker update therefore describes what ACT has received, while the
+policy-selected observation describes the latest valid result causally available
+at the policy/history target time. An invalid latest update does not erase the
+previous valid observation: the existing max-age hold semantics continue to feed
+that valid observation until it becomes stale. This keeps ACT prediction behavior
+unchanged.
 
-The current `/openmv_cam/event_tracker/ball_2d_px` type is
-`geometry_msgs/msg/PointStamped` and therefore exposes no tracker update ID or
-hardware packet ID.  To expose one, the upstream OpenMV event-tracker publisher
-must publish a custom stamped message containing the point plus a `uint64`
-tracker update/hardware packet ID (or publish an equivalently header-synchronized
-companion metadata topic).  The rollout can then copy that field into
-`event_source_update_id`; changing detector-latency reporting alone is not a
-freshness signal.
+`availability_timestamp_ns` (equivalent to `header.stamp`) is the tracker result's
+host ROS availability/source timestamp. `*_receipt_timestamp_ns` is sampled by
+the rollout callback and measures when ACT received it. Their difference exposes
+ROS callback/transport delay; policy time minus availability time exposes source
+age. The sensor-window microsecond fields are in the GenX320 sensor clock domain
+and must not be subtracted from ROS time.
+
+`tracker_update_id` is a monotonic tracker-process update sequence.
+`source_packet_id`, when `source_packet_id_valid` is true, is the EVR1 hardware/raw
+packet sequence. The compatibility `event_observation_sequence` is only a local
+rollout sequence and is **not** a hardware packet ID. Packet IDs remain unavailable
+for processed EVT1 and current HDF5 sources, as stated by the upstream message.
+
+For old deployments, `--legacy_event_pointstamped` subscribes to the unchanged
+`--sparse_topic` (normally `/openmv_cam/event_tracker/ball_2d_px`). This fallback
+cannot distinguish invalid tracker updates and has no tracker or hardware packet
+ID; it labels that limitation explicitly in the rejection-reason provenance.
 
 `helpers/export_act_event_provenance.py` converts decoded ACT `LatencyTrace`
-JSON/JSONL records to one CSV row per trace for causal probability analysis.
+JSON/JSONL records to one CSV row per trace. Add `--summary-json summary.json` to
+compute the requested conditional probabilities, held/invalid fractions, hold
+duration distribution, and source-age/transport-delay percentiles.
+
+The provenance separates four bottlenecks:
+
+1. Tracker generation: inspect latest update ID, validity, rejection reason,
+   event count, and availability/source age.
+2. ROS delivery/selection: inspect callback delay and compare latest update with
+   the causally selected/held observation and its full three-slot history.
+3. ACT sensitivity: compare `sparse_input_changed` with
+   `prediction_changed_gt_0_1mm`.
+4. Downstream execution: join prediction time/value to the independently traced
+   `track_s` stream. That final association remains timestamp-based because the
+   controller interface is intentionally unchanged.
 
 DLAB trains ACT directly from sparse RGB or event tracker observations while
 keeping RGB images and optional dense event tensors in the same HDF5 episode.
