@@ -141,6 +141,37 @@ class RolloutLatencyTraceTests(unittest.TestCase):
         self.assertEqual(detail["selected_visual_timestamps_ns"], [1_000, 2_000, 3_000])
         self.assertEqual(detail["selected_visual_anchor_timestamp_ns"], 3_000)
 
+    def test_event_provenance_detail_json_serialization(self):
+        node, tracer = self.make_tracer("sparse_ball")
+        tick = tracer.begin(4_000)
+        tracer.mark(tick, "event_observation_selected")
+        tracer.mark(tick, "sparse_input_built")
+        tracer.add_detail(
+            tick,
+            policy_tick_timestamp_ns=5_000,
+            event_u=12.5,
+            event_v=9.0,
+            event_valid=False,
+            event_age_sec=0.25,
+            event_source_timestamp_ns=4_750,
+            event_observation_sequence=7,
+            event_input_changed=True,
+            sparse_input_changed=True,
+        )
+        tracer.mark(tick, "model_forward_pass")
+        tracer.mark(tick, "prediction_publication")
+        tracer.finish(tick, valid=True)
+        detail = json.loads(node.publisher.messages[0].detail_json)
+        self.assertEqual(detail["event_observation_sequence"], 7)
+        self.assertFalse(detail["event_valid"])
+        stages = detail["stages"]
+        ordered = [
+            stages[name]["steady_ns"] for name in
+            ("timer_tick_begin", "event_observation_selected", "sparse_input_built",
+             "model_forward_pass", "prediction_publication")
+        ]
+        self.assertEqual(ordered, sorted(ordered))
+
     def test_trace_emission_on_rejected_stale_event_tick(self):
         node, tracer = self.make_tracer("event")
         tick = tracer.begin(9_000)

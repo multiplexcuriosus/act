@@ -1,5 +1,26 @@
 # Sparse ball input
 
+## Live rollout provenance
+
+When latency tracing is enabled, the sparse rollout writes the exact causal
+event observation selected at each policy tick into `LatencyTrace.detail_json`.
+`event_source_timestamp_ns` comes from the subscribed `PointStamped.header.stamp`,
+and `event_age_sec` is policy-tick ROS time minus that source time.  The local
+`event_observation_sequence` advances when the selected source timestamp changes;
+it is **not** an OpenMV hardware packet ID.
+
+The current `/openmv_cam/event_tracker/ball_2d_px` type is
+`geometry_msgs/msg/PointStamped` and therefore exposes no tracker update ID or
+hardware packet ID.  To expose one, the upstream OpenMV event-tracker publisher
+must publish a custom stamped message containing the point plus a `uint64`
+tracker update/hardware packet ID (or publish an equivalently header-synchronized
+companion metadata topic).  The rollout can then copy that field into
+`event_source_update_id`; changing detector-latency reporting alone is not a
+freshness signal.
+
+`helpers/export_act_event_provenance.py` converts decoded ACT `LatencyTrace`
+JSON/JSONL records to one CSV row per trace for causal probability analysis.
+
 DLAB trains ACT directly from sparse RGB or event tracker observations while
 keeping RGB images and optional dense event tensors in the same HDF5 episode.
 The integrated bag converter is the authoritative writer; sparse enrichment is

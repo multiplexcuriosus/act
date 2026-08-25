@@ -175,6 +175,13 @@ class FrankaActRolloutNode(Node):
         self._last_attempted_anchor_ns: Optional[int] = None
         self._last_sparse_message_tick_ns: Optional[int] = None
         self._last_sparse_diagnostics: Dict[str, Any] = {}
+        # PointStamped has no hardware packet/update ID.  This local sequence
+        # advances only when the selected source header timestamp changes.
+        self._event_observation_sequence = 0
+        self._last_selected_event_source_timestamp_ns: Optional[int] = None
+        self._last_selected_event_signature = None
+        self._last_sparse_input = None
+        self._last_prediction_current_abs_s: Optional[float] = None
         self._last_policy_output_timestamp: Optional[float] = None
         self._last_anchor_discontinuity_reset_reason = ""
         self._last_throttled_log_sec: Dict[str, float] = {}
@@ -444,6 +451,11 @@ class FrankaActRolloutNode(Node):
         if tracer is not None:
             tracer.mark(getattr(self, "_active_latency_trace", None), stage, **detail)
 
+    def _trace_add_detail(self, **detail) -> None:
+        tracer = getattr(self, "latency_tracer", None)
+        if tracer is not None:
+            tracer.add_detail(getattr(self, "_active_latency_trace", None), **detail)
+
     def _run_policy_forward(self, qpos: torch.Tensor, image: torch.Tensor) -> Tuple[torch.Tensor, float]:
         with torch.inference_mode():
             normalized_image = self.policy.preprocess_image(image)
@@ -536,6 +548,11 @@ class FrankaActRolloutNode(Node):
             self.reset_anchor_floor_ns = floor_anchor_ns
             self._last_sparse_message_tick_ns = None
             self._last_sparse_diagnostics.clear()
+            self._event_observation_sequence = 0
+            self._last_selected_event_source_timestamp_ns = None
+            self._last_selected_event_signature = None
+            self._last_sparse_input = None
+            self._last_prediction_current_abs_s = None
             self._last_policy_output_timestamp = None
             if floor_anchor_ns is not None:
                 self._last_attempted_anchor_ns = floor_anchor_ns
@@ -660,19 +677,74 @@ class FrankaActRolloutNode(Node):
             SparsePoint(ts, float(msg.point.x), float(msg.point.y), 1)
             for ts, msg in self.visual_buffer
         ]
+        point_stamps = [point.source_timestamp for point in sparse_points]
+        selected_source_timestamps = []
+        selected_indices = []
+        for target in targets:
+            index = select_latest_index_at_or_before(point_stamps, target)
+            selected_indices.append(index)
+            selected_source_timestamps.append(
+                None if index is None else float(point_stamps[index])
+            )
+
+        latest_index = selected_indices[-1]
+        selected_point = None if latest_index is None else sparse_points[latest_index]
+        source_timestamp_ns = (
+            None if selected_point is None
+            else int(round(selected_point.source_timestamp * 1e9))
+        )
+        event_age_sec = (
+            None if selected_point is None
+            else float(policy_time - selected_point.source_timestamp)
+        )
+        event_u = None if selected_point is None else float(selected_point.u)
+        event_v = None if selected_point is None else float(selected_point.v)
+        event_valid = bool(
+            selected_point is not None
+            and bool(selected_point.valid)
+            and np.isfinite(event_u) and np.isfinite(event_v)
+            and event_age_sec is not None
+            and 0.0 <= event_age_sec <= self.max_observation_age_sec
+            and 0.0 <= event_u < self.sparse_image_width
+            and 0.0 <= event_v < self.sparse_image_height
+        )
+        previous_source_ns = getattr(
+            self, "_last_selected_event_source_timestamp_ns", None,
+        )
+        if source_timestamp_ns is not None and source_timestamp_ns != previous_source_ns:
+            self._event_observation_sequence = getattr(
+                self, "_event_observation_sequence", 0,
+            ) + 1
+        self._last_selected_event_source_timestamp_ns = source_timestamp_ns
+        event_signature = (source_timestamp_ns, event_u, event_v, event_valid)
+        event_input_changed = event_signature != getattr(
+            self, "_last_selected_event_signature", None,
+        )
+        self._last_selected_event_signature = event_signature
+        self._trace_mark(
+            "event_observation_selected",
+            policy_tick_timestamp_ns=int(round(policy_time * 1e9)),
+            event_u=event_u,
+            event_v=event_v,
+            event_valid=event_valid,
+            event_age_sec=event_age_sec,
+            event_source_timestamp_ns=source_timestamp_ns,
+            event_observation_sequence=getattr(self, "_event_observation_sequence", 0),
+            event_input_changed=event_input_changed,
+        )
+
         image_np = construct_causal_sparse_history(
             sparse_points, policy_time, SPARSE_HISTORY_OFFSETS_SEC,
             self.sparse_image_width, self.sparse_image_height,
             self.max_observation_age_sec,
         )[None, ...]
-
-        point_stamps = [point.source_timestamp for point in sparse_points]
-        selected_source_timestamps = []
-        for target in targets:
-            index = select_latest_index_at_or_before(point_stamps, target)
-            selected_source_timestamps.append(
-                None if index is None else float(point_stamps[index])
-            )
+        previous_sparse_input = getattr(self, "_last_sparse_input", None)
+        sparse_input_changed = (
+            previous_sparse_input is None
+            or not np.array_equal(image_np, previous_sparse_input, equal_nan=True)
+        )
+        self._last_sparse_input = image_np.copy()
+        self._trace_mark("sparse_input_built", sparse_input_changed=sparse_input_changed)
 
         joint_timestamps = [item[0] for item in self.joint_buffer]
         qpos_samples = [item[1] for item in self.joint_buffer]
@@ -714,6 +786,17 @@ class FrankaActRolloutNode(Node):
             "selected_qpos_timestamps": qpos_timestamps,
             "selected_tcp_timestamp": float(tcp_timestamp),
             "inference_without_new_sparse_message": no_new_sparse,
+            "event_provenance": {
+                "policy_tick_timestamp_ns": int(round(policy_time * 1e9)),
+                "event_u": event_u,
+                "event_v": event_v,
+                "event_valid": event_valid,
+                "event_age_sec": event_age_sec,
+                "event_source_timestamp_ns": source_timestamp_ns,
+                "event_observation_sequence": getattr(self, "_event_observation_sequence", 0),
+                "event_input_changed": event_input_changed,
+                "sparse_input_changed": sparse_input_changed,
+            },
         }
         self._trace_mark(
             "sparse_observation_selection_and_construction",
@@ -782,6 +865,10 @@ class FrankaActRolloutNode(Node):
             self._last_attempted_anchor_ns = anchor_timestamp_ns
 
         try:
+            if self.input_modality == "sparse_ball":
+                # Add the already-selected observation immediately before ACT;
+                # never re-read the subscription buffer after inference.
+                self._trace_add_detail(**self._last_sparse_diagnostics["event_provenance"])
             raw_output, inference_ms = self._run_policy_forward(qpos, curr_image)
         except Exception:
             with self._aggregation_lock:
@@ -846,6 +933,19 @@ class FrankaActRolloutNode(Node):
             if not np.isfinite(selection.effective_age_frames):
                 raise ValueError("Temporal aggregator produced non-finite effective age")
             current_value = float(selection.value)
+            previous_prediction = getattr(self, "_last_prediction_current_abs_s", None)
+            prediction_delta = (
+                None if previous_prediction is None
+                else current_value - previous_prediction
+            )
+            self._trace_add_detail(
+                prediction_current_abs_s=current_value,
+                prediction_delta_abs_s=prediction_delta,
+                prediction_changed_gt_0_1mm=(
+                    False if prediction_delta is None
+                    else abs(prediction_delta) > 0.0001
+                ),
+            )
             agg_contributors = int(selection.contributor_count)
             agg_effective_age_frames = float(selection.effective_age_frames)
             self._trace_mark(
@@ -865,6 +965,8 @@ class FrankaActRolloutNode(Node):
                 self.reset_anchor_floor_ns = None
 
         self.publish_predictions(absolute_s, current_value)
+        self._last_prediction_current_abs_s = current_value
+        self._trace_mark("prediction_publication")
         self._trace_mark("prediction_publication_completion")
         with self._aggregation_lock:
             self.accepted_prediction_count += 1

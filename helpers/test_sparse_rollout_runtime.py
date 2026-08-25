@@ -157,6 +157,72 @@ def test_repeated_sparse_ticks_are_causal_and_age_the_cached_observation():
     assert np.all(second[:, 2] == 1)
 
 
+def _sparse_builder_node(module, points, max_age=0.2):
+    node = _base_runtime_node(module, "sparse_ball", [])
+    node.visual_buffer = deque(points)
+    node.joint_buffer = deque(
+        (stamp, np.full(7, stamp, dtype=np.float32))
+        for stamp in (0.6, 0.7, 0.8, 0.9, 1.0, 1.1)
+    )
+    node.tcp_buffer = deque([(1.0, 0.2), (1.1, 0.2)])
+    node.sparse_image_width = node.sparse_image_height = 320
+    node.sparse_source = "event"
+    node.sparse_topic = "/openmv_cam/event_tracker/ball_2d_px"
+    node.max_observation_age_sec = max_age
+    node.pre_process = lambda value: value
+    node.device = torch.device("cpu")
+    node._last_sparse_message_tick_ns = None
+    node._last_sparse_diagnostics = {}
+    node._trace_stages = []
+    node._trace_mark = lambda stage, **detail: node._trace_stages.append((stage, detail))
+    return node
+
+
+def _point(stamp, u=30.0, v=40.0):
+    msg = types.SimpleNamespace(point=types.SimpleNamespace(x=u, y=v))
+    return stamp, msg
+
+
+def test_event_provenance_sequence_unchanged_then_changed_timestamp(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    node = _sparse_builder_node(module, [_point(0.95)])
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.0)
+    first = dict(node._last_sparse_diagnostics["event_provenance"])
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.1)
+    unchanged = dict(node._last_sparse_diagnostics["event_provenance"])
+    node.visual_buffer.append(_point(1.08, 31.0, 41.0))
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.1)
+    changed = node._last_sparse_diagnostics["event_provenance"]
+    assert first["event_observation_sequence"] == 1
+    assert unchanged["event_observation_sequence"] == 1
+    assert not unchanged["event_input_changed"]
+    assert changed["event_observation_sequence"] == 2
+    assert changed["event_input_changed"]
+
+
+def test_event_provenance_invalid_and_stale(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    invalid = _sparse_builder_node(module, [_point(0.95, -1.0, 40.0)])
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(invalid, 1.0)
+    assert not invalid._last_sparse_diagnostics["event_provenance"]["event_valid"]
+
+    stale = _sparse_builder_node(module, [_point(0.5)], max_age=0.2)
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(stale, 1.0)
+    provenance = stale._last_sparse_diagnostics["event_provenance"]
+    assert not provenance["event_valid"]
+    assert provenance["event_age_sec"] == 0.5
+
+
+def test_event_selection_precedes_sparse_build_and_model_forward(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    node = _sparse_builder_node(module, [_point(0.95)])
+    module.FrankaActRolloutNode._build_sparse_policy_inputs(node, 1.0)
+    node._trace_stages.append(("model_forward_pass", {}))
+    names = [stage for stage, _detail in node._trace_stages]
+    assert names.index("event_observation_selected") < names.index("sparse_input_built")
+    assert names.index("sparse_input_built") < names.index("model_forward_pass")
+
+
 def test_sparse_qpos_selection_is_policy_time_causal():
     stamps = [0.79, 0.81, 0.89, 0.91, 0.99, 1.01]
     samples = [np.full(7, index, dtype=np.float32)
