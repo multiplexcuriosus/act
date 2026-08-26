@@ -83,8 +83,11 @@ def test_dryrun_keeps_selected_source_for_input_and_checkpoint(rollout, source, 
     assert runtime["sparse_source"] == source
     assert resolve_sparse_topic(runtime["sparse_source"], None) == topic
     checkpoint_contract = resolve_sparse_checkpoint_contract(
-        {
-            "sparse_source": source,
+            {
+                "input_modality": "sparse_ball",
+                "state_dim": 21,
+                "action_dim": 1,
+                "sparse_source": source,
             "sparse_feature_dim": 4,
             "sparse_history_length": 3,
             "policy_rate_hz": 30,

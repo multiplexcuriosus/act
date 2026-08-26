@@ -46,9 +46,10 @@ from intercept_rollout_contract import (
 from policy import ACTPolicy
 from rollout_latency_trace import RolloutLatencyTracer, resolve_latency_trace_cuda_sync
 from sparse_ball import (
-    SparsePoint, construct_causal_sparse_history,
+    SparsePoint, construct_causal_sparse_history, construct_causal_sparse_window,
     SPARSE_HISTORY_OFFSETS_SEC, resolve_sparse_topic,
-    resolve_sparse_checkpoint_contract, sparse_history_offsets_frames, validate_policy_rate,
+    resolve_history_config, resolve_sparse_checkpoint_contract,
+    sparse_history_offsets_frames, validate_policy_rate,
     validate_sparse_checkpoint_contract,
 )
 
@@ -173,14 +174,37 @@ class FrankaActRolloutNode(Node):
         self.action_lookahead_steps = int(args.action_lookahead_steps)
         self.selected_target_offset_frames = int(self.action_lookahead_steps + 1)
         self.selected_target_offset_ms = 1000.0 * float(self.selected_target_offset_frames) / float(self.fps)
-        self.state_dim = args.state_dim
+        self.sparse_history_mode = str(args.sparse_history_mode)
+        self.history_ms = float(args.history_ms)
+        self.sparse_history_capacity = int(args.sparse_history_capacity)
+        history_config = resolve_history_config(
+            self.sparse_history_mode, self.policy_rate_hz, self.history_ms,
+            self.sparse_history_capacity)
+        expected_state_dim = history_config["state_dim"]
+        self.state_dim = (expected_state_dim if args.state_dim is None
+                          and args.input_modality == "sparse_ball"
+                          else (21 if args.state_dim is None else int(args.state_dim)))
         self.action_dim = args.action_dim
         self.chunk_size = args.chunk_size
         self.input_modality = str(args.input_modality)
         self.qpos_history_offsets = (
-            sparse_history_offsets_frames(self.policy_rate_hz)
+            history_config["qpos_history_offsets"]
             if self.input_modality == "sparse_ball" else (-6, -3, 0)
         )
+        self.sparse_history_length = (
+            history_config["sparse_history_length"]
+            if self.input_modality == "sparse_ball" else 3)
+        if self.input_modality == "sparse_ball" and self.state_dim != expected_state_dim:
+            raise ValueError(
+                f"{self.sparse_history_mode} sparse history at {self.policy_rate_hz} Hz "
+                f"and history_ms={self.history_ms:g} requires state_dim={expected_state_dim}, "
+                f"got {self.state_dim}")
+        if (self.input_modality == "sparse_ball"
+                and self.sparse_history_mode == "m_window"
+                and args.legacy_event_pointstamped):
+            raise ValueError(
+                "--legacy_event_pointstamped is not supported with m_window: typed updates "
+                "are required to preserve invalid observations and provenance")
         self.sparse_source = args.sparse_source
         self.sparse_topic = resolve_sparse_topic(self.sparse_source, args.sparse_topic)
         self.event_update_topic = str(args.event_update_topic)
@@ -273,7 +297,10 @@ class FrankaActRolloutNode(Node):
             "image_size": self.image_size,
             "sparse_source": self.sparse_source,
             "sparse_feature_dim": 4,
-            "sparse_history_length": 3,
+            "sparse_history_length": self.sparse_history_length,
+            "sparse_history_mode": self.sparse_history_mode,
+            "history_ms": self.history_ms,
+            "sparse_history_capacity": self.sparse_history_length,
             "max_observation_age_sec": self.max_observation_age_sec,
             "policy_rate_hz": self.policy_rate_hz,
         }
@@ -290,9 +317,12 @@ class FrankaActRolloutNode(Node):
             validate_sparse_checkpoint_contract(
                 stats, self.sparse_source, self.sparse_image_width,
                 self.sparse_image_height, self.max_observation_age_sec,
+                self.sparse_history_length,
             )
             sparse_runtime_contract = resolve_sparse_checkpoint_contract(
                 stats, self.policy_rate_hz, self.chunk_size, self.sparse_source,
+                self.sparse_history_mode, self.history_ms,
+                self.sparse_history_capacity, self.state_dim,
             )
             self.qpos_history_offsets = tuple(
                 sparse_runtime_contract["qpos_history_offsets"]
@@ -303,7 +333,8 @@ class FrankaActRolloutNode(Node):
                     "Legacy 30 Hz sparse checkpoint metadata inferred: "
                     f"{inferred}"
                 )
-            stats_arrays = validate_normalization_stats(stats, include_sparse=True)
+            stats_arrays = validate_normalization_stats(
+                stats, include_sparse=True, qpos_dim=self.state_dim)
             policy_config["sparse_mean"] = stats_arrays["sparse_mean"]
             policy_config["sparse_std"] = stats_arrays["sparse_std"]
         else:
@@ -390,7 +421,11 @@ class FrankaActRolloutNode(Node):
 
         if self.input_modality == "sparse_ball":
             self.get_logger().info(
-                f"sparse_source={self.sparse_source} sparse_topic={self.sparse_topic}"
+                f"sparse_source={self.sparse_source} sparse_topic={self.sparse_topic} "
+                f"sparse_history_mode={self.sparse_history_mode} history_ms={self.history_ms:g} "
+                f"sparse_history_capacity={self.sparse_history_length} "
+                f"qpos_history_offsets={list(self.qpos_history_offsets)} "
+                f"state_dim={self.state_dim} sparse_tensor_shape=(1,{self.sparse_history_length},4)"
             )
             if self.sparse_source == "event":
                 self.get_logger().info(
@@ -514,9 +549,9 @@ class FrankaActRolloutNode(Node):
         )
         # Receipt order is intentional here: this buffer answers "newest received".
         self.event_update_buffer.append(observation)
-        if observation.valid:
-            # The sparse constructor sorts by source time. Invalid updates are not fed
-            # to ACT, retaining the pre-existing latest-valid hold/max-age behavior.
+        if observation.valid or self.sparse_history_mode == "m_window":
+            # M-window consumes literal updates, including invalid tracker results.
+            # Legacy retains its historical latest-valid hold/max-age behavior.
             self.visual_buffer.append((observation.source_timestamp, observation))
 
     def joint_cb(self, msg: JointState) -> None:
@@ -608,7 +643,9 @@ class FrankaActRolloutNode(Node):
             device=self.device,
         )
         if self.input_modality == "sparse_ball":
-            warmup_image = torch.zeros((1, 3, 4), dtype=torch.float32, device=self.device)
+            warmup_image = torch.zeros(
+                (1, self.sparse_history_length, 4),
+                dtype=torch.float32, device=self.device)
         else:
             warmup_image = torch.zeros((
                 1,                    # batch
@@ -784,7 +821,9 @@ class FrankaActRolloutNode(Node):
         return sync, qpos, image, anchor_timestamp_ns
 
     def _build_sparse_policy_inputs(self, policy_time: float):
-        targets = tuple(policy_time + offset for offset in SPARSE_HISTORY_OFFSETS_SEC)
+        targets = tuple(
+            policy_time + offset / float(self.policy_rate_hz)
+            for offset in self.qpos_history_offsets)
         def observation_from_visual(ts, msg):
             if isinstance(msg, BufferedEventObservation):
                 return msg
@@ -811,14 +850,26 @@ class FrankaActRolloutNode(Node):
         point_stamps = [point.source_timestamp for point in sparse_points]
         selected_source_timestamps = []
         selected_indices = []
-        for target in targets:
-            index = select_latest_index_at_or_before(point_stamps, target)
-            selected_indices.append(index)
-            selected_source_timestamps.append(
-                None if index is None else float(point_stamps[index])
-            )
+        window_info = None
+        if self.sparse_history_mode == "m_window":
+            lower = policy_time - self.history_ms / 1000.0
+            selected_indices = [
+                index for index, stamp in enumerate(point_stamps)
+                if lower <= stamp <= policy_time
+            ]
+            overflow_count = max(0, len(selected_indices) - self.sparse_history_length)
+            if overflow_count:
+                selected_indices = selected_indices[-self.sparse_history_length:]
+            selected_source_timestamps = [float(point_stamps[i]) for i in selected_indices]
+        else:
+            for target in targets:
+                index = select_latest_index_at_or_before(point_stamps, target)
+                selected_indices.append(index)
+                selected_source_timestamps.append(
+                    None if index is None else float(point_stamps[index])
+                )
 
-        latest_index = selected_indices[-1]
+        latest_index = selected_indices[-1] if selected_indices else None
         selected_point = None if latest_index is None else sparse_points[latest_index]
         selected_observation = None if latest_index is None else observations[latest_index]
         update_buffer = getattr(self, "event_update_buffer", ())
@@ -891,11 +942,17 @@ class FrankaActRolloutNode(Node):
             policy_selected_valid=policy_selected_valid,
         )
 
-        image_np = construct_causal_sparse_history(
-            sparse_points, policy_time, SPARSE_HISTORY_OFFSETS_SEC,
-            self.sparse_image_width, self.sparse_image_height,
-            self.max_observation_age_sec,
-        )[None, ...]
+        if self.sparse_history_mode == "m_window":
+            image_rows, window_info = construct_causal_sparse_window(
+                sparse_points, policy_time, self.history_ms,
+                self.sparse_history_length, self.sparse_image_width,
+                self.sparse_image_height, return_info=True)
+        else:
+            image_rows = construct_causal_sparse_history(
+                sparse_points, policy_time, SPARSE_HISTORY_OFFSETS_SEC,
+                self.sparse_image_width, self.sparse_image_height,
+                self.max_observation_age_sec)
+        image_np = image_rows[None, ...]
         previous_sparse_input = getattr(self, "_last_sparse_input", None)
         sparse_input_changed = (
             previous_sparse_input is None
@@ -907,18 +964,25 @@ class FrankaActRolloutNode(Node):
         selected_observations = [
             None if index is None else observations[index] for index in selected_indices
         ]
-        selected_event_ages = [
-            None if obs is None else float(target - obs.source_timestamp)
-            for target, obs in zip(targets, selected_observations)
-        ]
-        selected_event_valid_flags = [
-            bool(obs is not None and obs.valid and age is not None
-                 and 0.0 <= age <= self.max_observation_age_sec
-                 and np.isfinite(obs.x_px) and np.isfinite(obs.y_px)
-                 and 0.0 <= obs.x_px < self.sparse_image_width
-                 and 0.0 <= obs.y_px < self.sparse_image_height)
-            for obs, age in zip(selected_observations, selected_event_ages)
-        ]
+        selected_event_ages = (
+            [float(policy_time - obs.source_timestamp) for obs in selected_observations]
+            if self.sparse_history_mode == "m_window" else
+            [None if obs is None else float(target - obs.source_timestamp)
+             for target, obs in zip(targets, selected_observations)]
+        )
+        if self.sparse_history_mode == "m_window":
+            selected_event_valid_flags = [
+                bool(value) for value in image_np[0, -len(selected_observations):, 2]
+            ] if selected_observations else []
+        else:
+            selected_event_valid_flags = [
+                bool(obs is not None and obs.valid and age is not None
+                     and 0.0 <= age <= self.max_observation_age_sec
+                     and np.isfinite(obs.x_px) and np.isfinite(obs.y_px)
+                     and 0.0 <= obs.x_px < self.sparse_image_width
+                     and 0.0 <= obs.y_px < self.sparse_image_height)
+                for obs, age in zip(selected_observations, selected_event_ages)
+            ]
 
         def obs_value(obs, name):
             return None if obs is None else getattr(obs, name)
@@ -965,6 +1029,15 @@ class FrankaActRolloutNode(Node):
             "selected_event_valid_flags": selected_event_valid_flags,
             "selected_event_packet_ids": [obs_value(obs, "source_packet_id")
                                            for obs in selected_observations],
+            "history_mode": self.sparse_history_mode,
+            "history_horizon_ms": self.history_ms,
+            "sparse_history_capacity": self.sparse_history_length,
+            "selected_count": (len(selected_observations) if window_info is None
+                               else window_info["selected_count"]),
+            "overflow_count": (0 if window_info is None
+                               else window_info["overflow_count"]),
+            "padding_count": (sum(obs is None for obs in selected_observations)
+                              if window_info is None else window_info["padding_count"]),
             "sparse_input_changed": sparse_input_changed,
             "event_source_changed": event_source_changed,
             "event_policy_observation_changed": event_policy_observation_changed,
@@ -991,7 +1064,7 @@ class FrankaActRolloutNode(Node):
         tcp_timestamp, anchor_tcp_s = self.tcp_buffer[tcp_index]
 
         sync = type("SparseSync", (), {
-            "history_indices": (-1, -1, -1),
+            "history_indices": tuple(-1 for _ in targets),
             "visual_timestamps": targets,
             "qpos_timestamps": qpos_timestamps,
             "anchor_tcp_s": float(anchor_tcp_s),
@@ -1349,7 +1422,9 @@ def main():
     parser.add_argument("--latency_trace_topic", type=str, default="/intercept_trace/act_rollout")
     parser.add_argument("--latency_run_id", type=str, default="")
 
-    parser.add_argument("--state_dim", type=int, default=21)
+    parser.add_argument(
+        "--state_dim", type=int, default=None,
+        help="Policy qpos dimension (derived from sparse history when omitted).")
     parser.add_argument("--action_dim", type=int, default=1)
     parser.add_argument("--chunk_size", type=int, default=None)
     parser.add_argument("--rgb_history_frames", type=int, default=3)
@@ -1361,6 +1436,10 @@ def main():
         default="sparse_ball",
     )
     parser.add_argument("--sparse_source", choices=["rgb", "event"])
+    parser.add_argument(
+        "--sparse_history_mode", choices=["legacy", "m_window"], default="legacy")
+    parser.add_argument("--history_ms", type=float, default=200.0)
+    parser.add_argument("--sparse_history_capacity", type=int, default=32)
     add_dryrun_argument(parser)
     parser.add_argument("--sparse_topic", type=str)
     parser.add_argument(

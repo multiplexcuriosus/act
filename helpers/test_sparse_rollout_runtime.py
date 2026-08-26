@@ -14,7 +14,9 @@ from intercept_rollout_contract import (
     select_qpos_history_at_targets,
     skip_duplicate_source_frame,
 )
-from sparse_ball import SparsePoint, construct_causal_sparse_history
+from sparse_ball import (
+    SparsePoint, construct_causal_sparse_history, construct_causal_sparse_window,
+)
 
 
 def _load_rollout_module(monkeypatch):
@@ -108,6 +110,11 @@ def _base_runtime_node(module, modality, clock_seconds):
     node._last_diag_log_sec = time.time()
     node.diag_log_period_sec = 10_000.0
     node.fps = 30.0
+    node.policy_rate_hz = 30
+    node.qpos_history_offsets = (-6, -3, 0)
+    node.sparse_history_mode = "legacy"
+    node.history_ms = 200.0
+    node.sparse_history_length = 3
     node.temporal_agg_mode = "latest"
     node.selected_target_offset_frames = 1
     node.selected_target_offset_ms = 1000.0 / 30.0
@@ -167,6 +174,10 @@ def _sparse_builder_node(module, points, max_age=0.2):
     node.tcp_buffer = deque([(1.0, 0.2), (1.1, 0.2)])
     node.sparse_image_width = node.sparse_image_height = 320
     node.sparse_source = "event"
+    node.sparse_history_mode = "legacy"
+    node.history_ms = 200.0
+    node.sparse_history_length = 3
+    node.policy_rate_hz = 30
     node.sparse_topic = "/openmv_cam/event_tracker/ball_2d_px"
     node.max_observation_age_sec = max_age
     node.pre_process = lambda value: value
@@ -201,8 +212,42 @@ def _typed(module, update_id, stamp, *, valid=True, u=30.0, v=40.0,
 def _set_typed_updates(node, updates):
     node.event_update_buffer = deque(updates)
     node.visual_buffer = deque(
-        (update.source_timestamp, update) for update in updates if update.valid
+        (update.source_timestamp, update) for update in updates
+        if update.valid or node.sparse_history_mode == "m_window"
     )
+
+
+def test_m_window_runtime_tensor_provenance_invalid_and_no_future(monkeypatch):
+    module = _load_rollout_module(monkeypatch)
+    node = _sparse_builder_node(module, [])
+    node.sparse_history_mode = "m_window"
+    node.history_ms = 100.0
+    node.sparse_history_length = 32
+    node.policy_rate_hz = 60
+    node.qpos_history_offsets = tuple(range(-6, 1))
+    node.joint_buffer = deque(
+        (stamp, np.full(7, stamp, dtype=np.float32))
+        for stamp in np.arange(0.85, 1.001, 0.005)
+    )
+    updates = [
+        _typed(module, 1, 0.90),
+        _typed(module, 2, 0.95, valid=False, reason="no_candidate",
+               u=float("nan"), v=float("nan")),
+        _typed(module, 3, 1.00),
+        _typed(module, 4, 1.01),
+    ]
+    _set_typed_updates(node, updates)
+    sync, _qpos, image, _anchor = module.FrankaActRolloutNode._build_sparse_policy_inputs(
+        node, 1.0)
+    assert image.shape == (1, 32, 4)
+    assert sync.qpos_history.shape == (49,)
+    np.testing.assert_array_equal(image[0, -3:, 2].numpy(), [1, 0, 1])
+    provenance = node._last_sparse_diagnostics["event_provenance"]
+    assert provenance["selected_event_update_ids"] == [1, 2, 3]
+    assert provenance["selected_count"] == 3
+    assert provenance["padding_count"] == 29
+    assert provenance["history_mode"] == "m_window"
+    assert 4 not in provenance["selected_event_update_ids"]
 
 
 def test_event_provenance_sequence_unchanged_then_changed_timestamp(monkeypatch):

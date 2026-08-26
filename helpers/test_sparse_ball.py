@@ -8,7 +8,8 @@ import pytest
 
 from sparse_ball import (
     SPARSE_FEATURE_NAMES, policy_period_ns, policy_period_sec,
-    SparsePoint, construct_causal_sparse_history, construct_sparse_features,
+    SparsePoint, construct_causal_sparse_history, construct_causal_sparse_window,
+    construct_sparse_features, qpos_history_offsets_for_window,
     default_sparse_topic, sparse_dataset_paths, sparse_history_offsets_frames,
     resolve_sparse_checkpoint_contract, resolve_sparse_topic, validate_policy_rate,
     validate_sparse_checkpoint_contract,
@@ -192,6 +193,7 @@ def test_unsupported_policy_rates_are_rejected(rate):
 def _checkpoint_contract(rate=30):
     offsets = [-6, -3, 0] if rate == 30 else [-12, -6, 0]
     return {
+        "input_modality": "sparse_ball", "state_dim": 21, "action_dim": 1,
         "policy_rate_hz": np.int64(rate),
         "chunk_size": np.asarray(rate),
         "qpos_history_offsets": tuple(offsets),
@@ -200,6 +202,55 @@ def _checkpoint_contract(rate=30):
         "sparse_feature_dim": np.int64(4),
         "sparse_history_length": np.asarray(3),
     }
+
+
+def test_m_window_boundaries_padding_overflow_invalid_and_future_exclusion():
+    points = [
+        SparsePoint(0.899999, 1, 1),
+        SparsePoint(0.900000, 10, 20),
+        SparsePoint(0.950000, float("nan"), float("nan"), valid=0),
+        SparsePoint(1.000000, 30, 40),
+        SparsePoint(1.000001, 50, 60),
+    ]
+    window, info = construct_causal_sparse_window(
+        points, 1.0, 100.0, 32, 320, 320, return_info=True)
+    assert window.shape == (32, 4)
+    assert info["selected_count"] == 3
+    assert info["padding_count"] == 29
+    np.testing.assert_array_equal(window[-3:, 2], [1, 0, 1])
+    np.testing.assert_allclose(window[-3:, 3], [0.1, 0.05, 0.0], atol=1e-7)
+
+    overflow, overflow_info = construct_causal_sparse_window(
+        [SparsePoint(0.9 + i * 0.001, i, i) for i in range(40)],
+        1.0, 100.0, 32, 320, 320, return_info=True)
+    assert overflow.shape == (32, 4)
+    assert overflow_info["overflow_count"] == 8
+    assert overflow_info["selected_timestamps"][0] == pytest.approx(0.908)
+
+
+def _m_window_contract(**overrides):
+    stats = {
+        "input_modality": "sparse_ball", "sparse_source": "event",
+        "sparse_feature_dim": 4, "sparse_history_length": 32,
+        "sparse_history_mode": "m_window", "history_horizon_ms": 100.0,
+        "sparse_history_capacity": 32, "state_dim": 49, "action_dim": 1,
+        "qpos_history_offsets": list(range(-6, 1)),
+        "policy_rate_hz": 60, "chunk_size": 60,
+    }
+    stats.update(overrides)
+    return stats
+
+
+def test_m_window_checkpoint_contract_accepts_exact_contract_and_rejects_legacy_shapes():
+    assert qpos_history_offsets_for_window(60, 100) == tuple(range(-6, 1))
+    resolved = resolve_sparse_checkpoint_contract(
+        _m_window_contract(), 60, 60, "event", "m_window", 100, 32, 49)
+    assert resolved["sparse_history_length"] == 32
+    for bad in ({"state_dim": 21}, {"sparse_history_length": 3}):
+        with pytest.raises(ValueError):
+            resolve_sparse_checkpoint_contract(
+                _m_window_contract(**bad), 60, 60, "event",
+                "m_window", 100, 32, 49)
 
 
 @pytest.mark.parametrize("rate", [30, 60])

@@ -110,6 +110,12 @@ class InterceptRolloutContractTests(unittest.TestCase):
         np.testing.assert_allclose(q_hist[7:14], q1)
         np.testing.assert_allclose(q_hist[14:], q2)
 
+        q49 = build_qpos_history([
+            np.full(7, index, dtype=np.float32) for index in range(7)
+        ])
+        self.assertEqual(q49.shape, (49,))
+        np.testing.assert_array_equal(q49.reshape(7, 7)[:, 0], np.arange(7))
+
     def test_timestamp_selection_with_delays(self):
         rgb_ts = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]
         joint_ts = [0.95, 1.15, 1.35, 1.55]

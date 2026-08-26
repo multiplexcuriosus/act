@@ -448,8 +448,8 @@ def extract_arm_qpos(joint_names: Sequence[str], joint_positions: Sequence[float
 
 
 def build_qpos_history(qpos_samples: Sequence[np.ndarray]) -> np.ndarray:
-    if len(qpos_samples) != 3:
-        raise ValueError(f"Expected exactly 3 qpos samples, got {len(qpos_samples)}")
+    if not qpos_samples:
+        raise ValueError("Expected at least one qpos sample")
 
     flattened = []
     for sample in qpos_samples:
@@ -459,8 +459,10 @@ def build_qpos_history(qpos_samples: Sequence[np.ndarray]) -> np.ndarray:
         flattened.append(qpos)
 
     out = np.concatenate(flattened, axis=0)
-    if out.shape != (21,):
-        raise AssertionError(f"qpos history shape mismatch: expected (21,), got {out.shape}")
+    expected_shape = (7 * len(qpos_samples),)
+    if out.shape != expected_shape:
+        raise AssertionError(
+            f"qpos history shape mismatch: expected {expected_shape}, got {out.shape}")
     return out
 
 
@@ -578,11 +580,12 @@ def validate_normalization_stats(
     stats: Dict[str, object],
     *,
     include_sparse: bool = False,
+    qpos_dim: int = 21,
 ) -> Dict[str, np.ndarray]:
     """Validate normalization arrays shared by dense and sparse rollouts."""
     expected = [
-        ("qpos_mean", (21,), False),
-        ("qpos_std", (21,), True),
+        ("qpos_mean", (int(qpos_dim),), False),
+        ("qpos_std", (int(qpos_dim),), True),
         ("action_mean", (1,), False),
         ("action_std", (1,), True),
     ]

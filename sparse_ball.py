@@ -14,6 +14,10 @@ SUPPORTED_POLICY_RATES_HZ = (30, 60)
 SPARSE_HISTORY_OFFSETS_SEC = (-0.2, -0.1, 0.0)
 SPARSE_HISTORY_OFFSETS = (-6, -3, 0)
 SPARSE_HISTORY_LENGTH = 3
+SPARSE_HISTORY_MODE_LEGACY = "legacy"
+SPARSE_HISTORY_MODE_M_WINDOW = "m_window"
+DEFAULT_HISTORY_MS = 200.0
+DEFAULT_SPARSE_HISTORY_CAPACITY = 32
 SPARSE_FEATURE_NAMES = ("u_norm", "v_norm", "valid", "observation_age_sec")
 SPARSE_SOURCE_TIMESTAMP_POLICY = "point_stamped_header_latest_at_or_before_policy_time"
 DEFAULT_MAX_OBSERVATION_AGE_SEC = 0.10
@@ -48,6 +52,46 @@ def sparse_history_offsets_frames(rate_hz):
     return tuple(int(round(offset * rate)) for offset in SPARSE_HISTORY_OFFSETS_SEC)
 
 
+def qpos_history_offsets_for_window(rate_hz, history_ms=DEFAULT_HISTORY_MS):
+    """Return every policy-grid offset in an inclusive causal time window."""
+    rate = validate_policy_rate(rate_hz)
+    horizon_ms = float(history_ms)
+    if not np.isfinite(horizon_ms) or horizon_ms < 0:
+        raise ValueError("history_ms must be finite and non-negative")
+    frames = int(round(horizon_ms * rate / 1000.0))
+    return tuple(range(-frames, 1))
+
+
+def resolve_history_config(mode=SPARSE_HISTORY_MODE_LEGACY, policy_rate_hz=30,
+                           history_ms=DEFAULT_HISTORY_MS,
+                           sparse_history_capacity=DEFAULT_SPARSE_HISTORY_CAPACITY):
+    """Resolve sparse tensor and qpos dimensions for a rollout/training contract."""
+    mode = str(mode)
+    if mode not in (SPARSE_HISTORY_MODE_LEGACY, SPARSE_HISTORY_MODE_M_WINDOW):
+        raise ValueError("sparse_history_mode must be 'legacy' or 'm_window'")
+    if mode == SPARSE_HISTORY_MODE_LEGACY:
+        offsets = sparse_history_offsets_frames(policy_rate_hz)
+        capacity = SPARSE_HISTORY_LENGTH
+        horizon_ms = 200.0
+    else:
+        offsets = qpos_history_offsets_for_window(policy_rate_hz, history_ms)
+        capacity = int(sparse_history_capacity)
+        horizon_ms = float(history_ms)
+        if capacity <= 0:
+            raise ValueError("sparse_history_capacity must be positive")
+    return {
+        "history_mode": mode,
+        "history_horizon_ms": horizon_ms,
+        "history_horizon_sec": horizon_ms / 1000.0,
+        "sparse_history_capacity": capacity,
+        "sparse_history_length": capacity,
+        "sparse_feature_dim": SPARSE_FEATURE_DIM,
+        "qpos_history_offsets": offsets,
+        "qpos_history_length": len(offsets),
+        "state_dim": 7 * len(offsets),
+    }
+
+
 def _normalize_contract_value(value):
     if isinstance(value, np.ndarray):
         value = value.tolist()
@@ -60,12 +104,17 @@ def _normalize_contract_value(value):
 
 def resolve_sparse_checkpoint_contract(
     stats, requested_policy_rate_hz, requested_chunk_size,
-    requested_sparse_source,
+    requested_sparse_source, sparse_history_mode=SPARSE_HISTORY_MODE_LEGACY,
+    history_ms=DEFAULT_HISTORY_MS,
+    sparse_history_capacity=DEFAULT_SPARSE_HISTORY_CAPACITY,
+    requested_state_dim=None,
 ):
     """Resolve the rate-specific sparse contract without mutating checkpoint stats."""
     rate = validate_policy_rate(requested_policy_rate_hz)
     chunk_size = int(_normalize_contract_value(requested_chunk_size))
-    expected_offsets = list(sparse_history_offsets_frames(rate))
+    history = resolve_history_config(
+        sparse_history_mode, rate, history_ms, sparse_history_capacity)
+    expected_offsets = list(history["qpos_history_offsets"])
     if chunk_size != rate:
         raise ValueError(
             "Requested sparse chunk_size does not match policy_rate_hz: "
@@ -76,8 +125,9 @@ def resolve_sparse_checkpoint_contract(
         "policy_rate_hz": rate,
         "chunk_size": chunk_size,
         "qpos_history_offsets": expected_offsets,
-        "sparse_history_offsets_frames": expected_offsets,
     }
+    if sparse_history_mode == SPARSE_HISTORY_MODE_LEGACY:
+        rate_values["sparse_history_offsets_frames"] = expected_offsets
     missing = [key for key in rate_values if stats.get(key) is None]
     if rate == 60 and missing:
         raise ValueError(
@@ -108,15 +158,23 @@ def resolve_sparse_checkpoint_contract(
         resolved[key] = saved
 
     strict_values = {
+        "input_modality": "sparse_ball",
         "sparse_source": str(requested_sparse_source),
         "sparse_feature_dim": SPARSE_FEATURE_DIM,
-        "sparse_history_length": SPARSE_HISTORY_LENGTH,
+        "sparse_history_length": history["sparse_history_length"],
+        "state_dim": history["state_dim"],
+        "action_dim": 1,
     }
+    if sparse_history_mode == SPARSE_HISTORY_MODE_M_WINDOW:
+        strict_values.update({
+            "sparse_history_mode": SPARSE_HISTORY_MODE_M_WINDOW,
+            "sparse_history_capacity": history["sparse_history_capacity"],
+        })
     for key, expected in strict_values.items():
         if stats.get(key) is None:
             raise ValueError(f"Sparse checkpoint is missing {key}")
         saved = _normalize_contract_value(stats[key])
-        if key != "sparse_source":
+        if key not in ("input_modality", "sparse_source", "sparse_history_mode"):
             try:
                 saved = int(saved)
             except (TypeError, ValueError):
@@ -127,6 +185,21 @@ def resolve_sparse_checkpoint_contract(
                 f"requested={expected!r}, saved={saved!r}"
             )
         resolved[key] = saved
+
+    if requested_state_dim is not None and int(requested_state_dim) != history["state_dim"]:
+        raise ValueError(
+            "Sparse rollout state_dim mismatch: "
+            f"expected={history['state_dim']}, requested={requested_state_dim}")
+    if sparse_history_mode == SPARSE_HISTORY_MODE_M_WINDOW:
+        saved_history_ms = stats.get("history_ms", stats.get("history_horizon_ms"))
+        if saved_history_ms is None:
+            raise ValueError("Sparse checkpoint is missing history_ms/history_horizon_ms")
+        if not np.isclose(float(saved_history_ms), history["history_horizon_ms"],
+                          rtol=1e-9, atol=1e-9):
+            raise ValueError(
+                "Sparse checkpoint contract mismatch for history_ms: "
+                f"requested={history['history_horizon_ms']!r}, saved={saved_history_ms!r}")
+        resolved["history_ms"] = float(saved_history_ms)
 
     resolved["inferred_legacy_fields"] = inferred
     if inferred:
@@ -263,15 +336,61 @@ def construct_causal_sparse_history(
     )
 
 
+def construct_causal_sparse_window(
+    points: Iterable[SparsePoint], policy_timestamp: float, history_ms: float,
+    capacity: int, image_width: int, image_height: int, *, return_info=False,
+):
+    """Build an inclusive, causal, front-padded literal observation window."""
+    anchor = float(policy_timestamp)
+    horizon = float(history_ms) / 1000.0
+    capacity = int(capacity)
+    if not np.isfinite(anchor) or not np.isfinite(horizon) or horizon < 0:
+        raise ValueError("policy_timestamp and history_ms must be finite; history_ms >= 0")
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+    if image_width <= 1 or image_height <= 1:
+        raise ValueError("sparse image dimensions must both exceed one pixel")
+    ordered = sorted(points, key=lambda item: item.source_timestamp)
+    stamps = np.asarray([point.source_timestamp for point in ordered], dtype=np.float64)
+    if stamps.size and (not np.isfinite(stamps).all() or np.any(np.diff(stamps) < 0)):
+        raise ValueError("sparse source timestamps must be finite and monotonic")
+    selected = [point for point in ordered
+                if anchor - horizon <= point.source_timestamp <= anchor]
+    overflow_count = max(0, len(selected) - capacity)
+    if overflow_count:
+        selected = selected[-capacity:]
+    result = np.zeros((capacity, SPARSE_FEATURE_DIM), dtype=np.float32)
+    start = capacity - len(selected)
+    for row, point in enumerate(selected, start=start):
+        age = anchor - float(point.source_timestamp)
+        in_bounds = (np.isfinite(point.u) and np.isfinite(point.v)
+                     and 0 <= point.u < image_width and 0 <= point.v < image_height)
+        result[row, 3] = age
+        if point.valid and in_bounds:
+            result[row, 0] = 2.0 * float(point.u) / (image_width - 1) - 1.0
+            result[row, 1] = 2.0 * float(point.v) / (image_height - 1) - 1.0
+            result[row, 2] = 1.0
+    info = {
+        "overflow": bool(overflow_count),
+        "overflow_count": overflow_count,
+        "selected_count": len(selected),
+        "padding_count": start,
+        "selected_timestamps": np.asarray(
+            [point.source_timestamp for point in selected], dtype=np.float64),
+    }
+    return (result, info) if return_info else result
+
+
 def validate_sparse_checkpoint_contract(
-    stats, source, image_width, image_height, max_observation_age_sec
+    stats, source, image_width, image_height, max_observation_age_sec,
+    sparse_history_length=SPARSE_HISTORY_LENGTH,
 ):
     """Reject incompatible dense or sparse checkpoint metadata."""
     required = {
         "input_modality": "sparse_ball",
         "sparse_source": source,
         "sparse_feature_dim": SPARSE_FEATURE_DIM,
-        "sparse_history_length": SPARSE_HISTORY_LENGTH,
+        "sparse_history_length": int(sparse_history_length),
         "sparse_feature_names": list(SPARSE_FEATURE_NAMES),
         "sparse_image_width": int(image_width),
         "sparse_image_height": int(image_height),
