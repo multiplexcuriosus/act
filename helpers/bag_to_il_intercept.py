@@ -21,7 +21,9 @@ import importlib
 import json
 import os
 from pathlib import Path
+import signal
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -79,6 +81,81 @@ EVENT_TRACKER_PROCESSING_SCHEMA = "event_tracker_updates_v2"
 OPENMV_REQUIRED_API = (
     "TrackerUpdate", "run_tracker_updates", "align_tracker_updates_to_policy_grid",
 )
+
+GIBIBYTE = 1024 ** 3
+DEFAULT_MIN_FREE_DISK_GB = 10.0
+DEFAULT_DISK_CHECK_PATH = "/"
+DEFAULT_DISK_CHECK_INTERVAL_SEC = 5.0
+
+
+class LowDiskSpaceError(RuntimeError):
+    """Raised in the main thread when the disk-space watchdog trips."""
+
+
+def available_disk_bytes(path: str) -> int:
+    """Return bytes available to an unprivileged process, as reported by df."""
+    stats = os.statvfs(path)
+    return int(stats.f_bavail) * int(stats.f_frsize)
+
+
+class DiskSpaceMonitor:
+    """Continuously interrupt the main thread when free space is too low."""
+
+    def __init__(self, path: str, minimum_gib: float, interval_sec: float):
+        self.path = os.path.abspath(os.path.expanduser(path))
+        self.minimum_bytes = int(float(minimum_gib) * GIBIBYTE)
+        self.minimum_gib = float(minimum_gib)
+        self.interval_sec = float(interval_sec)
+        self._stop = threading.Event()
+        self._failure_message: Optional[str] = None
+        self._thread: Optional[threading.Thread] = None
+        self._previous_handler = None
+
+    def _check(self) -> None:
+        available = available_disk_bytes(self.path)
+        if available < self.minimum_bytes:
+            raise LowDiskSpaceError(
+                f"Free disk space on {self.path} is {available / GIBIBYTE:.2f} GiB, "
+                f"below the required {self.minimum_gib:g} GiB; stopping conversion"
+            )
+
+    def _handle_signal(self, _signum, _frame) -> None:
+        if self._failure_message is not None:
+            raise LowDiskSpaceError(self._failure_message)
+
+    def _watch(self) -> None:
+        while not self._stop.wait(self.interval_sec):
+            try:
+                self._check()
+            except (LowDiskSpaceError, OSError) as error:
+                self._failure_message = str(error)
+                os.kill(os.getpid(), signal.SIGUSR1)
+                return
+
+    def __enter__(self):
+        self._check()
+        self._previous_handler = signal.getsignal(signal.SIGUSR1)
+        signal.signal(signal.SIGUSR1, self._handle_signal)
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="disk-space-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+        log(
+            f"[INFO] disk guard: path={self.path}, "
+            f"minimum_free={self.minimum_gib:g} GiB, "
+            f"check_interval={self.interval_sec:g}s"
+        )
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        if self._previous_handler is not None:
+            signal.signal(signal.SIGUSR1, self._previous_handler)
+        return False
 
 
 @dataclass
@@ -254,9 +331,14 @@ def save_event_tracker_cache(path, raw_events_h5, config_hash, updates_by_episod
     }
     target = Path(path).expanduser().resolve()
     temporary = target.with_suffix(target.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(cache, stream, sort_keys=True)
-    os.replace(temporary, target)
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(cache, stream, sort_keys=True)
+        os.replace(temporary, target)
+    except BaseException:
+        if temporary.exists():
+            temporary.unlink()
+        raise
 
 
 def header_stamp_to_sec(msg: Any) -> float:
@@ -1591,7 +1673,7 @@ def write_episode(
             median_period = validate_policy_grid_metadata(h5, fps, temporary_path)
 
         os.replace(temporary_path, output_path)
-    except Exception:
+    except BaseException:
         if os.path.exists(temporary_path):
             os.unlink(temporary_path)
         raise
@@ -1680,6 +1762,23 @@ def parse_args() -> argparse.Namespace:
         help="HDF5 compression for RGB frames and event frames when enabled",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--min-free-disk-gb",
+        type=float,
+        default=DEFAULT_MIN_FREE_DISK_GB,
+        help="Stop when free space falls below this many GiB (default: 10)",
+    )
+    parser.add_argument(
+        "--disk-check-path",
+        default=DEFAULT_DISK_CHECK_PATH,
+        help="Filesystem path monitored for free space (default: /)",
+    )
+    parser.add_argument(
+        "--disk-check-interval-sec",
+        type=float,
+        default=DEFAULT_DISK_CHECK_INTERVAL_SEC,
+        help="Seconds between disk-space checks (default: 5)",
+    )
 
     parser.add_argument(
         "--raw_events_h5",
@@ -1771,6 +1870,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--min_duration must be non-negative")
     if args.max_episodes is not None and args.max_episodes <= 0:
         parser.error("--max_episodes must be positive")
+    if not np.isfinite(args.min_free_disk_gb) or args.min_free_disk_gb <= 0.0:
+        parser.error("--min-free-disk-gb must be finite and positive")
+    if (
+        not np.isfinite(args.disk_check_interval_sec)
+        or args.disk_check_interval_sec <= 0.0
+    ):
+        parser.error("--disk-check-interval-sec must be finite and positive")
     if len(args.event_frame_windows_ms) != 3:
         parser.error("--event_frame_windows_ms must contain exactly 3 values")
     if any(w <= 0.0 for w in args.event_frame_windows_ms):
@@ -1811,9 +1917,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    conversion_start_wall = time.perf_counter()
-    args = parse_args()
+def run_conversion(args: argparse.Namespace, conversion_start_wall: float) -> None:
     selected_rate = validate_policy_rate(args.fps)
     log(
         f"[INFO] selected policy grid: fps={selected_rate}, "
@@ -1837,6 +1941,9 @@ def main() -> None:
         ("max_observation_age_sec", 0.10),
         ("save_event_tracker_cache", None),
         ("reuse_event_tracker_cache", None),
+        ("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB),
+        ("disk_check_path", DEFAULT_DISK_CHECK_PATH),
+        ("disk_check_interval_sec", DEFAULT_DISK_CHECK_INTERVAL_SEC),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -2167,6 +2274,29 @@ def main() -> None:
     )
     total_wall = max(0.0, time.perf_counter() - conversion_start_wall)
     log(f"       total wall time: {format_hms(total_wall)}")
+
+
+def main() -> None:
+    conversion_start_wall = time.perf_counter()
+    args = parse_args()
+    for name, default in (
+        ("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB),
+        ("disk_check_path", DEFAULT_DISK_CHECK_PATH),
+        ("disk_check_interval_sec", DEFAULT_DISK_CHECK_INTERVAL_SEC),
+    ):
+        if not hasattr(args, name):
+            setattr(args, name, default)
+
+    try:
+        with DiskSpaceMonitor(
+            path=args.disk_check_path,
+            minimum_gib=args.min_free_disk_gb,
+            interval_sec=args.disk_check_interval_sec,
+        ):
+            run_conversion(args, conversion_start_wall)
+    except LowDiskSpaceError as error:
+        log(f"[ERROR] {error}")
+        raise SystemExit(2) from error
 
 
 if __name__ == "__main__":

@@ -966,7 +966,7 @@ class BagToIlInterceptTests(unittest.TestCase):
         finally:
             sys.argv = argv
 
-    def test_fps_and_event_clip_count_defaults(self):
+    def test_converter_defaults(self):
         argv = list(sys.argv)
         try:
             sys.argv = [
@@ -977,8 +977,28 @@ class BagToIlInterceptTests(unittest.TestCase):
             args = self.mod.parse_args()
             self.assertEqual(args.fps, 30.0)
             self.assertEqual(args.event_clip_count, 16.0)
+            self.assertEqual(args.min_free_disk_gb, 10.0)
+            self.assertEqual(args.disk_check_path, "/")
+            self.assertEqual(args.disk_check_interval_sec, 5.0)
         finally:
             sys.argv = argv
+
+    def test_disk_guard_rejects_space_below_threshold(self):
+        monitor = self.mod.DiskSpaceMonitor("/", 10.0, 5.0)
+        with mock.patch.object(
+            self.mod, "available_disk_bytes", return_value=10 * 1024 ** 3 - 1
+        ):
+            with self.assertRaisesRegex(
+                self.mod.LowDiskSpaceError, "below the required 10 GiB"
+            ):
+                monitor._check()
+
+    def test_disk_guard_accepts_space_at_threshold(self):
+        monitor = self.mod.DiskSpaceMonitor("/", 10.0, 5.0)
+        with mock.patch.object(
+            self.mod, "available_disk_bytes", return_value=10 * 1024 ** 3
+        ):
+            monitor._check()
 
     def test_out_dir_is_the_exact_episode_destination(self):
         argv = list(sys.argv)
@@ -1411,6 +1431,34 @@ class BagToIlInterceptTests(unittest.TestCase):
                     output, arrays, self.make_episode(), self.make_topics(),
                     30.0, "none", False, raw_events_h5=None,
                 )
+            self.assertFalse(os.path.exists(output + ".tmp"))
+
+    def test_interrupted_write_removes_temporary_file(self):
+        arrays = {
+            "timestamps": np.asarray([0.0]),
+            "timestamps_ns": np.asarray([0], dtype=np.int64),
+            "rgb": np.zeros((1, 1, 1, 3), dtype=np.uint8),
+            "qpos": np.zeros((1, 7), dtype=np.float32),
+            "action": np.zeros((1, 1), dtype=np.float32),
+            "action_source_timestamps": np.asarray([0.0]),
+            "action_source_age_sec": np.asarray([0.0], dtype=np.float32),
+            "command_timestamps": np.empty(0),
+            "command_values": np.empty((0, 1), dtype=np.float32),
+            "target_base_timestamps": np.empty(0),
+            "target_base_points": np.empty((0, 3), dtype=np.float32),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "episode_0.hdf5")
+            with mock.patch.object(
+                self.mod,
+                "validate_policy_grid_metadata",
+                side_effect=KeyboardInterrupt,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.mod.write_episode(
+                        output, arrays, self.make_episode(), self.make_topics(),
+                        30.0, "none", False,
+                    )
             self.assertFalse(os.path.exists(output + ".tmp"))
 
     def test_cache_hash_mismatch_is_rejected(self):
