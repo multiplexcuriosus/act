@@ -1477,6 +1477,34 @@ class BagToIlInterceptTests(unittest.TestCase):
                     cache, raw, "expected", ["episode_0"], object
                 )
 
+    def test_topic_profile_resolution_and_ambiguity(self):
+        self.assertEqual(self.mod.resolve_topic_profile({
+            self.mod.EVENT_NATIVE_RGB_2D_TOPIC: self.mod.POINT_STAMPED_TYPE,
+        }, "auto"), "event_native")
+        self.assertEqual(self.mod.resolve_topic_profile({
+            self.mod.DEFAULT_RGB_2D_TOPIC: self.mod.POINT_STAMPED_TYPE,
+        }, "auto"), "legacy_rgb_primary")
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            self.mod.resolve_topic_profile({
+                self.mod.DEFAULT_RGB_2D_TOPIC: self.mod.POINT_STAMPED_TYPE,
+                self.mod.EVENT_NATIVE_RGB_2D_TOPIC: self.mod.POINT_STAMPED_TYPE,
+            }, "auto")
+
+    def test_sparse_only_sampling_needs_no_rgb_images(self):
+        data = self.make_sampling_data([0.0, 0.1, 0.2], [0.0, 0.1, 0.2])
+        data["rgb_t"] = []
+        data["rgb_msg"] = []
+        data["rgb_2d_t"] = [0.05]
+        data["rgb_2d_source_t"] = [0.01]
+        data["rgb_2d_px"] = [[640.0, 360.0]]
+        arrays = self.mod.sample_episode(
+            data, self.make_episode(end=0.2), 10.0, 1.0,
+            rgb_2d_enabled=True, sparse_only=True,
+            rgb_sparse_size=(1280, 720), sparse_source="rgb")
+        self.assertNotIn("rgb", arrays)
+        self.assertIn("sparse_tracking/raw_rgb_availability_timestamps", arrays)
+        self.assertEqual(arrays["action"].shape, (3, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

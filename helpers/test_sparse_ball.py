@@ -190,3 +190,16 @@ def test_sparse_checkpoint_history_and_chunk_mismatches_are_rejected():
     stats["chunk_size"] = 30
     with pytest.raises(ValueError, match="mismatch for chunk_size"):
         resolve_sparse_checkpoint_contract(stats, 60, 60, "rgb")
+
+
+def test_m_window_rejects_source_early_but_receipt_late():
+    points = [SparsePoint(0.90, 10, 20, 1, availability_timestamp=1.01)]
+    window, info = construct_causal_sparse_window(
+        points, 1.0, 200, 4, 1280, 720, return_info=True)
+    assert info["selected_count"] == 0
+    assert not window[:, 2].any()
+    later, info = construct_causal_sparse_window(
+        points, 1.02, 200, 4, 1280, 720, return_info=True)
+    assert info["selected_count"] == 1
+    assert later[-1, 2] == 1
+    assert later[-1, 3] == pytest.approx(0.12)

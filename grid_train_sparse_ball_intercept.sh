@@ -8,11 +8,15 @@ cd "$SCRIPT_DIR"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 DATASET_DIRS=(
-  "/home/dyros/Data/jg_data/hdf5/bumpy/recording_20260824_150734_bumpybase1_hdf5/"
-  "/home/dyros/Data/jg_data/hdf5/bumpy/recording_20260824_194237_bumpybase2_hdf5/"
+  "/home/dyros/Data/jg_data/hdf5/bumpy/recording_20260824_150734_bumpybase1_hdf5_mwindow/"
+  "/home/dyros/Data/jg_data/hdf5/bumpy/recording_20260824_194237_bumpybase2_hdf5_mwindow/"
 )
 
+POLICY_RATE_HZ=60
+HISTORY_LENGTH=3
+STATE_DIM=21
 
+RUN_ROOT="${RUN_ROOT:-/home/dyros/Data/jg_data/ckpts/intercept_sparse_legacy_bumpy_$(date +%Y%m%d_%H%M%S)}"
 
 for DATASET_DIR in "${DATASET_DIRS[@]}"; do
   if [[ ! -d "$DATASET_DIR" ]]; then
@@ -21,25 +25,26 @@ for DATASET_DIR in "${DATASET_DIRS[@]}"; do
   fi
 done
 
-RUN_ROOT="${RUN_ROOT:-/home/dyros/Data/jg_data/ckpts/intercept_sparse_grid_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RUN_ROOT"
 
-cp -- "$SCRIPT_PATH" "$RUN_ROOT/grid_train_sparse_ball_intercept.sh"
+cp -- "$SCRIPT_PATH" "$RUN_ROOT/train_sparse_ball_bumpy_legacy3shot.sh"
 
-for POLICY_RATE_HZ in 60; do
 for SPARSE_SOURCE in rgb event; do
   for LR in 1e-5; do
     for BS in 8; do
       for KL in 1; do
 
-        RUN_NAME="sparse_${SPARSE_SOURCE}_uvnorm_valid_age_hist3_${POLICY_RATE_HZ}hz_lr${LR}_bs${BS}_kl${KL}"
+        RUN_NAME="sparse_${SPARSE_SOURCE}_uvnorm_valid_age_legacy3shot_${POLICY_RATE_HZ}hz_lr${LR}_bs${BS}_kl${KL}"
         CKPT_DIR="${RUN_ROOT}/${SPARSE_SOURCE}/${RUN_NAME}"
+
         mkdir -p "$CKPT_DIR"
 
         echo
         echo "============================================================"
         echo "Starting: ${RUN_NAME}"
         echo "Checkpoint directory: ${CKPT_DIR}"
+        echo "Training data: bumpybase1 + bumpybase2"
+        echo "History: legacy 3 snapshots (~[-200, -100, 0] ms)"
         echo "============================================================"
 
         CMD=(
@@ -56,11 +61,14 @@ for SPARSE_SOURCE in rgb event; do
           --input_modality sparse_ball
           --sparse_source "$SPARSE_SOURCE"
           --sparse_feature_dim 4
-          --sparse_history_length 3
+
+          # Legacy mode is the default when m_window is not specified.
+          --sparse_history_length "$HISTORY_LENGTH"
           --max_observation_age_sec 0.10
+
           --policy_rate_hz "$POLICY_RATE_HZ"
 
-          --state_dim 21
+          --state_dim "$STATE_DIM"
           --action_dim 1
           --chunk_size "$POLICY_RATE_HZ"
 
@@ -87,8 +95,7 @@ for SPARSE_SOURCE in rgb event; do
     done
   done
 done
-done
 
 echo
-echo "All sparse RGB and sparse event grid runs completed."
+echo "All bumpy-trained legacy 3-snapshot RGB/event runs completed."
 echo "Results: ${RUN_ROOT}"

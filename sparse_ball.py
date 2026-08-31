@@ -176,6 +176,7 @@ class SparsePoint:
     u: float
     v: float
     valid: int = 1
+    availability_timestamp: float | None = None
 
 
 def construct_causal_sparse_window(
@@ -196,7 +197,12 @@ def construct_causal_sparse_window(
     stamps = np.asarray([p.source_timestamp for p in ordered], dtype=np.float64)
     if stamps.size and (not np.isfinite(stamps).all() or np.any(np.diff(stamps) < 0)):
         raise ValueError("sparse source timestamps must be finite and monotonic")
-    selected = [p for p in ordered if anchor - horizon <= p.source_timestamp <= anchor]
+    selected = [
+        p for p in ordered
+        if anchor - horizon <= p.source_timestamp <= anchor
+        and (p.availability_timestamp is None
+             or float(p.availability_timestamp) <= anchor)
+    ]
     overflow_count = max(0, len(selected) - capacity)
     if overflow_count:
         selected = selected[-capacity:]
@@ -217,6 +223,10 @@ def construct_causal_sparse_window(
         "selected_count": len(selected),
         "selected_timestamps": np.asarray(
             [p.source_timestamp for p in selected], dtype=np.float64
+        ),
+        "selected_availability_timestamps": np.asarray(
+            [p.source_timestamp if p.availability_timestamp is None
+             else p.availability_timestamp for p in selected], dtype=np.float64
         ),
     }
     return (result, info) if return_info else result

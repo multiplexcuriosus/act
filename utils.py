@@ -549,12 +549,24 @@ def _read_raw_sparse_episode(root, dataset_path, source):
     timestamps = np.asarray(root[timestamp_key][()], dtype=np.float64)
     points = np.asarray(root[points_key][()], dtype=np.float64)
     valid = np.asarray(root[valid_key][()]).reshape(-1)
+    availability_key = (
+        f'/observations/sparse_tracking/raw_{source}_availability_timestamps'
+    )
+    availability = (
+        np.asarray(root[availability_key][()], dtype=np.float64)
+        if availability_key in root else timestamps
+    )
     if timestamps.ndim != 1 or points.shape != (len(timestamps), 2) or valid.shape != timestamps.shape:
         raise ValueError(f"Malformed raw {source} sparse stream in {dataset_path}")
     if len(timestamps) and (not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) < 0)):
         raise ValueError(f"Raw {source} sparse timestamps must be finite and monotonic")
-    return [SparsePoint(t, p[0], p[1], int(v))
-            for t, p, v in zip(timestamps, points, valid)]
+    if availability.shape != timestamps.shape or (
+        len(availability) and
+        (not np.isfinite(availability).all() or np.any(np.diff(availability) < 0))
+    ):
+        raise ValueError(f"Raw {source} sparse availability timestamps must be finite and monotonic")
+    return [SparsePoint(t, p[0], p[1], int(v), a)
+            for t, p, v, a in zip(timestamps, points, valid, availability)]
 
 def rotate_n_crop_transform(img, size=(360, 480), angle=None, top=None):
     if angle is None:
